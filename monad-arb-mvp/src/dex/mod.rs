@@ -35,19 +35,26 @@ pub struct Pool {
     pub dex: Dex,
     pub liquidity: U256,      // Current liquidity
     pub sqrt_price_x96: U256, // Current price (sqrt(price) * 2^96)
+    pub decimals0: u8,        // Decimals of token0
+    pub decimals1: u8,        // Decimals of token1
 }
 
 impl Pool {
-    /// Calculate the price of token0 in terms of token1
+    /// Calculate the ADJUSTED price of token0 in terms of token1
+    /// Formula: price = (sqrtPriceX96 / 2^96)^2 * 10^(decimals0 - decimals1)
     pub fn price_0_to_1(&self) -> f64 {
         let sqrt_price = self.sqrt_price_x96.to::<u128>() as f64 / (2_f64.powi(96));
-        sqrt_price * sqrt_price
+        let raw_price = sqrt_price * sqrt_price;
+
+        // Adjust for decimal difference between tokens
+        let decimal_adjustment = 10_f64.powi(self.decimals0 as i32 - self.decimals1 as i32);
+        raw_price * decimal_adjustment
     }
 
-    /// Calculate the price of token1 in terms of token0
+    /// Calculate the ADJUSTED price of token1 in terms of token0
     pub fn price_1_to_0(&self) -> f64 {
         let price = self.price_0_to_1();
-        if price > 0.0 {
+        if price > 0.0 && price.is_finite() {
             1.0 / price
         } else {
             0.0
@@ -64,6 +71,22 @@ impl Pool {
     pub fn effective_price_1_to_0(&self) -> f64 {
         let fee_factor = 1.0 - (self.fee as f64 / 1_000_000.0);
         self.price_1_to_0() * fee_factor
+    }
+
+    /// Validate that the price is within reasonable bounds
+    pub fn is_price_valid(&self) -> bool {
+        let price = self.price_0_to_1();
+        price > 0.0 && price.is_finite() && price < 1e18 && price > 1e-18
+    }
+
+    /// Check if pool has sufficient liquidity
+    pub fn has_sufficient_liquidity(&self, min_liquidity: u128) -> bool {
+        self.liquidity >= U256::from(min_liquidity)
+    }
+
+    /// Get liquidity as a normalized value
+    pub fn liquidity_normalized(&self) -> f64 {
+        self.liquidity.to::<u128>() as f64
     }
 }
 

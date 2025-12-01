@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use super::{Dex, DexClient, Pool};
 use crate::config::contracts::pancakeswap_v3::{FACTORY, FEE_TIERS};
+use crate::config::tokens;
 
 // PancakeSwap V3 Factory ABI (same interface as Uniswap V3)
 sol! {
@@ -91,9 +92,14 @@ impl<P: Provider + Clone> PancakeSwapClient<P> {
             dex: Dex::PancakeSwapV3,
             liquidity: U256::from(liquidity),
             sqrt_price_x96: U256::from(slot0.sqrtPriceX96),
+            decimals0: tokens::decimals(token0),
+            decimals1: tokens::decimals(token1),
         })
     }
 }
+
+/// Minimum liquidity threshold (1000 units with 18 decimals)
+const MIN_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
 
 #[async_trait]
 impl<P: Provider + Clone + Send + Sync> DexClient for PancakeSwapClient<P> {
@@ -113,14 +119,24 @@ impl<P: Provider + Clone + Send + Sync> DexClient for PancakeSwapClient<P> {
                     if let Ok(Some(pool_addr)) = self.get_pool_address(token0, token1, fee).await {
                         match self.get_pool_state(pool_addr, token0, token1, fee).await {
                             Ok(pool) => {
-                                // Only add pools with liquidity
-                                if pool.liquidity > U256::ZERO {
+                                // Multiple validity checks: liquidity, price validity, and minimum threshold
+                                if pool.liquidity > U256::ZERO
+                                    && pool.is_price_valid()
+                                    && pool.has_sufficient_liquidity(MIN_LIQUIDITY)
+                                {
                                     tracing::debug!(
-                                        "Found PancakeSwap V3 pool: {} (fee: {})",
+                                        "Found valid PancakeSwap V3 pool: {} (fee: {}, liq: {}, price: {:.8})",
                                         pool_addr,
-                                        fee
+                                        fee,
+                                        pool.liquidity,
+                                        pool.price_0_to_1()
                                     );
                                     pools.push(pool);
+                                } else {
+                                    tracing::trace!(
+                                        "Skipping PancakeSwap V3 pool {} - insufficient liquidity or invalid price",
+                                        pool_addr
+                                    );
                                 }
                             }
                             Err(e) => {

@@ -177,13 +177,18 @@ async fn main() -> eyre::Result<()> {
             // Log top opportunities
             for (i, cycle) in cycles.iter().take(10).enumerate() {
                 let cross_dex = if cycle.is_cross_dex() {
-                    "[CROSS-DEX]"
+                    "CROSS"
                 } else {
-                    "[SINGLE-DEX]"
+                    "SINGLE"
                 };
 
                 println!();
-                println!("--- Opportunity #{} {} ---", i + 1, cross_dex);
+                println!(
+                    "--- Opportunity #{} [{}-DEX] [Confidence: {}] ---",
+                    i + 1,
+                    cross_dex,
+                    cycle.confidence_level()
+                );
                 println!("   Path: {}", cycle.token_path());
                 println!(
                     "   Profit: {:.4}% ({} bps)",
@@ -194,6 +199,7 @@ async fn main() -> eyre::Result<()> {
                 println!("   DEXes: {}", cycle.dex_path());
                 println!("   Avg Fee: {:.2} bps", cycle.avg_fee_bps());
                 println!("   Expected Return: {:.6}x", cycle.expected_return);
+                println!("   Confidence Score: {:.2}", cycle.confidence_score());
 
                 // Print pool addresses for debugging
                 println!("   Pools:");

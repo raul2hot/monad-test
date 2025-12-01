@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use super::{Dex, DexClient, Pool};
 use crate::config::contracts::lfj::LB_FACTORY;
+use crate::config::tokens;
 
 // LFJ (TraderJoe) Liquidity Book Factory ABI
 sol! {
@@ -106,13 +107,27 @@ impl<P: Provider + Clone> LfjClient<P> {
             .call()
             .await?;
 
-        // Convert Q128.128 to sqrt_price_x96 format for compatibility
-        // price_x128 = price * 2^128
-        // sqrt_price_x96 = sqrt(price) * 2^96
-        // sqrt_price_x96 = sqrt(price_x128 / 2^128) * 2^96 = sqrt(price_x128) * 2^(96-64) = sqrt(price_x128) * 2^32
-        let price_u128: u128 = price_x128.to();
-        let sqrt_price = (price_u128 as f64).sqrt();
-        let sqrt_price_x96 = (sqrt_price * (1u128 << 32) as f64) as u128;
+        // FIXED: Proper conversion from Q128.128
+        // price_x128 = actual_price * 2^128
+        // We need to convert to sqrtPriceX96 = sqrt(actual_price) * 2^96
+
+        // First get the actual price as f64
+        let price_x128_f64 = price_x128.to::<u128>() as f64;
+        let actual_price = price_x128_f64 / (2_f64.powi(128));
+
+        // Get decimals for adjustment
+        let decimals0 = tokens::decimals(token0);
+        let decimals1 = tokens::decimals(token1);
+
+        // Note: decimal_adjustment is calculated but LFJ already handles decimals in its price
+        // The Pool::price_0_to_1() method will apply decimal adjustment using decimals0/decimals1
+        let _decimal_adjustment = 10_f64.powi(decimals0 as i32 - decimals1 as i32);
+
+        // Convert to sqrtPriceX96 format for consistency with Uniswap
+        // But since Pool::price_0_to_1() will apply decimal adjustment again,
+        // we store the raw sqrtPriceX96 and let the Pool methods handle decimals
+        let sqrt_price = actual_price.sqrt();
+        let sqrt_price_x96 = (sqrt_price * 2_f64.powi(96)) as u128;
 
         // Total liquidity is approximated from reserves
         let total_liquidity = U256::from(reserves.reserveX) + U256::from(reserves.reserveY);
@@ -128,9 +143,14 @@ impl<P: Provider + Clone> LfjClient<P> {
             dex: Dex::LFJ,
             liquidity: total_liquidity,
             sqrt_price_x96: U256::from(sqrt_price_x96),
+            decimals0,
+            decimals1,
         })
     }
 }
+
+/// Minimum liquidity threshold (1000 units with 18 decimals)
+const MIN_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
 
 #[async_trait]
 impl<P: Provider + Clone + Send + Sync> DexClient for LfjClient<P> {
@@ -150,14 +170,24 @@ impl<P: Provider + Clone + Send + Sync> DexClient for LfjClient<P> {
                     if let Ok(Some(pair_addr)) = self.get_lb_pair(token0, token1, bin_step).await {
                         match self.get_pool_state(pair_addr, token0, token1, bin_step).await {
                             Ok(pool) => {
-                                // Only add pools with liquidity
-                                if pool.liquidity > U256::ZERO {
+                                // Multiple validity checks: liquidity, price validity, and minimum threshold
+                                if pool.liquidity > U256::ZERO
+                                    && pool.is_price_valid()
+                                    && pool.has_sufficient_liquidity(MIN_LIQUIDITY)
+                                {
                                     tracing::debug!(
-                                        "Found LFJ pool: {} (bin_step: {})",
+                                        "Found valid LFJ pool: {} (bin_step: {}, liq: {}, price: {:.8})",
                                         pair_addr,
-                                        bin_step
+                                        bin_step,
+                                        pool.liquidity,
+                                        pool.price_0_to_1()
                                     );
                                     pools.push(pool);
+                                } else {
+                                    tracing::trace!(
+                                        "Skipping LFJ pool {} - insufficient liquidity or invalid price",
+                                        pair_addr
+                                    );
                                 }
                             }
                             Err(e) => {
