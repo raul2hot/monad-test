@@ -85,39 +85,41 @@ pub mod tokens {
 pub mod contracts {
     use super::*;
 
-    /// Uniswap V3 contracts (deterministic CREATE2 deployment)
+    /// Uniswap V3 contracts on Monad Mainnet
+    /// Source: https://github.com/monad-crypto/protocols/blob/main/mainnet/Uniswap.json
     pub mod uniswap_v3 {
         use super::*;
 
-        pub const FACTORY: Address = address!("1F98431c8aD98523631AE4a59f267346ea31F984");
-        pub const SWAP_ROUTER: Address = address!("E592427A0AEce92De3Edee1F18E0157C05861564");
-        pub const SWAP_ROUTER_02: Address = address!("68b3465833fb72A70ecDF485E0e4C7bD8665Fc45");
-        pub const QUOTER_V2: Address = address!("61fFE014bA17989E743c5F6cB21bF9697530B21e");
+        pub const FACTORY: Address = address!("204faca1764b154221e35c0d20abb3c525710498");
+        pub const SWAP_ROUTER: Address = address!("d6145b2d3f379919e8cdeda7b97e37c4b2ca9c40");
+        pub const QUOTER_V2: Address = address!("661e93cca42afacb172121ef892830ca3b70f08d");
         pub const NFT_POSITION_MANAGER: Address =
-            address!("C36442b4a4522E871399CD717aBDD847Ab11FE88");
+            address!("7197e214c0b767cfb76fb734ab638e2c192f4e53");
 
         // Fee tiers in hundredths of a bip: 100 = 0.01%, 500 = 0.05%, 3000 = 0.3%, 10000 = 1%
         pub const FEE_TIERS: [u32; 4] = [100, 500, 3000, 10000];
     }
 
-    /// PancakeSwap V3 contracts
+    /// PancakeSwap V3 contracts on Monad Mainnet
+    /// Source: https://github.com/monad-crypto/protocols/blob/main/mainnet/PancakeSwap.json
     pub mod pancakeswap_v3 {
         use super::*;
 
         pub const FACTORY: Address = address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865");
-        pub const SWAP_ROUTER: Address = address!("13f4EA83D0bd40E75C8222255bc855a974568Dd4");
+        pub const SWAP_ROUTER: Address = address!("1b81D678ffb9C0263b24A97847620C99d213eB14");
         pub const QUOTER_V2: Address = address!("B048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997");
 
         // Fee tiers (slightly different from Uniswap)
         pub const FEE_TIERS: [u32; 4] = [100, 500, 2500, 10000];
     }
 
-    /// LFJ (TraderJoe V2.1) contracts - Liquidity Book
+    /// LFJ (TraderJoe V2.1) contracts - Liquidity Book on Monad Mainnet
+    /// Source: https://github.com/monad-crypto/protocols/blob/main/mainnet/LFJ.json
     pub mod lfj {
         use super::*;
 
-        pub const LB_FACTORY: Address = address!("8e42f2F4101563bF679975178e880FD87d3eFd4e");
-        pub const LB_ROUTER: Address = address!("b4315e873dBcf96Ffd0acd8EA43f689D8c20fB30");
-        pub const LB_QUOTER: Address = address!("64b57F4249aA99a812212cee7DAEFEDC93b02E14");
+        pub const LB_FACTORY: Address = address!("b43120c4745967fa9b93E79C149E66B0f2D6Fe0c");
+        pub const LB_ROUTER: Address = address!("18556DA13313f3532c54711497A8FedAC273220E");
+        pub const LB_QUOTER: Address = address!("9A550a522BBaDFB69019b0432800Ed17855A51C3");
     }
 }
