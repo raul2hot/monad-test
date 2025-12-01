@@ -19,7 +19,7 @@ use graph::{ArbitrageGraph, BoundedBellmanFord};
 use simulation::{Simulator, SimulationConfidence};
 
 /// Default simulation amount: 1 WMON (18 decimals)
-const SIMULATION_AMOUNT: u128 = 1_000_000_000_000_000_000; // 1e18
+const SIMULATION_AMOUNT: u128 = 100_000_000_000_000_000_000; // 1e18
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
