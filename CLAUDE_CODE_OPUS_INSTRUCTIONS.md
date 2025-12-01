@@ -6,21 +6,21 @@
 
 ---
 
-## 📊 Current State Analysis
+## Current State Analysis
 
 ### What's Working
-- ✅ RPC Connection to Monad Mainnet (Chain ID: 143)
-- ✅ Successfully connecting to Alchemy RPC
-- ✅ PancakeSwap V3 pool discovery (finding 3 pools)
-- ✅ Graph construction and Bellman-Ford cycle detection
-- ✅ Price calculation with decimal adjustment
-- ✅ Basic logging and output
+- [x] RPC Connection to Monad Mainnet (Chain ID: 143)
+- [x] Successfully connecting to Alchemy RPC
+- [x] PancakeSwap V3 pool discovery (finding 3 pools)
+- [x] Graph construction and Bellman-Ford cycle detection
+- [x] Price calculation with decimal adjustment
+- [x] Basic logging and output
 
 ### What's NOT Working
-- ❌ **Uniswap V3**: Returns 0 pools (factory address likely incorrect for Monad)
-- ❌ **LFJ (TraderJoe)**: Returns 0 pools (factory address likely incorrect for Monad)
-- ⚠️ Only 3 pools found = limited arbitrage opportunities
-- ⚠️ Graph has only 4 nodes, 6 edges - too sparse for meaningful arbitrage
+- [ ] **Uniswap V3**: Returns 0 pools (factory address likely incorrect for Monad)
+- [ ] **LFJ (TraderJoe)**: Returns 0 pools (factory address likely incorrect for Monad)
+- [!] Only 3 pools found = limited arbitrage opportunities
+- [!] Graph has only 4 nodes, 6 edges - too sparse for meaningful arbitrage
 
 ### Current Output (Sample)
 ```
@@ -31,7 +31,7 @@ No arbitrage opportunities found above threshold
 
 ---
 
-## 🔴 CRITICAL ISSUE: DEX Contract Addresses
+## CRITICAL ISSUE: DEX Contract Addresses
 
 The project is using **Ethereum mainnet CREATE2 addresses** for Uniswap V3, which may NOT be correct for Monad Mainnet.
 
@@ -39,24 +39,24 @@ The project is using **Ethereum mainnet CREATE2 addresses** for Uniswap V3, whic
 ```rust
 // These are Ethereum mainnet addresses - NEED VERIFICATION FOR MONAD
 pub mod uniswap_v3 {
-    pub const FACTORY: Address = address!("1F98431c8aD98523631AE4a59f267346ea31F984");  // ❌ Ethereum
+    pub const FACTORY: Address = address!("1F98431c8aD98523631AE4a59f267346ea31F984");  // WRONG: Ethereum
     // ...
 }
 
 pub mod pancakeswap_v3 {
-    pub const FACTORY: Address = address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865");  // ⚠️ Needs verification
+    pub const FACTORY: Address = address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865");  // TODO: Needs verification
     // ...
 }
 
 pub mod lfj {
-    pub const LB_FACTORY: Address = address!("8e42f2F4101563bF679975178e880FD87d3eFd4e");  // ❌ Likely wrong
+    pub const LB_FACTORY: Address = address!("8e42f2F4101563bF679975178e880FD87d3eFd4e");  // WRONG: Likely incorrect
     // ...
 }
 ```
 
 ---
 
-## 🎯 Priority Tasks
+## Priority Tasks
 
 ### Phase 1: Fix Contract Addresses (CRITICAL)
 
@@ -126,7 +126,7 @@ LFJ uses Liquidity Book (LB) pools with bin-based pricing. Current implementatio
 
 ---
 
-## 🛠️ Technical Improvements
+## Technical Improvements
 
 ### Task 3.1: Pool Discovery Improvements
 
@@ -179,7 +179,7 @@ tracing::debug!(
 
 ---
 
-## 📝 Code Changes Required
+## Code Changes Required
 
 ### File: `src/config.rs`
 
@@ -211,9 +211,9 @@ async fn verify_dex_contracts(provider: &impl Provider) -> eyre::Result<()> {
     for (name, address) in factories {
         let has_code = config::verify_contract(provider, address).await;
         if has_code {
-            info!("✅ {} factory verified at {}", name, address);
+            info!("[OK] {} factory verified at {}", name, address);
         } else {
-            warn!("❌ {} factory NOT FOUND at {} - check address!", name, address);
+            warn!("[MISSING] {} factory NOT FOUND at {} - check address!", name, address);
         }
     }
     
@@ -246,7 +246,7 @@ pub trait DexClient: Send + Sync {
 
 ---
 
-## 🔍 Debugging Steps
+## Debugging Steps
 
 ### Step 1: Verify RPC Connection & Contract Bytecode
 
@@ -282,7 +282,7 @@ RUST_LOG=monad_arb_mvp=trace cargo run --release
 
 ---
 
-## 📋 Research Tasks
+## Research Tasks
 
 ### Task R1: Find Correct Monad Contract Addresses
 
@@ -320,7 +320,7 @@ Even if pools exist, they may have insufficient liquidity. Check:
 
 ---
 
-## 🏗️ Architecture Improvements
+## Architecture Improvements
 
 ### Current Flow
 ```
@@ -346,7 +346,7 @@ Main Loop:
 
 ---
 
-## 📁 New Files to Create
+## New Files to Create
 
 ### `src/discovery.rs` - Pool Discovery Module
 ```rust
@@ -407,7 +407,7 @@ impl<P: Provider + Clone + Send + Sync> DexClient for KuruClient<P> {
 
 ---
 
-## 🧪 Testing Commands
+## Testing Commands
 
 ```bash
 # Build the project
@@ -432,7 +432,7 @@ cargo clippy
 
 ---
 
-## 📚 Reference Links
+## Reference Links
 
 | Resource | URL |
 |----------|-----|
@@ -446,7 +446,7 @@ cargo clippy
 
 ---
 
-## ✅ Success Criteria
+## Success Criteria
 
 The MVP is working correctly when:
 
@@ -469,7 +469,7 @@ The MVP is working correctly when:
 
 ---
 
-## 🚨 Important Notes
+## Important Notes
 
 1. **Monad is 1 week old** - Ecosystem is still developing, liquidity is limited
 2. **Probabilistic Execution** - Monad's deferred execution means simulated profits may not match actual
@@ -478,7 +478,7 @@ The MVP is working correctly when:
 
 ---
 
-## 🔄 Next Session Checklist
+## Next Session Checklist
 
 When resuming work on this project:
 
