@@ -160,6 +160,8 @@ const MIN_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
 impl<P: Provider + Clone + Send + Sync> DexClient for UniswapV4Client<P> {
     async fn get_pools(&self, tokens: &[Address]) -> eyre::Result<Vec<Pool>> {
         let mut pools = Vec::new();
+        let mut checked_count = 0u32;
+        let mut error_count = 0u32;
 
         // Check all token pairs across fee tiers and tick spacings
         for i in 0..tokens.len() {
@@ -181,13 +183,14 @@ impl<P: Provider + Clone + Send + Sync> DexClient for UniswapV4Client<P> {
                             continue;
                         }
 
+                        checked_count += 1;
                         match self.get_pool_state(token0, token1, fee, tick_spacing).await {
                             Ok(Some(pool)) => {
                                 if pool.liquidity > U256::ZERO
                                     && pool.is_price_valid()
                                     && pool.has_sufficient_liquidity(MIN_LIQUIDITY)
                                 {
-                                    tracing::debug!(
+                                    tracing::info!(
                                         "Found valid Uniswap V4 pool: {}-{} (fee: {}, tickSpacing: {}, liq: {}, price: {:.8})",
                                         tokens::symbol(token0),
                                         tokens::symbol(token1),
@@ -209,19 +212,36 @@ impl<P: Provider + Clone + Send + Sync> DexClient for UniswapV4Client<P> {
                                 // Pool doesn't exist, skip silently
                             }
                             Err(e) => {
-                                tracing::debug!(
-                                    "Failed to get V4 pool state for {}-{} fee={} tickSpacing={}: {}",
-                                    token0,
-                                    token1,
-                                    fee,
-                                    tick_spacing,
-                                    e
-                                );
+                                error_count += 1;
+                                // Only log first few errors to avoid spam
+                                if error_count <= 3 {
+                                    tracing::warn!(
+                                        "V4 StateView error for {}-{}: {} (this may indicate V4 is not deployed)",
+                                        tokens::symbol(token0),
+                                        tokens::symbol(token1),
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Log summary
+        if error_count > 0 {
+            tracing::warn!(
+                "Uniswap V4: checked {} pool configs, {} errors (StateView may not be deployed at {})",
+                checked_count,
+                error_count,
+                self.state_view
+            );
+        } else if pools.is_empty() {
+            tracing::debug!(
+                "Uniswap V4: checked {} pool configs, no pools found",
+                checked_count
+            );
         }
 
         Ok(pools)
