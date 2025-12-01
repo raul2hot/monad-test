@@ -1,6 +1,7 @@
 pub mod lfj;
 pub mod pancakeswap;
 pub mod uniswap_v3;
+pub mod uniswap_v4;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
@@ -9,6 +10,7 @@ use async_trait::async_trait;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dex {
     UniswapV3,
+    UniswapV4,
     PancakeSwapV3,
     LFJ,
     Kuru,
@@ -18,6 +20,7 @@ impl std::fmt::Display for Dex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Dex::UniswapV3 => write!(f, "Uniswap V3"),
+            Dex::UniswapV4 => write!(f, "Uniswap V4"),
             Dex::PancakeSwapV3 => write!(f, "PancakeSwap V3"),
             Dex::LFJ => write!(f, "LFJ"),
             Dex::Kuru => write!(f, "Kuru"),
