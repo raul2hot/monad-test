@@ -66,10 +66,14 @@ async fn main() -> eyre::Result<()> {
         tokens::WMON,
         tokens::USDC,
         tokens::USDT,
+        tokens::AUSD,
         tokens::WETH,
         tokens::WBTC,
+        tokens::WSTETH,
         tokens::SMON,
         tokens::GMON,
+        tokens::SHMON,
+        tokens::GMONAD,
     ];
 
     info!("Monitoring {} tokens:", tokens_to_monitor.len());

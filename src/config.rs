@@ -39,14 +39,20 @@ pub mod tokens {
     // Stablecoins
     pub const USDC: Address = address!("754704Bc059F8C67012fEd69BC8A327a5aafb603");
     pub const USDT: Address = address!("e7cd86e13AC4309349F30B3435a9d337750fC82D");
+    pub const AUSD: Address = address!("00000000eFE302BEAA2b3e6e1b18d08D69a9012a"); // Agora USD
 
     // Major Tokens
     pub const WETH: Address = address!("EE8c0E9f1BFFb4Eb878d8f15f368A02a35481242");
     pub const WBTC: Address = address!("0555E30da8f98308EdB960aa94C0Db47230d2B9c");
+    pub const WSTETH: Address = address!("10Aeaf63194db8d453d4D85a06E5eFE1dd0b5417"); // Lido wstETH
 
     // Liquid Staking Tokens (LSTs)
-    pub const SMON: Address = address!("A3227C5969757783154C60bF0bC1944180ed81B9"); // Kintsu
-    pub const GMON: Address = address!("8498312A6B3CbD158bf0c93AbdCF29E6e4F55081"); // Magma
+    pub const SMON: Address = address!("A3227C5969757783154C60bF0bC1944180ed81B9"); // Kintsu sMON
+    pub const GMON: Address = address!("8498312A6B3CbD158bf0c93AbdCF29E6e4F55081"); // Magma gMON
+    pub const SHMON: Address = address!("1B68626dCa36c7fE922fD2d55E4f631d962dE19c"); // FastLane shMON
+
+    // Meme/Community Tokens
+    pub const GMONAD: Address = address!("7db552eeb6b77a6babe6e0a739b5382cd653cc3e"); // GMONAD
 
     // Base tokens for starting arbitrage cycles
     pub const BASE_TOKENS: [Address; 4] = [WMON, USDC, USDT, WETH];
@@ -57,25 +63,33 @@ pub mod tokens {
             a if a == WMON => "WMON",
             a if a == USDC => "USDC",
             a if a == USDT => "USDT",
+            a if a == AUSD => "AUSD",
             a if a == WETH => "WETH",
             a if a == WBTC => "WBTC",
+            a if a == WSTETH => "wstETH",
             a if a == SMON => "sMON",
             a if a == GMON => "gMON",
+            a if a == SHMON => "shMON",
+            a if a == GMONAD => "GMONAD",
             _ => "???",
         }
     }
 
     /// Get the decimals for a token address
-    /// USDC/USDT use 6 decimals, WBTC uses 8, most others use 18
+    /// USDC/USDT/AUSD use 6 decimals, WBTC uses 8, most others use 18
     pub fn decimals(addr: Address) -> u8 {
         match addr {
             a if a == WMON => 18,
             a if a == USDC => 6,
             a if a == USDT => 6,
+            a if a == AUSD => 6,
             a if a == WETH => 18,
             a if a == WBTC => 8,
+            a if a == WSTETH => 18,
             a if a == SMON => 18,
             a if a == GMON => 18,
+            a if a == SHMON => 18,
+            a if a == GMONAD => 18,
             _ => 18, // Default assumption
         }
     }
