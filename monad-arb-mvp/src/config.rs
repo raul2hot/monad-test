@@ -8,6 +8,8 @@ pub struct Config {
     pub poll_interval_ms: u64,
     pub max_hops: usize,
     pub min_profit_bps: u32, // Minimum profit in basis points (100 = 1%)
+    pub min_liquidity_usd: f64,      // Minimum liquidity in USD
+    pub min_liquidity_native: u128,  // Minimum liquidity in native token units
 }
 
 impl Config {
@@ -21,6 +23,8 @@ impl Config {
             poll_interval_ms: 1000, // 1 second (matches block time)
             max_hops: 4,            // Max 4 swaps in an arb cycle
             min_profit_bps: 10,     // 0.1% minimum to log
+            min_liquidity_usd: 1000.0,                    // $1000 minimum
+            min_liquidity_native: 1000 * 10u128.pow(18),  // 1000 MON minimum
         })
     }
 }
@@ -58,6 +62,21 @@ pub mod tokens {
             a if a == SMON => "sMON",
             a if a == GMON => "gMON",
             _ => "???",
+        }
+    }
+
+    /// Get the decimals for a token address
+    /// USDC/USDT use 6 decimals, WBTC uses 8, most others use 18
+    pub fn decimals(addr: Address) -> u8 {
+        match addr {
+            a if a == WMON => 18,
+            a if a == USDC => 6,
+            a if a == USDT => 6,
+            a if a == WETH => 18,
+            a if a == WBTC => 8,
+            a if a == SMON => 18,
+            a if a == GMON => 18,
+            _ => 18, // Default assumption
         }
     }
 }

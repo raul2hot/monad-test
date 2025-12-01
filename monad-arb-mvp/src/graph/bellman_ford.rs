@@ -111,12 +111,58 @@ impl ArbitrageCycle {
             return false;
         }
 
-        // Cap at 1000% to filter noise (unrealistic returns)
-        if self.expected_return > 10.0 {
+        // FIXED: Cap at 50% to filter noise (real arb is usually < 5%)
+        // Even 50% is generous - most real opportunities are < 1%
+        if self.expected_return > 1.5 {
+            tracing::trace!(
+                "Rejecting cycle with unrealistic return: {:.2}%",
+                self.profit_percentage()
+            );
+            return false;
+        }
+
+        // Minimum return check (avoid dust) - less than 0.01%
+        if self.expected_return < 1.0001 {
             return false;
         }
 
         true
+    }
+
+    /// Confidence score based on various factors
+    /// Returns a score where higher is more confident the opportunity is real
+    pub fn confidence_score(&self) -> f64 {
+        let mut score = 1.0;
+
+        // Cross-DEX is more likely to be real
+        if self.is_cross_dex() {
+            score *= 1.5;
+        }
+
+        // Lower profit is more likely to be real
+        if self.profit_percentage() < 1.0 {
+            score *= 1.2;
+        } else if self.profit_percentage() > 5.0 {
+            score *= 0.5; // Suspicious
+        }
+
+        // Fewer hops is better
+        if self.hop_count() <= 3 {
+            score *= 1.1;
+        }
+
+        score
+    }
+
+    /// Get confidence level as a string
+    pub fn confidence_level(&self) -> &'static str {
+        if self.profit_percentage() < 1.0 {
+            "HIGH"
+        } else if self.profit_percentage() < 5.0 {
+            "MEDIUM"
+        } else {
+            "LOW - VERIFY"
+        }
     }
 }
 
