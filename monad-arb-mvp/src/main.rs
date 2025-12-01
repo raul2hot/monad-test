@@ -9,7 +9,10 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::{tokens, Config};
-use dex::{lfj::LfjClient, pancakeswap::PancakeSwapClient, uniswap_v3::UniswapV3Client, DexClient};
+use dex::{
+    lfj::LfjClient, pancakeswap::PancakeSwapClient, uniswap_v3::UniswapV3Client,
+    uniswap_v4::UniswapV4Client, DexClient,
+};
 use graph::{ArbitrageGraph, BoundedBellmanFord};
 
 #[tokio::main]
@@ -53,7 +56,8 @@ async fn main() -> eyre::Result<()> {
     }
 
     // Initialize DEX clients
-    let uniswap = UniswapV3Client::new(provider.clone());
+    let uniswap_v3 = UniswapV3Client::new(provider.clone());
+    let uniswap_v4 = UniswapV4Client::new(provider.clone());
     let pancakeswap = PancakeSwapClient::new(provider.clone());
     let lfj = LfjClient::new(provider.clone());
 
@@ -96,7 +100,7 @@ async fn main() -> eyre::Result<()> {
         let mut total_pools = 0;
 
         // Fetch pools from Uniswap V3
-        match uniswap.get_pools(&tokens_to_monitor).await {
+        match uniswap_v3.get_pools(&tokens_to_monitor).await {
             Ok(pools) => {
                 let count = pools.len();
                 for pool in &pools {
@@ -108,7 +112,24 @@ async fn main() -> eyre::Result<()> {
                 }
             }
             Err(e) => {
-                warn!("Failed to fetch Uniswap pools: {}", e);
+                warn!("Failed to fetch Uniswap V3 pools: {}", e);
+            }
+        }
+
+        // Fetch pools from Uniswap V4
+        match uniswap_v4.get_pools(&tokens_to_monitor).await {
+            Ok(pools) => {
+                let count = pools.len();
+                for pool in &pools {
+                    graph.add_pool(pool);
+                }
+                total_pools += count;
+                if count > 0 {
+                    info!("Found {} Uniswap V4 pools", count);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to fetch Uniswap V4 pools: {}", e);
             }
         }
 

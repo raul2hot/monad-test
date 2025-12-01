@@ -122,4 +122,35 @@ pub mod contracts {
         pub const LB_ROUTER: Address = address!("18556DA13313f3532c54711497A8FedAC273220E");
         pub const LB_QUOTER: Address = address!("9A550a522BBaDFB69019b0432800Ed17855A51C3");
     }
+
+    /// Uniswap V4 contracts on Monad Mainnet (Chain ID 143)
+    /// Source: https://docs.uniswap.org/contracts/v4/deployments
+    pub mod uniswap_v4 {
+        use super::*;
+
+        /// Singleton PoolManager - all V4 pools are managed by this single contract
+        pub const POOL_MANAGER: Address = address!("188d586ddcf52439676ca21a244753fa19f9ea8e");
+        /// Position descriptor for LP positions
+        pub const POSITION_DESCRIPTOR: Address = address!("5770d2914355a6d0a39a70aeea9bcce55df4201b");
+        /// Position manager (ERC721 for LP positions)
+        pub const POSITION_MANAGER: Address = address!("5b7ec4a94ff9bedb700fb82ab09d5846972f4016");
+        /// Quoter for off-chain quote simulation
+        pub const QUOTER: Address = address!("a222dd357a9076d1091ed6aa2e76c9742dd26891");
+        /// StateView for off-chain state queries (getSlot0, getLiquidity, etc.)
+        pub const STATE_VIEW: Address = address!("77395f3b2e73ae90843717371294fa97cc419d64");
+        /// Universal Router for swap execution
+        pub const UNIVERSAL_ROUTER: Address = address!("0d97dc33264bfc1c226207428a79b26757fb9dc3");
+        /// Permit2 for token approvals
+        pub const PERMIT2: Address = address!("000000000022D473030F116dDEE9F6B43aC78BA3");
+
+        /// Common fee tiers in hundredths of a bip
+        /// V4 allows any static fee 0-1,000,000, but these are common defaults
+        pub const COMMON_FEE_TIERS: [u32; 5] = [100, 500, 3000, 10000, 100000];
+
+        /// Common tick spacings for V4 pools
+        pub const COMMON_TICK_SPACINGS: [i32; 4] = [1, 10, 60, 200];
+
+        /// Dynamic fee flag - when set in fee field, hooks control the fee
+        pub const DYNAMIC_FEE_FLAG: u32 = 0x800000;
+    }
 }
