@@ -38,18 +38,42 @@ pub mod tokens {
 
     // Stablecoins
     pub const USDC: Address = address!("754704Bc059F8C67012fEd69BC8A327a5aafb603");
-    pub const USDT: Address = address!("e7cd86e13AC4309349F30B3435a9d337750fC82D");
+    pub const USDT: Address = address!("e7cd86e13AC4309349F30B3435a9d337750fC82D"); // USDT0
     pub const AUSD: Address = address!("00000000eFE302BEAA2b3e6e1b18d08D69a9012a"); // Agora USD
+    pub const AZND: Address = address!("4917a5ec9fCb5e10f47CBB197aBe6aB63be81fE8"); // Asian Dollar
+    pub const USD1: Address = address!("111111d2bf19e43C34263401e0CAd979eD1cdb61"); // World Liberty Financial USD
+    pub const IDRX: Address = address!("18Bc5bcC660cf2B9cE3cd51a404aFe1a0cBD3C22"); // Indonesian Rupiah stablecoin
+    pub const LVUSD: Address = address!("FD44B35139Ae53FFF7d8F2A9869c503D987f00d1"); // LeverUp USD
+    pub const XAUT0: Address = address!("01bFF41798a0BcF287b996046Ca68b395DbC1071"); // Tether Gold
+    pub const EARNAUSD: Address = address!("103222f020e98Bba0AD9809A011FDF8e6F067496"); // earnAUSD
+    pub const SAUSD: Address = address!("D793c04B87386A6bb84ee61D98e0065FdE7fdA5E"); // sAUSD
+    pub const MUBOND: Address = address!("336D414754967C6682B5A665C7DAF6F1409E63e8"); // mu Bond
+    pub const SUUSD: Address = address!("8BF591Eae535f93a242D5A954d3Cde648b48A5A8"); // Sumerian USD
 
     // Major Tokens
     pub const WETH: Address = address!("EE8c0E9f1BFFb4Eb878d8f15f368A02a35481242");
     pub const WBTC: Address = address!("0555E30da8f98308EdB960aa94C0Db47230d2B9c");
     pub const WSTETH: Address = address!("10Aeaf63194db8d453d4D85a06E5eFE1dd0b5417"); // Lido wstETH
+    pub const BTCB: Address = address!("B0F70C0bD6FD87dbEb7C10dC692a2a6106817072"); // Bitcoin (bridged)
+    pub const LBTC: Address = address!("ecAc9C5F704e954931349Da37F60E39f515c11c1"); // Lombard Staked Bitcoin
+    pub const SOL: Address = address!("ea17E5a9efEBf1477dB45082d67010E2245217f1"); // Wrapped SOL
+    pub const WEETH: Address = address!("A3D68b74bF0528fdD07263c60d6488749044914b"); // Wrapped eETH (EtherFi)
+    pub const PUFETH: Address = address!("37D6382B6889cCeF8d6871A8b60E667115eDDBcF"); // Puffer ETH
+    pub const SUBTC: Address = address!("e85411C030fB32A9D8b14Bbbc6CB19417391F711"); // Sumerian BTC
+    pub const SUETH: Address = address!("1c22531AA9747d76fFF8F0A43b37954ca67d28e0"); // Sumerian ETH
 
     // Liquid Staking Tokens (LSTs)
     pub const SMON: Address = address!("A3227C5969757783154C60bF0bC1944180ed81B9"); // Kintsu sMON
     pub const GMON: Address = address!("8498312A6B3CbD158bf0c93AbdCF29E6e4F55081"); // Magma gMON
     pub const SHMON: Address = address!("1B68626dCa36c7fE922fD2d55E4f631d962dE19c"); // FastLane shMON
+    pub const APRMON: Address = address!("0c65A0BC65a5D819235B71F554D210D3F80E0852"); // aPriori Monad LST
+    pub const LVMON: Address = address!("91b81bfbe3A747230F0529Aa28d8b2Bc898E6D56"); // LeverUp MON
+    pub const MCMON: Address = address!("1D4795A4670033f47f572b910553be0295077b51"); // mcMON
+
+    // Protocol Tokens
+    pub const EUL: Address = address!("Def72Af3fc69E1Dd5a094f7DDa08Ba203CD0438B"); // Euler
+    pub const FOLKS: Address = address!("FF7F8F301F7A706E3CfD3D2275f5dc0b9EE8009B"); // Folks Finance
+    pub const MVT: Address = address!("04f8c38AE80BcF690B947f60F62BdA18145c3D67"); // Monad Vault
 
     // Meme/Community Tokens
     pub const GMONAD: Address = address!("7db552eeb6b77a6babe6e0a739b5382cd653cc3e"); // GMONAD
@@ -60,16 +84,44 @@ pub mod tokens {
     /// Get the symbol for a token address
     pub fn symbol(addr: Address) -> &'static str {
         match addr {
+            // Native Wrapped Token
             a if a == WMON => "WMON",
+            // Stablecoins
             a if a == USDC => "USDC",
-            a if a == USDT => "USDT",
+            a if a == USDT => "USDT0",
             a if a == AUSD => "AUSD",
+            a if a == AZND => "AZND",
+            a if a == USD1 => "USD1",
+            a if a == IDRX => "IDRX",
+            a if a == LVUSD => "LVUSD",
+            a if a == XAUT0 => "XAUt0",
+            a if a == EARNAUSD => "earnAUSD",
+            a if a == SAUSD => "sAUSD",
+            a if a == MUBOND => "muBOND",
+            a if a == SUUSD => "suUSD",
+            // Major Tokens
             a if a == WETH => "WETH",
             a if a == WBTC => "WBTC",
             a if a == WSTETH => "wstETH",
+            a if a == BTCB => "BTC.b",
+            a if a == LBTC => "LBTC",
+            a if a == SOL => "SOL",
+            a if a == WEETH => "weETH",
+            a if a == PUFETH => "pufETH",
+            a if a == SUBTC => "suBTC",
+            a if a == SUETH => "suETH",
+            // Liquid Staking Tokens (LSTs)
             a if a == SMON => "sMON",
             a if a == GMON => "gMON",
             a if a == SHMON => "shMON",
+            a if a == APRMON => "aprMON",
+            a if a == LVMON => "LVMON",
+            a if a == MCMON => "mcMON",
+            // Protocol Tokens
+            a if a == EUL => "EUL",
+            a if a == FOLKS => "FOLKS",
+            a if a == MVT => "MVT",
+            // Meme/Community Tokens
             a if a == GMONAD => "GMONAD",
             _ => "???",
         }
@@ -79,16 +131,43 @@ pub mod tokens {
     /// USDC/USDT/AUSD use 6 decimals, WBTC uses 8, most others use 18
     pub fn decimals(addr: Address) -> u8 {
         match addr {
-            a if a == WMON => 18,
+            // 2 decimals
+            a if a == IDRX => 2,
+            // 6 decimals
             a if a == USDC => 6,
             a if a == USDT => 6,
             a if a == AUSD => 6,
-            a if a == WETH => 18,
+            a if a == USD1 => 6,
+            a if a == XAUT0 => 6,
+            a if a == EARNAUSD => 6,
+            a if a == SAUSD => 6,
+            a if a == FOLKS => 6,
+            // 8 decimals
             a if a == WBTC => 8,
+            a if a == BTCB => 8,
+            a if a == LBTC => 8,
+            // 9 decimals
+            a if a == SOL => 9,
+            // 18 decimals (default for most tokens)
+            a if a == WMON => 18,
+            a if a == WETH => 18,
             a if a == WSTETH => 18,
+            a if a == AZND => 18,
+            a if a == LVUSD => 18,
+            a if a == MUBOND => 18,
+            a if a == SUUSD => 18,
+            a if a == WEETH => 18,
+            a if a == PUFETH => 18,
+            a if a == SUBTC => 18,
+            a if a == SUETH => 18,
             a if a == SMON => 18,
             a if a == GMON => 18,
             a if a == SHMON => 18,
+            a if a == APRMON => 18,
+            a if a == LVMON => 18,
+            a if a == MCMON => 18,
+            a if a == EUL => 18,
+            a if a == MVT => 18,
             a if a == GMONAD => 18,
             _ => 18, // Default assumption
         }
