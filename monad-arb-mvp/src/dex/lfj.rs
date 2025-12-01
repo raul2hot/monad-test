@@ -52,6 +52,22 @@ sol! {
 /// Bin step determines the price increment between bins (in basis points)
 const LB_BIN_STEPS: [u32; 6] = [1, 2, 5, 10, 15, 20];
 
+/// Convert U256 to f64 safely, handling values larger than u128::MAX
+fn u256_to_f64(value: U256) -> f64 {
+    // If the value fits in u128, use direct conversion
+    if value <= U256::from(u128::MAX) {
+        return value.to::<u128>() as f64;
+    }
+
+    // For larger values, split into high and low 128-bit parts
+    let shifted: U256 = value >> 128;
+    let high = shifted.to::<u128>() as f64;
+    let low = (value & U256::from(u128::MAX)).to::<u128>() as f64;
+
+    // Combine: high * 2^128 + low
+    high * 2_f64.powi(128) + low
+}
+
 /// LFJ (TraderJoe Liquidity Book) DEX client
 pub struct LfjClient<P> {
     provider: P,
@@ -111,8 +127,8 @@ impl<P: Provider + Clone> LfjClient<P> {
         // price_x128 = actual_price * 2^128
         // We need to convert to sqrtPriceX96 = sqrt(actual_price) * 2^96
 
-        // First get the actual price as f64
-        let price_x128_f64 = price_x128.to::<u128>() as f64;
+        // Convert U256 to f64 safely (handle values > u128::MAX)
+        let price_x128_f64 = u256_to_f64(price_x128);
         let actual_price = price_x128_f64 / (2_f64.powi(128));
 
         // Get decimals for adjustment
