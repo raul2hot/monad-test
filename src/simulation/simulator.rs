@@ -13,6 +13,11 @@ use eyre::{eyre, Result};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Maximum reasonable gas for a 2-3 hop swap (1M gas)
+/// When eth_estimateGas reverts, it returns absurdly high values
+/// A typical 2-hop swap uses ~300-500k gas
+const MAX_REASONABLE_GAS: u64 = 1_000_000;
+
 use super::fee_validator::FeeValidator;
 use super::liquidity::{LiquidityAnalyzer, LiquidityInfo};
 use super::profit_calculator::{FlashLoanProvider, ProfitBreakdown, ProfitCalculator};
@@ -201,8 +206,54 @@ where
         let gas_price = U256::from(gas_price_u128);
         let gas_units = quotes.total_gas_estimate + 50_000; // Add buffer for flash loan
 
+        // 5a. Sanity check: reject if gas estimate is absurdly high
+        // When eth_estimateGas reverts, it returns huge values (e.g., 4.73 MON worth of gas)
+        // A typical 2-3 hop swap uses 300-500k gas, so 1M is a generous upper bound
+        if gas_units > MAX_REASONABLE_GAS {
+            warn!(
+                "Gas estimate {} exceeds max reasonable {} - likely revert in quoter",
+                gas_units, MAX_REASONABLE_GAS
+            );
+            return Ok(self.create_rejected_result(
+                cycle,
+                input_amount,
+                &liquidity_info,
+                format!(
+                    "Gas estimate too high ({} > {}), likely swap would revert",
+                    gas_units, MAX_REASONABLE_GAS
+                ),
+            ));
+        }
+
         // 6. Calculate profit breakdown
         let gross_output = quotes.final_amount_out();
+
+        // 6a. Sanity check: reject if gross output is extremely low (indicates bad quote)
+        // If output < 50% of input, something is very wrong (e.g., -8013 bps = output is 20% of input)
+        // Real arbitrage opportunities should have gross output close to input (within a few %)
+        let min_reasonable_output = input_amount / U256::from(2); // 50% of input
+        if gross_output < min_reasonable_output {
+            let loss_bps = if gross_output > U256::ZERO {
+                let ratio = (input_amount - gross_output).to::<u128>() * 10000 / input_amount.to::<u128>();
+                ratio as i32
+            } else {
+                10000 // 100% loss
+            };
+            warn!(
+                "Gross output {} is < 50% of input {} (-{} bps) - likely bad quote from V4/hooks",
+                gross_output, input_amount, loss_bps
+            );
+            return Ok(self.create_rejected_result(
+                cycle,
+                input_amount,
+                &liquidity_info,
+                format!(
+                    "Gross output too low (-{} bps), likely pool returned bad quote",
+                    loss_bps
+                ),
+            ));
+        }
+
         let profit_breakdown = self.profit_calculator.calculate(
             input_amount,
             gross_output,
