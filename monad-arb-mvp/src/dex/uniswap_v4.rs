@@ -237,9 +237,9 @@ impl<P: Provider + Clone + Send + Sync> DexClient for UniswapV4Client<P> {
                 error_count,
                 self.state_view
             );
-        } else if pools.is_empty() {
-            tracing::debug!(
-                "Uniswap V4: checked {} pool configs, no pools found",
+        } else if pools.is_empty() && checked_count > 0 {
+            tracing::info!(
+                "Uniswap V4: checked {} pool configs, no V4 pools found for monitored tokens",
                 checked_count
             );
         }
