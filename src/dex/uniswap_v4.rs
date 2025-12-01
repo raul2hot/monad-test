@@ -200,62 +200,133 @@ impl<P: Provider + Clone> UniswapV4Client<P> {
         let latest_block = self.provider.get_block_number().await?;
 
         // Query Initialize events from PoolManager
-        // Look back ~500k blocks to catch all pools (adjust based on chain age)
-        let from_block = latest_block.saturating_sub(500_000);
+        // Look back ~50k blocks (reasonable range), query in chunks due to RPC limits
+        let total_blocks_back: u64 = 50_000;
+        let chunk_size: u64 = 10_000; // Use 10k chunks for faster querying
+        let start_block = latest_block.saturating_sub(total_blocks_back);
 
-        tracing::debug!(
+        tracing::info!(
             "Querying V4 Initialize events from block {} to {} on PoolManager {}",
-            from_block,
+            start_block,
             latest_block,
             self.pool_manager
         );
 
-        let filter = Filter::new()
-            .address(self.pool_manager)
-            .event_signature(IPoolManager::Initialize::SIGNATURE_HASH)
-            .from_block(from_block)
-            .to_block(latest_block);
+        let mut current_from = start_block;
+        let mut total_logs = 0u64;
+        let mut chunk_errors = 0u32;
 
-        let logs = self.provider.get_logs(&filter).await?;
+        while current_from < latest_block {
+            let current_to = std::cmp::min(current_from + chunk_size - 1, latest_block);
 
-        tracing::debug!("Found {} Initialize events from PoolManager", logs.len());
+            let filter = Filter::new()
+                .address(self.pool_manager)
+                .event_signature(IPoolManager::Initialize::SIGNATURE_HASH)
+                .from_block(current_from)
+                .to_block(current_to);
 
-        for log in logs {
-            // Parse the Initialize event
-            match log.log_decode::<IPoolManager::Initialize>() {
-                Ok(decoded) => {
-                    let event = decoded.inner.data;
-                    let currency0 = event.currency0;
-                    let currency1 = event.currency1;
+            match self.provider.get_logs(&filter).await {
+                Ok(logs) => {
+                    total_logs += logs.len() as u64;
+                    for log in logs {
+                        // Parse the Initialize event
+                        match log.log_decode::<IPoolManager::Initialize>() {
+                            Ok(decoded) => {
+                                let event = decoded.inner.data;
+                                let currency0 = event.currency0;
+                                let currency1 = event.currency1;
 
-                    // Only include pools with at least one monitored token
-                    if token_set.contains(&currency0) || token_set.contains(&currency1) {
-                        let fee: u32 = event.fee.to::<u32>();
-                        let tick_spacing: i32 = event.tickSpacing.as_i32();
+                                // Only include pools with at least one monitored token
+                                if token_set.contains(&currency0)
+                                    || token_set.contains(&currency1)
+                                {
+                                    let fee: u32 = event.fee.to::<u32>();
+                                    let tick_spacing: i32 = event.tickSpacing.as_i32();
 
-                        discovered.push(DiscoveredPool {
-                            currency0,
-                            currency1,
-                            fee,
-                            tick_spacing,
-                            hooks: event.hooks,
-                        });
+                                    discovered.push(DiscoveredPool {
+                                        currency0,
+                                        currency1,
+                                        fee,
+                                        tick_spacing,
+                                        hooks: event.hooks,
+                                    });
 
-                        tracing::debug!(
-                            "Discovered V4 pool: {}-{} (fee: {}, tickSpacing: {}, hooks: {})",
-                            tokens::symbol(currency0),
-                            tokens::symbol(currency1),
-                            fee,
-                            tick_spacing,
-                            event.hooks
-                        );
+                                    tracing::debug!(
+                                        "Discovered V4 pool: {}-{} (fee: {}, tickSpacing: {}, hooks: {})",
+                                        tokens::symbol(currency0),
+                                        tokens::symbol(currency1),
+                                        fee,
+                                        tick_spacing,
+                                        event.hooks
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::trace!("Failed to decode Initialize event: {}", e);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
-                    tracing::trace!("Failed to decode Initialize event: {}", e);
+                    chunk_errors += 1;
+                    // If we get rate limited, try smaller chunks
+                    if chunk_errors == 1 {
+                        tracing::debug!(
+                            "Log query failed for blocks {}-{}: {}, will try smaller chunks",
+                            current_from,
+                            current_to,
+                            e
+                        );
+                    }
+                    // Try with 1000 block chunks as fallback
+                    let small_chunk_size: u64 = 1000;
+                    let mut small_from = current_from;
+                    while small_from <= current_to {
+                        let small_to = std::cmp::min(small_from + small_chunk_size - 1, current_to);
+                        let small_filter = Filter::new()
+                            .address(self.pool_manager)
+                            .event_signature(IPoolManager::Initialize::SIGNATURE_HASH)
+                            .from_block(small_from)
+                            .to_block(small_to);
+
+                        if let Ok(logs) = self.provider.get_logs(&small_filter).await {
+                            total_logs += logs.len() as u64;
+                            for log in logs {
+                                if let Ok(decoded) = log.log_decode::<IPoolManager::Initialize>() {
+                                    let event = decoded.inner.data;
+                                    let currency0 = event.currency0;
+                                    let currency1 = event.currency1;
+
+                                    if token_set.contains(&currency0)
+                                        || token_set.contains(&currency1)
+                                    {
+                                        let fee: u32 = event.fee.to::<u32>();
+                                        let tick_spacing: i32 = event.tickSpacing.as_i32();
+
+                                        discovered.push(DiscoveredPool {
+                                            currency0,
+                                            currency1,
+                                            fee,
+                                            tick_spacing,
+                                            hooks: event.hooks,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        small_from = small_to + 1;
+                    }
                 }
             }
+
+            current_from = current_to + 1;
         }
+
+        tracing::info!(
+            "V4 event scan complete: {} Initialize events found, {} pools with monitored tokens",
+            total_logs,
+            discovered.len()
+        );
 
         Ok(discovered)
     }
