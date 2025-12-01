@@ -325,8 +325,14 @@ where
         let fee = result.fee;
 
         // Calculate effective fee in bps
+        // IMPORTANT: Use u128 arithmetic to avoid overflow with large amounts
+        // fee and amount_in are both u128, and we need to preserve precision
         let fee_bps = if amount_in_u128 > 0 {
-            ((fee as u64 * 10000) / (amount_in_u128 as u64)) as u32
+            // fee_bps = (fee * 10000) / amount_in
+            // For safety, we do: (fee / (amount_in / 10000)) to avoid overflow
+            // Or equivalently: fee * 10000 / amount_in using checked math
+            let numerator = (fee as u128).saturating_mul(10000);
+            (numerator / amount_in_u128) as u32
         } else {
             0
         };
