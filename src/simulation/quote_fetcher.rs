@@ -10,7 +10,7 @@ use alloy::sol;
 use eyre::{eyre, Result};
 use std::sync::Arc;
 
-use crate::config::contracts;
+use crate::config::{contracts, tokens};
 use crate::dex::{Dex, Pool};
 
 /// Quote from a single pool
@@ -262,7 +262,21 @@ where
         };
 
         // Use call() to simulate without state change
-        let result = quoter.quoteExactInputSingle(params).call().await?;
+        // IMPORTANT: The quoter revert is the authoritative signal that a swap can't execute
+        let result = quoter.quoteExactInputSingle(params).call().await.map_err(|e| {
+            let decimals_in = tokens::decimals(token_in);
+            let decimals_out = tokens::decimals(token_out);
+            eyre!(
+                "V3 quoter failed for {} {} ({} decimals) -> {} ({} decimals) in pool {}: {}",
+                amount_in,
+                tokens::symbol(token_in),
+                decimals_in,
+                tokens::symbol(token_out),
+                decimals_out,
+                pool.address,
+                e
+            )
+        })?;
 
         let amount_out = result.amountOut;
         let sqrt_price_after = result.sqrtPriceX96After;
@@ -320,21 +334,63 @@ where
         // Convert U256 to u128 for LFJ
         let amount_in_u128: u128 = amount_in.try_into().unwrap_or(u128::MAX);
 
-        let result = pair.getSwapOut(amount_in_u128, swap_for_y).call().await?;
+        // Get token decimal info for logging
+        let decimals_in = tokens::decimals(token_in);
+        let decimals_out = tokens::decimals(token_out);
 
-        // CRITICAL FIX: Check if full amount was swapped
-        // amountInLeft > 0 means insufficient liquidity in the active bins
-        let amount_in_left = result.amountInLeft;
-        if amount_in_left > 0 {
-            return Err(eyre!(
-                "LFJ pool {} has insufficient liquidity: {} of {} not swapped",
+        let result = pair.getSwapOut(amount_in_u128, swap_for_y).call().await.map_err(|e| {
+            eyre!(
+                "LFJ getSwapOut failed for {} {} ({} decimals) -> {} ({} decimals) in pool {}: {}",
+                amount_in_u128,
+                tokens::symbol(token_in),
+                decimals_in,
+                tokens::symbol(token_out),
+                decimals_out,
                 pool.address,
-                amount_in_left,
-                amount_in_u128
+                e
+            )
+        })?;
+
+        // CRITICAL FIX: Correctly interpret LFJ getSwapOut() return values
+        // amountInLeft > 0 does NOT always mean reject - partial fills can be profitable
+        //
+        // Interpretation:
+        // - amountInLeft == amountIn && amountOut == 0: NO liquidity at all -> reject
+        // - amountInLeft > 0 && amountOut > 0: Partial fill available -> may still be profitable
+        // - amountInLeft == 0: Full swap possible -> accept
+        let amount_in_left = result.amountInLeft;
+        let amount_out_raw = result.amountOut;
+
+        if amount_in_left == amount_in_u128 && amount_out_raw == 0 {
+            // No liquidity at all - legitimate rejection
+            return Err(eyre!(
+                "LFJ pool {} has NO liquidity for {} {} ({} decimals) -> {} ({} decimals): amountInLeft={}, amountOut=0",
+                pool.address,
+                amount_in_u128,
+                tokens::symbol(token_in),
+                decimals_in,
+                tokens::symbol(token_out),
+                decimals_out,
+                amount_in_left
             ));
         }
 
-        let amount_out = U256::from(result.amountOut);
+        // Calculate the actual amount that was swapped
+        let actual_amount_in = amount_in_u128 - amount_in_left;
+
+        // Log partial fills for visibility
+        if amount_in_left > 0 && amount_out_raw > 0 {
+            tracing::debug!(
+                "LFJ pool {} partial fill: {} of {} swapped ({:.1}%), output: {}",
+                pool.address,
+                actual_amount_in,
+                amount_in_u128,
+                (actual_amount_in as f64 / amount_in_u128 as f64) * 100.0,
+                amount_out_raw
+            );
+        }
+
+        let amount_out = U256::from(amount_out_raw);
         let fee = result.fee;
 
         // LFJ: fee is returned as absolute amount from getSwapOut
@@ -407,7 +463,23 @@ where
             hookData: Bytes::new(),
         };
 
-        let result = quoter.quoteExactInputSingle(params).call().await?;
+        // Get token decimal info for logging
+        let decimals_in = tokens::decimals(token_in);
+        let decimals_out = tokens::decimals(token_out);
+
+        let result = quoter.quoteExactInputSingle(params).call().await.map_err(|e| {
+            eyre!(
+                "V4 quoter failed for {} {} ({} decimals) -> {} ({} decimals) in pool {} (hooks: {}): {}",
+                amount_in,
+                tokens::symbol(token_in),
+                decimals_in,
+                tokens::symbol(token_out),
+                decimals_out,
+                pool.address,
+                pool.hooks.map(|h| h.to_string()).unwrap_or_else(|| "none".to_string()),
+                e
+            )
+        })?;
 
         let amount_out = result.amountOut;
         let gas_estimate = result.gasEstimate.to::<u64>();

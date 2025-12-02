@@ -167,31 +167,53 @@ where
         // 1. Build pool info list with correct swap directions
         let pool_infos = self.build_pool_infos(cycle)?;
 
-        // 2. Check liquidity for all pools
+        // 2. Check liquidity for all pools (for diagnostics/logging only)
+        // CRITICAL FIX: Do NOT reject based on liquidity threshold alone!
+        // The liquidity value from V3 pools is the L parameter, not actual reserves.
+        // The only reliable way to validate swap feasibility is via the quoter.
         let liquidity_info = self.check_liquidity(&cycle.pools, &cycle.dexes).await?;
 
-        // Check minimum liquidity
+        // Log low liquidity pools but DON'T reject - let the quoter decide
         for (i, liq) in liquidity_info.iter().enumerate() {
             if liq.total_liquidity < self.min_liquidity {
-                return Ok(self.create_rejected_result(
-                    cycle,
-                    input_amount,
-                    &liquidity_info,
-                    format!(
-                        "Pool {} has insufficient liquidity: {} < {}",
-                        cycle.pools[i],
-                        liq.total_liquidity,
-                        self.min_liquidity
-                    ),
-                ));
+                debug!(
+                    "Pool {} has low liquidity: {} < threshold {} (will verify via quoter)",
+                    cycle.pools[i],
+                    liq.total_liquidity,
+                    self.min_liquidity
+                );
             }
         }
 
-        // 3. Get atomic quotes for the path
+        // 3. Get atomic quotes for the path (this is the REAL validation)
         let quotes = match self.quote_fetcher.get_path_quotes(&pool_infos, input_amount).await {
             Ok(q) => q,
             Err(e) => {
-                warn!("Failed to get quotes for cycle: {}", e);
+                // Enhanced diagnostic logging for quote failures
+                warn!(
+                    "Quote failed for cycle {} via {}: {}",
+                    cycle.token_path(),
+                    cycle.dex_path(),
+                    e
+                );
+
+                // Log detailed pool information for debugging
+                for (i, pool_info) in pool_infos.iter().enumerate() {
+                    let liq = liquidity_info.get(i);
+                    debug!(
+                        "  Pool {}: {} ({}) | token0={} ({}d), token1={} ({}d) | fee={} | liq={}",
+                        i,
+                        pool_info.address,
+                        pool_info.dex,
+                        tokens::symbol(pool_info.token0),
+                        tokens::decimals(pool_info.token0),
+                        tokens::symbol(pool_info.token1),
+                        tokens::decimals(pool_info.token1),
+                        pool_info.fee,
+                        liq.map(|l| l.total_liquidity.to_string()).unwrap_or_else(|| "N/A".to_string())
+                    );
+                }
+
                 return Ok(self.create_rejected_result(
                     cycle,
                     input_amount,

@@ -117,13 +117,22 @@ impl<P: Provider + Clone + Send + Sync> DexClient for UniswapV3Client<P> {
                     if let Ok(Some(pool_addr)) = self.get_pool_address(token0, token1, fee).await {
                         match self.get_pool_state(pool_addr, token0, token1, fee).await {
                             Ok(pool) => {
-                                // Multiple validity checks: liquidity, price validity, and minimum threshold
+                                // CRITICAL FIX: V3 liquidity value (L) is NOT comparable to reserve amounts
+                                // The L parameter represents concentrated liquidity, not actual token reserves
+                                // A low L doesn't necessarily mean a swap can't execute - the quoter is the
+                                // only reliable way to validate swap feasibility for V3 pools.
+                                //
+                                // We use has_sufficient_liquidity_normalized which adjusts thresholds
+                                // appropriately for V3's L value (divides by 1000).
+                                //
+                                // For truly reliable filtering, we'd need to query the quoter here,
+                                // but that would be too expensive during pool discovery.
                                 if pool.liquidity > U256::ZERO
                                     && pool.is_price_valid()
-                                    && pool.has_sufficient_liquidity(thresholds::MIN_TOTAL_LIQUIDITY)
+                                    && pool.has_sufficient_liquidity_normalized(thresholds::MIN_NORMALIZED_LIQUIDITY)
                                 {
                                     tracing::debug!(
-                                        "Found valid Uniswap V3 pool: {} (fee: {}, liq: {}, price: {:.8})",
+                                        "Found valid Uniswap V3 pool: {} (fee: {}, L: {}, price: {:.8})",
                                         pool_addr,
                                         fee,
                                         pool.liquidity,
@@ -132,8 +141,9 @@ impl<P: Provider + Clone + Send + Sync> DexClient for UniswapV3Client<P> {
                                     pools.push(pool);
                                 } else {
                                     tracing::trace!(
-                                        "Skipping Uniswap V3 pool {} - insufficient liquidity or invalid price",
-                                        pool_addr
+                                        "Skipping Uniswap V3 pool {} - L={} below threshold or invalid price (note: L is NOT reserves)",
+                                        pool_addr,
+                                        pool.liquidity
                                     );
                                 }
                             }
