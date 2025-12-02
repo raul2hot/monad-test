@@ -32,19 +32,6 @@ sol! {
     );
 }
 
-// Nad.fun DEX uses Uniswap V2-style Swap events
-sol! {
-    #[derive(Debug)]
-    event NadfunSwap(
-        address indexed sender,
-        uint256 amount0In,
-        uint256 amount1In,
-        uint256 amount0Out,
-        uint256 amount1Out,
-        address indexed to
-    );
-}
-
 // Uniswap V3 pool slot0 function
 sol! {
     #[derive(Debug)]
@@ -159,54 +146,6 @@ fn calculate_price_from_sqrt_price_x96(sqrt_price_x96: U160, token0_is_wmon: boo
     } else {
         // price is token0/token1 = token/WMON, need to invert
         if price > 0.0 { 1.0 / price } else { 0.0 }
-    }
-}
-
-/// Calculate price from Nad.fun swap amounts
-fn calculate_price_from_swap(
-    amount0_in: U256,
-    amount1_in: U256,
-    amount0_out: U256,
-    amount1_out: U256,
-    token0_is_wmon: bool,
-) -> Option<f64> {
-    let (token_amount, wmon_amount) = if token0_is_wmon {
-        if !amount0_in.is_zero() && !amount1_out.is_zero() {
-            (amount1_out, amount0_in)
-        } else if !amount1_in.is_zero() && !amount0_out.is_zero() {
-            (amount1_in, amount0_out)
-        } else {
-            return None;
-        }
-    } else {
-        if !amount0_in.is_zero() && !amount1_out.is_zero() {
-            (amount0_in, amount1_out)
-        } else if !amount1_in.is_zero() && !amount0_out.is_zero() {
-            (amount0_out, amount1_in)
-        } else {
-            return None;
-        }
-    };
-
-    if token_amount.is_zero() {
-        return None;
-    }
-
-    let wmon_f64 = wmon_amount.to_string().parse::<f64>().unwrap_or(0.0);
-    let token_f64 = token_amount.to_string().parse::<f64>().unwrap_or(1.0);
-
-    Some(wmon_f64 / token_f64)
-}
-
-/// Calculate price from Nad.fun reserves
-fn calculate_price_from_reserves(reserve0: U256, reserve1: U256, token0_is_wmon: bool) -> f64 {
-    let r0 = reserve0.to_string().parse::<f64>().unwrap_or(0.0);
-    let r1 = reserve1.to_string().parse::<f64>().unwrap_or(0.0);
-
-    if token0_is_wmon {
-        if r1 > 0.0 { r0 / r1 } else { 0.0 }
-    } else {
-        if r0 > 0.0 { r1 / r0 } else { 0.0 }
     }
 }
 
@@ -340,18 +279,13 @@ async fn main() -> Result<()> {
     let uniswap_sub = provider.subscribe_logs(&uniswap_filter).await?;
     let mut uniswap_stream = uniswap_sub.into_stream();
 
-    // Subscribe to Nad.fun Swap events
+    // Subscribe to Nad.fun Swap events (uses V3 signature!)
     let nadfun_filter = Filter::new()
         .address(chog_nadfun_pool)
-        .event_signature(NadfunSwap::SIGNATURE_HASH);
+        .event_signature(UniswapSwap::SIGNATURE_HASH);  // V3, not V2!
 
     let nadfun_sub = provider.subscribe_logs(&nadfun_filter).await?;
     let mut nadfun_stream = nadfun_sub.into_stream();
-
-    // Debug: Subscribe to ALL events from Nad.fun pool
-    let debug_filter = Filter::new().address(chog_nadfun_pool);
-    let debug_sub = provider.subscribe_logs(&debug_filter).await?;
-    let mut debug_stream = debug_sub.into_stream();
 
     info!("Subscriptions active");
 
@@ -380,43 +314,17 @@ async fn main() -> Result<()> {
     // Spawn task for Nad.fun events
     let nadfun_task = tokio::spawn(async move {
         while let Some(log) = nadfun_stream.next().await {
-            if let Ok(decoded) = NadfunSwap::decode_log(&log.inner) {
+            if let Ok(decoded) = UniswapSwap::decode_log(&log.inner) {
                 let block = log.block_number.unwrap_or(0);
+                let price = calculate_price_from_sqrt_price_x96(decoded.data.sqrtPriceX96, token0_is_wmon);
 
-                if let Some(price) = calculate_price_from_swap(
-                    decoded.data.amount0In,
-                    decoded.data.amount1In,
-                    decoded.data.amount0Out,
-                    decoded.data.amount1Out,
-                    token0_is_wmon,
-                ) {
-                    debug!(
-                        "Nad.fun CHOG swap: in=({},{}), out=({},{}), price={:.10}",
-                        decoded.data.amount0In, decoded.data.amount1In,
-                        decoded.data.amount0Out, decoded.data.amount1Out,
-                        price
-                    );
+                debug!(
+                    "Nad.fun CHOG swap: tick={}, sqrtPriceX96={}, price={:.10}",
+                    decoded.data.tick, decoded.data.sqrtPriceX96, price
+                );
 
-                    state2.update_nadfun("CHOG", price);
-                    state2.print_prices("CHOG", block, "Nad.fun");
-                }
-            }
-        }
-    });
-
-    // Debug task to identify what events the pool actually emits
-    let debug_task = tokio::spawn(async move {
-        println!("\n=== DEBUG: Listening for ALL Nad.fun pool events ===\n");
-        while let Some(log) = debug_stream.next().await {
-            let block = log.block_number.unwrap_or(0);
-            println!("\n[DEBUG] Block {} - Topics: {:?}", block, log.topics());
-
-            if let Some(topic0) = log.topics().first() {
-                let t = format!("{:?}", topic0);
-                if t.contains("d78ad95f") { println!("  >> Uniswap V2 Swap"); }
-                else if t.contains("c42079f9") { println!("  >> Uniswap V3 Swap"); }
-                else if t.contains("1c411e9a") { println!("  >> Sync event"); }
-                else { println!("  >> Unknown/Custom event"); }
+                state2.update_nadfun("CHOG", price);
+                state2.print_prices("CHOG", block, "Nad.fun");
             }
         }
     });
@@ -428,9 +336,6 @@ async fn main() -> Result<()> {
         }
         _ = nadfun_task => {
             warn!("Nad.fun subscription ended");
-        }
-        _ = debug_task => {
-            warn!("Debug subscription ended");
         }
     }
 
