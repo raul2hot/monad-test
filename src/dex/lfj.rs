@@ -387,6 +387,25 @@ impl<P: Provider + Clone> LfjClient<P> {
 
         // Convert to sqrtPriceX96 format for consistency with Uniswap V3
         // sqrtPriceX96 = sqrt(raw_price) * 2^96
+        // where raw_price is the non-adjusted ratio (token1_raw_units / token0_raw_units)
+        //
+        // CRITICAL FIX: actual_price from get_quote_based_rate() is already DECIMAL-ADJUSTED
+        // (i.e., the human-readable price like 0.04 USDC per WMON).
+        // But Pool::price_0_to_1() will apply decimal adjustment: raw_price * 10^(dec0-dec1)
+        // So we must convert actual_price back to raw_price first to avoid double-adjustment.
+        //
+        // Formula: adjusted_price = raw_price * 10^(decimals0 - decimals1)
+        // Therefore: raw_price = adjusted_price / 10^(decimals0 - decimals1)
+        let raw_price = actual_price / 10_f64.powi(decimals0 as i32 - decimals1 as i32);
+
+        // Sanity check: raw_price should be positive and finite
+        if raw_price <= 0.0 || !raw_price.is_finite() {
+            tracing::warn!(
+                "LFJ pool {} has invalid raw_price: {} (actual_price: {}, dec0: {}, dec1: {})",
+                pair_address, raw_price, actual_price, decimals0, decimals1
+            );
+        }
+
         let sqrt_price = raw_price.sqrt();
         let sqrt_price_x96 = (sqrt_price * 2_f64.powi(96)) as u128;
 
