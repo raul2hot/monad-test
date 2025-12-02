@@ -322,6 +322,18 @@ where
 
         let result = pair.getSwapOut(amount_in_u128, swap_for_y).call().await?;
 
+        // CRITICAL FIX: Check if full amount was swapped
+        // amountInLeft > 0 means insufficient liquidity in the active bins
+        let amount_in_left = result.amountInLeft;
+        if amount_in_left > 0 {
+            return Err(eyre!(
+                "LFJ pool {} has insufficient liquidity: {} of {} not swapped",
+                pool.address,
+                amount_in_left,
+                amount_in_u128
+            ));
+        }
+
         let amount_out = U256::from(result.amountOut);
         let fee = result.fee;
 

@@ -81,6 +81,16 @@ sol! {
         function getReserves() external view returns (uint128 reserveX, uint128 reserveY);
         function getActiveId() external view returns (uint24);
         function getBinStep() external view returns (uint16);
+        /// Get static fee parameters for accurate fee calculation
+        function getStaticFeeParameters() external view returns (
+            uint16 baseFactor,
+            uint16 filterPeriod,
+            uint16 decayPeriod,
+            uint16 reductionFactor,
+            uint24 variableFeeControl,
+            uint16 protocolShare,
+            uint24 maxVolatilityAccumulator
+        );
     }
 
     /// LFJ Factory interface for batch queries
@@ -439,8 +449,8 @@ where
             return Ok(HashMap::new());
         }
 
-        // Build calls: getTokenX, getTokenY, getReserves, getActiveId, getBinStep (5 calls per pair)
-        let mut calls = Vec::with_capacity(pair_addresses.len() * 5);
+        // Build calls: getTokenX, getTokenY, getReserves, getActiveId, getBinStep, getStaticFeeParameters (6 calls per pair)
+        let mut calls = Vec::with_capacity(pair_addresses.len() * 6);
         for addr in pair_addresses {
             calls.push(IMulticall3::Call3 {
                 target: *addr,
@@ -467,6 +477,11 @@ where
                 allowFailure: true,
                 callData: ILBPairBatch::getBinStepCall {}.abi_encode().into(),
             });
+            calls.push(IMulticall3::Call3 {
+                target: *addr,
+                allowFailure: true,
+                callData: ILBPairBatch::getStaticFeeParametersCall {}.abi_encode().into(),
+            });
         }
 
         let results = self.execute_large_batch(calls).await?;
@@ -474,7 +489,7 @@ where
         // Parse results
         let mut data = HashMap::new();
         for (i, addr) in pair_addresses.iter().enumerate() {
-            let offset = i * 5;
+            let offset = i * 6;
 
             let token_x = if results[offset].success {
                 ILBPairBatch::getTokenXCall::abi_decode_returns(&results[offset].returnData).ok()
@@ -511,6 +526,15 @@ where
                 None
             };
 
+            // CRITICAL FIX: Fetch fee parameters for accurate fee calculation
+            let base_factor = if results[offset + 5].success {
+                ILBPairBatch::getStaticFeeParametersCall::abi_decode_returns(&results[offset + 5].returnData)
+                    .ok()
+                    .map(|params| params.baseFactor)
+            } else {
+                None
+            };
+
             if let (Some(tx), Some(ty), Some(res), Some(aid), Some(bs)) =
                 (token_x, token_y, reserves, active_id, bin_step)
             {
@@ -523,6 +547,8 @@ where
                         reserve_y: U256::from(res.reserveY),
                         active_id: aid,
                         bin_step: bs,
+                        // Use fetched baseFactor or default to 5000 (common LFJ default)
+                        base_factor: base_factor.unwrap_or(5000),
                     },
                 );
             }
@@ -703,6 +729,8 @@ pub struct LfjPairData {
     pub reserve_y: U256,
     pub active_id: u32,
     pub bin_step: u16,
+    /// Base factor for fee calculation (baseFee = baseFactor * binStep / 10000)
+    pub base_factor: u16,
 }
 
 /// Convenience functions for building multicall calls

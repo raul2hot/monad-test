@@ -7,16 +7,75 @@ use std::env;
 /// - Graph building
 /// - Simulation
 pub mod thresholds {
+    use super::tokens;
+    use alloy::primitives::{Address, U256};
+
+    /// Minimum liquidity in USD equivalent for pool inclusion
+    /// This is the primary threshold - approximately $1,000 USD
+    pub const MIN_LIQUIDITY_USD: f64 = 1_000.0;
+
     /// Minimum active liquidity for pool inclusion (100 tokens with 18 decimals)
-    /// This is the ACTIVE liquidity near current price, not total reserves.
-    /// For LFJ pools, this is measured across bins [-10, +10] from active bin.
-    /// For V3 pools, this is the current tick's liquidity.
+    /// DEPRECATED: Use MIN_LIQUIDITY_USD or normalized_liquidity_check instead
+    /// Kept for backward compatibility but should be phased out
     pub const MIN_ACTIVE_LIQUIDITY: u128 = 100 * 10u128.pow(18);
 
     /// Minimum total liquidity/reserves for initial pool discovery (1000 tokens with 18 decimals)
-    /// Used during batch discovery phase. Pools must pass this threshold before
-    /// being added to the graph.
+    /// DEPRECATED: Use MIN_LIQUIDITY_USD or normalized_liquidity_check instead
     pub const MIN_TOTAL_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
+
+    /// Token-specific minimum liquidity thresholds (in token's native units)
+    /// These are based on approximate USD value: ~$50 minimum per token
+    pub fn min_liquidity_for_token(token: Address) -> u128 {
+        let decimals = tokens::decimals(token);
+        match decimals {
+            // USDC, USDT, AUSD, etc. (6 decimals) - 50 tokens = $50
+            6 => 50 * 10u128.pow(6),
+            // IDRX (2 decimals) - 750,000 IDR ≈ $50
+            2 => 750_000 * 10u128.pow(2),
+            // WBTC (8 decimals) - 0.0005 BTC ≈ $50
+            8 => 50_000, // 0.0005 * 10^8
+            // SOL (9 decimals) - 0.25 SOL ≈ $50
+            9 => 250_000_000, // 0.25 * 10^9
+            // WMON, WETH, LSTs (18 decimals) - 50 tokens
+            _ => 50 * 10u128.pow(18),
+        }
+    }
+
+    /// Normalize a reserve amount to 18 decimals for consistent comparison
+    /// This allows comparing liquidity across tokens with different decimals
+    pub fn normalize_to_18_decimals(amount: U256, decimals: u8) -> U256 {
+        if decimals == 18 {
+            amount
+        } else if decimals < 18 {
+            // Scale up: multiply by 10^(18-decimals)
+            let scale = U256::from(10u128.pow((18 - decimals) as u32));
+            amount.saturating_mul(scale)
+        } else {
+            // Scale down: divide by 10^(decimals-18)
+            let scale = U256::from(10u128.pow((decimals - 18) as u32));
+            amount / scale
+        }
+    }
+
+    /// Check if a pool has sufficient liquidity based on normalized reserves
+    /// For pools with two different tokens, we normalize both reserves to 18 decimals
+    /// before summing and comparing
+    pub fn has_sufficient_normalized_liquidity(
+        reserve0: U256,
+        decimals0: u8,
+        reserve1: U256,
+        decimals1: u8,
+        min_normalized: u128,
+    ) -> bool {
+        let normalized0 = normalize_to_18_decimals(reserve0, decimals0);
+        let normalized1 = normalize_to_18_decimals(reserve1, decimals1);
+        let total_normalized = normalized0.saturating_add(normalized1);
+        total_normalized >= U256::from(min_normalized)
+    }
+
+    /// Minimum normalized liquidity threshold (100 tokens at 18 decimals = $100-$1000 equivalent)
+    /// Used after normalizing reserves from different decimal tokens
+    pub const MIN_NORMALIZED_LIQUIDITY: u128 = 100 * 10u128.pow(18);
 
     /// Minimum profit in basis points to log/consider an opportunity (10 = 0.1%)
     pub const MIN_PROFIT_BPS: u32 = 10;

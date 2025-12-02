@@ -139,13 +139,25 @@ impl<P: Provider + Clone + 'static> BatchLfjClient<P> {
             (data.token_y, data.token_x)
         };
 
-        // Calculate effective fee from bin step (approximate)
-        // LFJ fee = baseFee + variableFee, roughly 0.1% - 1% depending on volatility
-        // bin_step / 10000 gives approximate base fee percentage
-        let fee_bps = (data.bin_step as u32) * 10; // Convert to bps-like value
+        // Get decimals for proper normalization
+        let decimals0 = tokens::decimals(token0);
+        let decimals1 = tokens::decimals(token1);
+        let decimals_x = tokens::decimals(data.token_x);
+        let decimals_y = tokens::decimals(data.token_y);
 
-        // Calculate liquidity from reserves
-        let total_liquidity = data.reserve_x + data.reserve_y;
+        // CRITICAL FIX: Calculate fee using proper LFJ formula with actual baseFactor
+        // LFJ baseFee = baseFactor * binStep / 10000 (result in basis points)
+        // baseFactor is typically around 5000-15000, fetched from getStaticFeeParameters
+        // For bin_step=10 with baseFactor=5000: baseFee = 5000*10/10000 = 5 bps
+        // Convert to hundredths of bips (multiply by 100) for consistency with V3
+        let base_fee_bps = (data.base_factor as u32 * data.bin_step as u32) / 10_000;
+        let fee = base_fee_bps * 100; // Convert to hundredths of bips
+
+        // CRITICAL FIX: Normalize liquidity to 18 decimals before summing
+        // This fixes the bug where we compare reserves with different decimals
+        let normalized_reserve_x = thresholds::normalize_to_18_decimals(data.reserve_x, decimals_x);
+        let normalized_reserve_y = thresholds::normalize_to_18_decimals(data.reserve_y, decimals_y);
+        let total_normalized_liquidity = normalized_reserve_x.saturating_add(normalized_reserve_y);
 
         // Calculate price from active ID
         // LFJ bin formula: price = (1 + binStep/10000)^(activeId - 8388608)
@@ -180,12 +192,12 @@ impl<P: Provider + Clone + 'static> BatchLfjClient<P> {
             address: pair_addr,
             token0,
             token1,
-            fee: fee_bps * 100, // Convert to hundredths of bps like V3
+            fee, // In hundredths of bps
             dex: Dex::LFJ,
-            liquidity: total_liquidity,
+            liquidity: total_normalized_liquidity, // Now normalized to 18 decimals
             sqrt_price_x96: U256::from(sqrt_price_x96),
-            decimals0: tokens::decimals(token0),
-            decimals1: tokens::decimals(token1),
+            decimals0,
+            decimals1,
         }
     }
 }
@@ -246,8 +258,11 @@ impl<P: Provider + Clone + Send + Sync + 'static> DexClient for BatchLfjClient<P
         for (addr, data) in pair_data {
             let pool = Self::lfj_to_pool(addr, &data);
 
-            // Filter by liquidity
-            if pool.liquidity > U256::ZERO && pool.has_sufficient_liquidity(thresholds::MIN_TOTAL_LIQUIDITY) {
+            // Filter by normalized liquidity (pool.liquidity is already normalized to 18 decimals)
+            if pool.liquidity > U256::ZERO
+                && pool.is_price_valid()
+                && pool.has_sufficient_liquidity_normalized(thresholds::MIN_NORMALIZED_LIQUIDITY)
+            {
                 pools.push(pool);
             }
         }
