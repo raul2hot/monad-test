@@ -311,17 +311,47 @@ impl<'a> BoundedBellmanFord<'a> {
         let mut all_cycles = Vec::new();
         let mut seen_signatures: HashSet<String> = HashSet::new();
 
+        tracing::info!(
+            "Searching for cycles from {} base tokens in graph with {} nodes, {} edges",
+            base_tokens.len(),
+            self.graph.node_count(),
+            self.graph.edge_count()
+        );
+
         for &token in base_tokens {
+            let token_symbol = crate::config::tokens::symbol(token);
             let cycles = self.find_cycles_from(token);
+
+            tracing::debug!(
+                "Found {} raw cycles starting from {}",
+                cycles.len(),
+                token_symbol
+            );
 
             for cycle in cycles {
                 let signature = create_cycle_signature(&cycle);
                 if !seen_signatures.contains(&signature) {
-                    seen_signatures.insert(signature);
+                    seen_signatures.insert(signature.clone());
+
+                    // Log each unique cycle found
+                    tracing::info!(
+                        "Unique cycle: {} | {} hops | {:.2}% profit | {}",
+                        cycle.token_path(),
+                        cycle.hop_count(),
+                        cycle.profit_percentage(),
+                        if cycle.is_cross_dex() { "CROSS-DEX" } else { "single-dex" }
+                    );
+
                     all_cycles.push(cycle);
                 }
             }
         }
+
+        tracing::info!(
+            "Total unique cycles found: {} (from {} base tokens)",
+            all_cycles.len(),
+            base_tokens.len()
+        );
 
         // Sort by expected return (best first)
         all_cycles.sort_by(|a, b| {

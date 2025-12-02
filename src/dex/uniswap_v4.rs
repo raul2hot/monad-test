@@ -8,10 +8,16 @@ use alloy::{
 use async_trait::async_trait;
 
 use super::{Dex, DexClient, Pool};
-use crate::config::contracts::uniswap_v4::{
-    COMMON_FEE_TIERS, COMMON_TICK_SPACINGS, DYNAMIC_FEE_FLAG, POOL_MANAGER, STATE_VIEW,
-};
+use crate::config::contracts::uniswap_v4::{POOL_MANAGER, STATE_VIEW};
 use crate::config::tokens;
+
+/// Dynamic fee flag - pools with this cannot be reliably quoted without V4Quoter
+const DYNAMIC_FEE_FLAG: u32 = 0x800000;
+
+/// Hook permission bits that modify swap amounts (unsafe for arbitrage)
+const BEFORE_SWAP_RETURNS_DELTA: u32 = 0x08;
+const AFTER_SWAP_RETURNS_DELTA: u32 = 0x04;
+const UNSAFE_HOOK_FLAGS: u32 = BEFORE_SWAP_RETURNS_DELTA | AFTER_SWAP_RETURNS_DELTA;
 
 // Uniswap V4 PoolKey structure for computing PoolId
 sol! {
@@ -58,14 +64,6 @@ sol! {
 
         /// Get current liquidity for a pool
         function getLiquidity(bytes32 poolId) external view returns (uint128 liquidity);
-
-        /// Get tick info for a specific tick
-        function getTickInfo(bytes32 poolId, int24 tick) external view returns (
-            uint128 liquidityGross,
-            int128 liquidityNet,
-            uint256 feeGrowthOutside0X128,
-            uint256 feeGrowthOutside1X128
-        );
     }
 }
 
@@ -75,19 +73,42 @@ fn compute_pool_id(pool_key: &PoolKey) -> FixedBytes<32> {
     keccak256(&encoded)
 }
 
-/// Check if a fee has dynamic fee flag set
-fn is_dynamic_fee(fee: u32) -> bool {
-    fee & DYNAMIC_FEE_FLAG != 0
+/// Check if a V4 pool is safe for arbitrage
+fn is_pool_safe_for_arb(fee: u32, hooks: Address) -> bool {
+    // Reject dynamic fee pools - fee is unpredictable
+    if fee & DYNAMIC_FEE_FLAG != 0 {
+        return false;
+    }
+
+    // No hooks = safe vanilla pool
+    if hooks == Address::ZERO {
+        return true;
+    }
+
+    // Check hook permission bits in address
+    let addr_bytes = hooks.as_slice();
+    let low_bits = u32::from(addr_bytes[19]) | (u32::from(addr_bytes[18]) << 8);
+
+    // Reject hooks that can modify swap amounts
+    (low_bits & UNSAFE_HOOK_FLAGS) == 0
+}
+
+/// Check if token is in our monitored list
+fn is_monitored_token(token: Address) -> bool {
+    tokens::symbol(token) != "???"
 }
 
 /// Discovered V4 pool info from Initialize events
 #[derive(Debug, Clone)]
 struct DiscoveredPool {
+    pool_id: FixedBytes<32>,
     currency0: Address,
     currency1: Address,
     fee: u32,
     tick_spacing: i32,
     hooks: Address,
+    #[allow(dead_code)]
+    initial_sqrt_price: u128,
 }
 
 /// Uniswap V4 DEX client
@@ -96,8 +117,6 @@ pub struct UniswapV4Client<P> {
     provider: P,
     pool_manager: Address,
     state_view: Address,
-    fee_tiers: Vec<u32>,
-    tick_spacings: Vec<i32>,
 }
 
 impl<P: Provider + Clone> UniswapV4Client<P> {
@@ -106,8 +125,6 @@ impl<P: Provider + Clone> UniswapV4Client<P> {
             provider,
             pool_manager: POOL_MANAGER,
             state_view: STATE_VIEW,
-            fee_tiers: COMMON_FEE_TIERS.to_vec(),
-            tick_spacings: COMMON_TICK_SPACINGS.to_vec(),
         }
     }
 
@@ -129,60 +146,58 @@ impl<P: Provider + Clone> UniswapV4Client<P> {
         }
     }
 
-    /// Check if a pool exists and get its state
-    async fn get_pool_state(
-        &self,
-        token0: Address,
-        token1: Address,
-        fee: u32,
-        tick_spacing: i32,
-        hooks: Address,
-    ) -> eyre::Result<Option<Pool>> {
-        let pool_key = Self::create_pool_key(token0, token1, fee, tick_spacing, hooks);
-        let pool_id = compute_pool_id(&pool_key);
-
-        let state_view = IStateView::new(self.state_view, &self.provider);
-
-        // Try to get slot0 - if pool doesn't exist, this will return zeros
-        let slot0 = state_view.getSlot0(pool_id).call().await?;
-
-        // Check if pool exists (sqrtPriceX96 > 0 means pool is initialized)
-        if slot0.sqrtPriceX96 == 0 {
-            return Ok(None);
-        }
-
-        // Convert lpFee from Uint<24,1> to u32
-        let lp_fee_u32: u32 = slot0.lpFee.to::<u32>();
-
-        // Skip pools with dynamic fees (hooks may manipulate pricing)
-        if is_dynamic_fee(lp_fee_u32) {
-            tracing::trace!(
-                "Skipping V4 pool with dynamic fee: {}-{} fee={} tickSpacing={}",
-                token0,
-                token1,
-                fee,
-                tick_spacing
+    /// Get pool state for a discovered pool
+    async fn get_pool_state(&self, dp: &DiscoveredPool) -> eyre::Result<Option<Pool>> {
+        // Skip unsafe pools
+        if !is_pool_safe_for_arb(dp.fee, dp.hooks) {
+            tracing::debug!(
+                "Skipping unsafe V4 pool {}-{}: fee={:#x}, hooks={}",
+                tokens::symbol(dp.currency0),
+                tokens::symbol(dp.currency1),
+                dp.fee,
+                dp.hooks
             );
             return Ok(None);
         }
 
-        // Get liquidity
-        let liquidity: u128 = state_view.getLiquidity(pool_id).call().await?;
+        // Skip pools with unknown tokens
+        if !is_monitored_token(dp.currency0) || !is_monitored_token(dp.currency1) {
+            tracing::debug!(
+                "Skipping V4 pool with unknown token: {}-{}",
+                dp.currency0,
+                dp.currency1
+            );
+            return Ok(None);
+        }
 
-        // Use the actual LP fee from slot0 for accurate calculations
-        let effective_fee: u32 = lp_fee_u32;
+        let state_view = IStateView::new(self.state_view, &self.provider);
+
+        let slot0 = state_view.getSlot0(dp.pool_id).call().await?;
+
+        // Pool not initialized
+        if slot0.sqrtPriceX96 == 0 {
+            return Ok(None);
+        }
+
+        let liquidity: u128 = state_view.getLiquidity(dp.pool_id).call().await?;
+
+        // Convert lpFee from Uint<24,1> to u32 - this is in hundredths of bps
+        let lp_fee_raw: u32 = slot0.lpFee.to::<u32>();
+
+        // For V4, the lpFee from slot0 is the actual fee to use
+        // It's already in hundredths of bps (e.g., 3000 = 0.30%)
+        let effective_fee = lp_fee_raw;
 
         Ok(Some(Pool {
-            // For V4, we use the pool_id as a pseudo-address since pools don't have individual addresses
-            address: Address::from_slice(&pool_id[12..32]),
-            token0,
-            token1,
+            address: Address::from_slice(&dp.pool_id[12..32]),
+            token0: dp.currency0,
+            token1: dp.currency1,
             fee: effective_fee,
             dex: Dex::UniswapV4,
             liquidity: U256::from(liquidity),
             sqrt_price_x96: U256::from(slot0.sqrtPriceX96),
-            decimals0: tokens::decimals(token0),
-            decimals1: tokens::decimals(token1),
+            decimals0: tokens::decimals(dp.currency0),
+            decimals1: tokens::decimals(dp.currency1),
         }))
     }
 
@@ -202,19 +217,17 @@ impl<P: Provider + Clone> UniswapV4Client<P> {
         // Query Initialize events from PoolManager
         // Look back ~50k blocks (reasonable range), query in chunks due to RPC limits
         let total_blocks_back: u64 = 50_000;
-        let chunk_size: u64 = 10_000; // Use 10k chunks for faster querying
+        let chunk_size: u64 = 10_000;
         let start_block = latest_block.saturating_sub(total_blocks_back);
 
         tracing::info!(
-            "Querying V4 Initialize events from block {} to {} on PoolManager {}",
+            "V4: Scanning Initialize events from block {} to {}",
             start_block,
-            latest_block,
-            self.pool_manager
+            latest_block
         );
 
         let mut current_from = start_block;
         let mut total_logs = 0u64;
-        let mut chunk_errors = 0u32;
 
         while current_from < latest_block {
             let current_to = std::cmp::min(current_from + chunk_size - 1, latest_block);
@@ -225,96 +238,67 @@ impl<P: Provider + Clone> UniswapV4Client<P> {
                 .from_block(current_from)
                 .to_block(current_to);
 
-            match self.provider.get_logs(&filter).await {
-                Ok(logs) => {
-                    total_logs += logs.len() as u64;
-                    for log in logs {
-                        // Parse the Initialize event
-                        match log.log_decode::<IPoolManager::Initialize>() {
-                            Ok(decoded) => {
-                                let event = decoded.inner.data;
-                                let currency0 = event.currency0;
-                                let currency1 = event.currency1;
+            if let Ok(logs) = self.provider.get_logs(&filter).await {
+                total_logs += logs.len() as u64;
+                for log in logs {
+                    if let Ok(decoded) = log.log_decode::<IPoolManager::Initialize>() {
+                        let event = decoded.inner.data;
+                        let currency0 = event.currency0;
+                        let currency1 = event.currency1;
 
-                                // Only include pools with at least one monitored token
-                                if token_set.contains(&currency0)
-                                    || token_set.contains(&currency1)
-                                {
-                                    let fee: u32 = event.fee.to::<u32>();
-                                    let tick_spacing: i32 = event.tickSpacing.as_i32();
+                        // Only include pools where BOTH tokens are monitored
+                        if token_set.contains(&currency0) && token_set.contains(&currency1) {
+                            let fee: u32 = event.fee.to::<u32>();
+                            let tick_spacing: i32 = event.tickSpacing.as_i32();
 
-                                    discovered.push(DiscoveredPool {
-                                        currency0,
-                                        currency1,
-                                        fee,
-                                        tick_spacing,
-                                        hooks: event.hooks,
-                                    });
-
-                                    tracing::debug!(
-                                        "Discovered V4 pool: {}-{} (fee: {}, tickSpacing: {}, hooks: {})",
-                                        tokens::symbol(currency0),
-                                        tokens::symbol(currency1),
-                                        fee,
-                                        tick_spacing,
-                                        event.hooks
-                                    );
-                                }
+                            // Pre-filter unsafe pools
+                            if !is_pool_safe_for_arb(fee, event.hooks) {
+                                tracing::debug!(
+                                    "Skipping discovered unsafe pool: {}-{} (fee={:#x}, hooks={})",
+                                    tokens::symbol(currency0),
+                                    tokens::symbol(currency1),
+                                    fee,
+                                    event.hooks
+                                );
+                                continue;
                             }
-                            Err(e) => {
-                                tracing::trace!("Failed to decode Initialize event: {}", e);
-                            }
+
+                            let pool_key = Self::create_pool_key(
+                                currency0,
+                                currency1,
+                                fee,
+                                tick_spacing,
+                                event.hooks,
+                            );
+                            let pool_id = compute_pool_id(&pool_key);
+
+                            // Convert sqrtPriceX96 safely - it's a uint160 but may still overflow u128
+                            // uint160 max is ~1.46e48 which exceeds u128 max (~3.4e38)
+                            let sqrt_price_u256 = U256::from(event.sqrtPriceX96);
+                            let initial_sqrt_price = if sqrt_price_u256 <= U256::from(u128::MAX) {
+                                sqrt_price_u256.to::<u128>()
+                            } else {
+                                u128::MAX // Cap at u128::MAX for storage
+                            };
+
+                            discovered.push(DiscoveredPool {
+                                pool_id,
+                                currency0,
+                                currency1,
+                                fee,
+                                tick_spacing,
+                                hooks: event.hooks,
+                                initial_sqrt_price,
+                            });
+
+                            tracing::debug!(
+                                "Discovered safe V4 pool: {}-{} (fee={}, tickSpacing={})",
+                                tokens::symbol(currency0),
+                                tokens::symbol(currency1),
+                                fee,
+                                tick_spacing
+                            );
                         }
-                    }
-                }
-                Err(e) => {
-                    chunk_errors += 1;
-                    // If we get rate limited, try smaller chunks
-                    if chunk_errors == 1 {
-                        tracing::debug!(
-                            "Log query failed for blocks {}-{}: {}, will try smaller chunks",
-                            current_from,
-                            current_to,
-                            e
-                        );
-                    }
-                    // Try with 1000 block chunks as fallback
-                    let small_chunk_size: u64 = 1000;
-                    let mut small_from = current_from;
-                    while small_from <= current_to {
-                        let small_to = std::cmp::min(small_from + small_chunk_size - 1, current_to);
-                        let small_filter = Filter::new()
-                            .address(self.pool_manager)
-                            .event_signature(IPoolManager::Initialize::SIGNATURE_HASH)
-                            .from_block(small_from)
-                            .to_block(small_to);
-
-                        if let Ok(logs) = self.provider.get_logs(&small_filter).await {
-                            total_logs += logs.len() as u64;
-                            for log in logs {
-                                if let Ok(decoded) = log.log_decode::<IPoolManager::Initialize>() {
-                                    let event = decoded.inner.data;
-                                    let currency0 = event.currency0;
-                                    let currency1 = event.currency1;
-
-                                    if token_set.contains(&currency0)
-                                        || token_set.contains(&currency1)
-                                    {
-                                        let fee: u32 = event.fee.to::<u32>();
-                                        let tick_spacing: i32 = event.tickSpacing.as_i32();
-
-                                        discovered.push(DiscoveredPool {
-                                            currency0,
-                                            currency1,
-                                            fee,
-                                            tick_spacing,
-                                            hooks: event.hooks,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        small_from = small_to + 1;
                     }
                 }
             }
@@ -323,92 +307,12 @@ impl<P: Provider + Clone> UniswapV4Client<P> {
         }
 
         tracing::info!(
-            "V4 event scan complete: {} Initialize events found, {} pools with monitored tokens",
+            "V4: {} Initialize events found, {} safe pools with monitored tokens",
             total_logs,
             discovered.len()
         );
 
         Ok(discovered)
-    }
-
-    /// Fallback brute-force pool discovery for vanilla pools (hooks=ZERO)
-    /// Used when event indexing fails or finds no pools
-    async fn get_pools_brute_force(&self, tokens: &[Address]) -> eyre::Result<Vec<Pool>> {
-        let mut pools = Vec::new();
-        let mut checked_count = 0u32;
-        let mut error_count = 0u32;
-
-        // Check all token pairs across fee tiers and tick spacings (vanilla pools only)
-        for i in 0..tokens.len() {
-            for j in (i + 1)..tokens.len() {
-                let (token0, token1) = if tokens[i] < tokens[j] {
-                    (tokens[i], tokens[j])
-                } else {
-                    (tokens[j], tokens[i])
-                };
-
-                for &fee in &self.fee_tiers {
-                    for &tick_spacing in &self.tick_spacings {
-                        if !is_valid_fee_tick_combo(fee, tick_spacing) {
-                            continue;
-                        }
-
-                        checked_count += 1;
-                        // Use Address::ZERO for hooks (vanilla pools only)
-                        match self
-                            .get_pool_state(token0, token1, fee, tick_spacing, Address::ZERO)
-                            .await
-                        {
-                            Ok(Some(pool)) => {
-                                if pool.liquidity > U256::ZERO
-                                    && pool.is_price_valid()
-                                    && pool.has_sufficient_liquidity(MIN_LIQUIDITY)
-                                {
-                                    tracing::info!(
-                                        "Found vanilla V4 pool: {}-{} (fee: {}, tickSpacing: {}, liq: {}, price: {:.8})",
-                                        tokens::symbol(token0),
-                                        tokens::symbol(token1),
-                                        fee,
-                                        tick_spacing,
-                                        pool.liquidity,
-                                        pool.price_0_to_1()
-                                    );
-                                    pools.push(pool);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                error_count += 1;
-                                if error_count <= 3 {
-                                    tracing::warn!(
-                                        "V4 StateView error for {}-{}: {}",
-                                        tokens::symbol(token0),
-                                        tokens::symbol(token1),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if error_count > 0 {
-            tracing::warn!(
-                "Uniswap V4 (brute-force): checked {} configs, {} errors",
-                checked_count,
-                error_count
-            );
-        } else {
-            tracing::info!(
-                "Uniswap V4 (brute-force): checked {} configs, found {} vanilla pools",
-                checked_count,
-                pools.len()
-            );
-        }
-
-        Ok(pools)
     }
 }
 
@@ -419,128 +323,54 @@ const MIN_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
 impl<P: Provider + Clone + Send + Sync> DexClient for UniswapV4Client<P> {
     async fn get_pools(&self, tokens: &[Address]) -> eyre::Result<Vec<Pool>> {
         let mut pools = Vec::new();
-        let mut error_count = 0u32;
 
-        // Step 1: Discover pools from Initialize events
         let discovered = match self.discover_pools_from_events(tokens).await {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to query V4 Initialize events from PoolManager {}: {}",
-                    self.pool_manager,
-                    e
-                );
-                // Fall back to brute-force approach with hooks=ZERO for vanilla pools
-                return self.get_pools_brute_force(tokens).await;
+                tracing::warn!("V4 event discovery failed: {}", e);
+                return Ok(pools);
             }
         };
 
         if discovered.is_empty() {
-            tracing::info!(
-                "Uniswap V4: no Initialize events found for monitored tokens, trying brute-force"
-            );
-            // Fall back to brute-force for vanilla pools (hooks=ZERO)
-            return self.get_pools_brute_force(tokens).await;
+            tracing::info!("V4: No safe pools found for monitored tokens");
+            return Ok(pools);
         }
 
-        tracing::info!(
-            "Uniswap V4: discovered {} pools from Initialize events",
-            discovered.len()
-        );
-
-        // Step 2: Query StateView for each discovered pool
         for dp in &discovered {
-            match self
-                .get_pool_state(
-                    dp.currency0,
-                    dp.currency1,
-                    dp.fee,
-                    dp.tick_spacing,
-                    dp.hooks,
-                )
-                .await
-            {
+            match self.get_pool_state(dp).await {
                 Ok(Some(pool)) => {
                     if pool.liquidity > U256::ZERO
                         && pool.is_price_valid()
                         && pool.has_sufficient_liquidity(MIN_LIQUIDITY)
                     {
                         tracing::info!(
-                            "Found valid Uniswap V4 pool: {}-{} (fee: {}, tickSpacing: {}, hooks: {}, liq: {}, price: {:.8})",
-                            tokens::symbol(dp.currency0),
-                            tokens::symbol(dp.currency1),
-                            dp.fee,
-                            dp.tick_spacing,
-                            dp.hooks,
+                            "V4 pool added: {}-{} (fee={} bps, liq={}, price={:.8})",
+                            tokens::symbol(pool.token0),
+                            tokens::symbol(pool.token1),
+                            pool.fee / 100,
                             pool.liquidity,
                             pool.price_0_to_1()
                         );
                         pools.push(pool);
-                    } else {
-                        tracing::debug!(
-                            "Skipping V4 pool {}-{} - insufficient liquidity or invalid price",
-                            tokens::symbol(dp.currency0),
-                            tokens::symbol(dp.currency1)
-                        );
                     }
                 }
-                Ok(None) => {
-                    tracing::debug!(
-                        "V4 pool {}-{} not initialized (sqrtPrice=0)",
-                        tokens::symbol(dp.currency0),
-                        tokens::symbol(dp.currency1)
-                    );
-                }
+                Ok(None) => {}
                 Err(e) => {
-                    error_count += 1;
-                    if error_count <= 3 {
-                        tracing::warn!(
-                            "V4 StateView error for {}-{}: {}",
-                            tokens::symbol(dp.currency0),
-                            tokens::symbol(dp.currency1),
-                            e
-                        );
-                    }
+                    tracing::debug!("V4 pool state error: {}", e);
                 }
             }
         }
 
-        if error_count > 3 {
-            tracing::warn!(
-                "Uniswap V4: {} total StateView errors (suppressed after first 3)",
-                error_count
-            );
-        }
-
         tracing::info!(
-            "Uniswap V4: found {} valid pools from {} discovered",
+            "V4: {} valid pools from {} discovered",
             pools.len(),
             discovered.len()
         );
-
         Ok(pools)
     }
 
     fn dex(&self) -> Dex {
         Dex::UniswapV4
-    }
-}
-
-/// Check if fee and tick spacing combination is valid/common
-/// This helps reduce unnecessary RPC calls for unlikely pool configurations
-fn is_valid_fee_tick_combo(fee: u32, tick_spacing: i32) -> bool {
-    // Common V4 pool configurations:
-    // - 100 bps (0.01%) with tick spacing 1
-    // - 500 bps (0.05%) with tick spacing 10
-    // - 3000 bps (0.3%) with tick spacing 60
-    // - 10000 bps (1%) with tick spacing 200
-    // But V4 allows any combination, so we're somewhat lenient
-    match fee {
-        100 => tick_spacing == 1 || tick_spacing == 10,
-        500 => tick_spacing == 10 || tick_spacing == 1,
-        3000 => tick_spacing == 60 || tick_spacing == 10,
-        10000 => tick_spacing == 200 || tick_spacing == 60,
-        100000 => tick_spacing == 200, // 10% fee tier (rare but possible)
-        _ => true, // Allow other combinations
     }
 }

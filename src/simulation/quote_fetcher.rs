@@ -268,7 +268,8 @@ where
         let sqrt_price_after = result.sqrtPriceX96After;
         let gas_estimate = result.gasEstimate.to::<u64>();
 
-        // Calculate fee in bps (divide raw fee by 100)
+        // V3 fees are in hundredths of bps (e.g., 3000 = 0.30% = 30 bps)
+        // Divide by 100 to get basis points
         let fee_bps = pool.fee / 100;
 
         // Calculate fee paid
@@ -324,9 +325,11 @@ where
         let amount_out = U256::from(result.amountOut);
         let fee = result.fee;
 
-        // Calculate effective fee in bps
+        // LFJ: fee is returned as absolute amount from getSwapOut
+        // Calculate effective fee in basis points from actual swap
         // IMPORTANT: Use u128 arithmetic to avoid overflow with large amounts
         // fee and amount_in are both u128, and we need to preserve precision
+        // This is different from V3/V4 where fee is a pool parameter
         let fee_bps = if amount_in_u128 > 0 {
             // fee_bps = (fee * 10000) / amount_in
             // For safety, we do: (fee / (amount_in / 10000)) to avoid overflow
@@ -397,7 +400,8 @@ where
         let amount_out = result.amountOut;
         let gas_estimate = result.gasEstimate.to::<u64>();
 
-        // Calculate fee in bps
+        // V4 lpFee from slot0 is in hundredths of bps (same as V3)
+        // Divide by 100 to get basis points
         let fee_bps = pool.fee / 100;
         let fee_paid = amount_in * U256::from(pool.fee) / U256::from(1_000_000);
 

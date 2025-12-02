@@ -70,18 +70,29 @@ async fn main() -> eyre::Result<()> {
     // Initialize simulator
     let simulator = Simulator::new(provider.clone());
 
-    // Token list to monitor
+    // Token list to monitor - expanded for better cross-DEX coverage
     let tokens_to_monitor = vec![
+        // Core tokens
         tokens::WMON,
         tokens::USDC,
         tokens::USDT,
-        tokens::AUSD,
         tokens::WETH,
         tokens::WBTC,
-        tokens::WSTETH,
+        // Additional stablecoins
+        tokens::AUSD,
+        tokens::USD1,
+        tokens::LVUSD,
+        // LSTs (important for MON arbitrage)
         tokens::SMON,
         tokens::GMON,
         tokens::SHMON,
+        tokens::APRMON,
+        // Wrapped assets
+        tokens::WSTETH,
+        tokens::WEETH,
+        tokens::SOL,
+        tokens::BTCB,
+        // Meme/community
         tokens::GMONAD,
     ];
 
@@ -112,19 +123,18 @@ async fn main() -> eyre::Result<()> {
 
         // Build fresh graph each iteration
         let mut graph = ArbitrageGraph::new();
-        let mut total_pools = 0;
+        let mut uniswap_v3_count = 0;
+        let mut uniswap_v4_count = 0;
+        let mut pancakeswap_count = 0;
+        let mut lfj_count = 0;
 
         // Fetch pools from all DEXes
         // Uniswap V3
         match uniswap_v3.get_pools(&tokens_to_monitor).await {
             Ok(pools) => {
-                let count = pools.len();
+                uniswap_v3_count = pools.len();
                 for pool in &pools {
                     graph.add_pool(pool);
-                }
-                total_pools += count;
-                if count > 0 {
-                    debug!("Found {} Uniswap V3 pools", count);
                 }
             }
             Err(e) => {
@@ -135,13 +145,9 @@ async fn main() -> eyre::Result<()> {
         // Uniswap V4
         match uniswap_v4.get_pools(&tokens_to_monitor).await {
             Ok(pools) => {
-                let count = pools.len();
+                uniswap_v4_count = pools.len();
                 for pool in &pools {
                     graph.add_pool(pool);
-                }
-                total_pools += count;
-                if count > 0 {
-                    debug!("Found {} Uniswap V4 pools", count);
                 }
             }
             Err(e) => {
@@ -152,13 +158,9 @@ async fn main() -> eyre::Result<()> {
         // PancakeSwap
         match pancakeswap.get_pools(&tokens_to_monitor).await {
             Ok(pools) => {
-                let count = pools.len();
+                pancakeswap_count = pools.len();
                 for pool in &pools {
                     graph.add_pool(pool);
-                }
-                total_pools += count;
-                if count > 0 {
-                    debug!("Found {} PancakeSwap V3 pools", count);
                 }
             }
             Err(e) => {
@@ -169,19 +171,17 @@ async fn main() -> eyre::Result<()> {
         // LFJ
         match lfj.get_pools(&tokens_to_monitor).await {
             Ok(pools) => {
-                let count = pools.len();
+                lfj_count = pools.len();
                 for pool in &pools {
                     graph.add_pool(pool);
-                }
-                total_pools += count;
-                if count > 0 {
-                    debug!("Found {} LFJ pools", count);
                 }
             }
             Err(e) => {
                 warn!("Failed to fetch LFJ pools: {}", e);
             }
         }
+
+        let total_pools = uniswap_v3_count + uniswap_v4_count + pancakeswap_count + lfj_count;
 
         if graph.edge_count() == 0 {
             info!(
@@ -190,6 +190,15 @@ async fn main() -> eyre::Result<()> {
             );
             continue;
         }
+
+        // Pool discovery summary
+        info!("=== POOL DISCOVERY SUMMARY ===");
+        info!("Uniswap V3: {} pools", uniswap_v3_count);
+        info!("Uniswap V4: {} pools (vanilla only)", uniswap_v4_count);
+        info!("PancakeSwap: {} pools", pancakeswap_count);
+        info!("LFJ: {} pools", lfj_count);
+        info!("Total: {} pools", total_pools);
+        info!("==============================");
 
         info!(
             "[Iteration {}] Graph: {} nodes, {} edges ({} pools)",
@@ -206,6 +215,39 @@ async fn main() -> eyre::Result<()> {
         if cycles.is_empty() {
             debug!("No arbitrage opportunities found above threshold");
             continue;
+        }
+
+        // Analyze cycle composition
+        let cross_dex_count = cycles.iter().filter(|c| c.is_cross_dex()).count();
+        let v3_only = cycles.iter().filter(|c| c.dexes.iter().all(|d| *d == dex::Dex::UniswapV3)).count();
+        let v4_only = cycles.iter().filter(|c| c.dexes.iter().all(|d| *d == dex::Dex::UniswapV4)).count();
+        let pancake_only = cycles.iter().filter(|c| c.dexes.iter().all(|d| *d == dex::Dex::PancakeSwapV3)).count();
+        let lfj_only = cycles.iter().filter(|c| c.dexes.iter().all(|d| *d == dex::Dex::LFJ)).count();
+
+        let mut hop_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for cycle in &cycles {
+            *hop_counts.entry(cycle.hop_count()).or_insert(0) += 1;
+        }
+
+        info!("=== CYCLE ANALYSIS ===");
+        info!("Total candidates: {}", cycles.len());
+        info!("Cross-DEX: {}", cross_dex_count);
+        info!("Uniswap V3 only: {}", v3_only);
+        info!("Uniswap V4 only: {}", v4_only);
+        info!("PancakeSwap only: {}", pancake_only);
+        info!("LFJ only: {}", lfj_only);
+        info!("Hop distribution: {:?}", hop_counts);
+        info!("======================");
+
+        // Log first 10 unique paths for debugging
+        for (i, cycle) in cycles.iter().take(10).enumerate() {
+            info!(
+                "Candidate #{}: {} | DEXes: {} | Profit: {:.2}%",
+                i + 1,
+                cycle.token_path(),
+                cycle.dex_path(),
+                cycle.profit_percentage()
+            );
         }
 
         info!("Found {} potential opportunities, simulating...", cycles.len());
