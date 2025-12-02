@@ -1,6 +1,7 @@
 mod config;
 mod dex;
 mod graph;
+mod multicall;
 mod simulation;
 
 use alloy::primitives::U256;
@@ -12,11 +13,12 @@ use tracing_subscriber::EnvFilter;
 
 use config::{tokens, Config};
 use dex::{
+    batch_client::BatchDexManager,
     lfj::LfjClient, pancakeswap::PancakeSwapClient, uniswap_v3::UniswapV3Client,
     uniswap_v4::UniswapV4Client, DexClient,
 };
 use graph::{ArbitrageGraph, BoundedBellmanFord};
-use simulation::{Simulator, SimulationConfidence};
+use simulation::Simulator;
 
 /// Default simulation amount: 1 WMON (18 decimals)
 const SIMULATION_AMOUNT: u128 = 100_000_000_000_000_000_000; // 1e18
@@ -61,14 +63,25 @@ async fn main() -> eyre::Result<()> {
         }
     }
 
-    // Initialize DEX clients
-    let uniswap_v3 = UniswapV3Client::new(provider.clone());
+    // Initialize batch DEX manager (uses Multicall3 for 80x fewer RPC calls)
+    let batch_dex_manager = BatchDexManager::new(provider.clone());
+
+    // Initialize individual DEX clients (for V4 which needs special handling)
     let uniswap_v4 = UniswapV4Client::new(provider.clone());
-    let pancakeswap = PancakeSwapClient::new(provider.clone());
-    let lfj = LfjClient::new(provider.clone());
 
     // Initialize simulator
     let simulator = Simulator::new(provider.clone());
+
+    // Check if batch mode is enabled (default: true)
+    let use_batch_mode = std::env::var("USE_BATCH_MODE")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true);
+
+    if use_batch_mode {
+        info!("Using Multicall3 batch mode for pool discovery (80x fewer RPC calls)");
+    } else {
+        info!("Using individual RPC calls (set USE_BATCH_MODE=1 for batch mode)");
+    }
 
     // Token list to monitor - expanded for better cross-DEX coverage
     let tokens_to_monitor = vec![
@@ -128,56 +141,94 @@ async fn main() -> eyre::Result<()> {
         let mut pancakeswap_count = 0;
         let mut lfj_count = 0;
 
-        // Fetch pools from all DEXes
-        // Uniswap V3
-        match uniswap_v3.get_pools(&tokens_to_monitor).await {
-            Ok(pools) => {
-                uniswap_v3_count = pools.len();
-                for pool in &pools {
-                    graph.add_pool(pool);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to fetch Uniswap V3 pools: {}", e);
-            }
-        }
+        // Fetch pools from all DEXes using batch mode or individual calls
+        if use_batch_mode {
+            // Use Multicall3 batch fetching (80x fewer RPC calls)
+            let batch_start = std::time::Instant::now();
+            let batch_result = batch_dex_manager.fetch_all_pools(&tokens_to_monitor).await;
 
-        // Uniswap V4
-        match uniswap_v4.get_pools(&tokens_to_monitor).await {
-            Ok(pools) => {
-                uniswap_v4_count = pools.len();
-                for pool in &pools {
-                    graph.add_pool(pool);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to fetch Uniswap V4 pools: {}", e);
-            }
-        }
+            uniswap_v3_count = batch_result.uniswap_v3_count;
+            pancakeswap_count = batch_result.pancakeswap_count;
+            lfj_count = batch_result.lfj_count;
 
-        // PancakeSwap
-        match pancakeswap.get_pools(&tokens_to_monitor).await {
-            Ok(pools) => {
-                pancakeswap_count = pools.len();
-                for pool in &pools {
-                    graph.add_pool(pool);
-                }
+            for pool in &batch_result.pools {
+                graph.add_pool(pool);
             }
-            Err(e) => {
-                warn!("Failed to fetch PancakeSwap pools: {}", e);
-            }
-        }
 
-        // LFJ
-        match lfj.get_pools(&tokens_to_monitor).await {
-            Ok(pools) => {
-                lfj_count = pools.len();
-                for pool in &pools {
-                    graph.add_pool(pool);
+            debug!(
+                "Batch fetch completed in {:?} ({} pools)",
+                batch_start.elapsed(),
+                batch_result.total_count()
+            );
+
+            // Uniswap V4 still uses individual calls (event-based discovery)
+            match uniswap_v4.get_pools(&tokens_to_monitor).await {
+                Ok(pools) => {
+                    uniswap_v4_count = pools.len();
+                    for pool in &pools {
+                        graph.add_pool(pool);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch Uniswap V4 pools: {}", e);
                 }
             }
-            Err(e) => {
-                warn!("Failed to fetch LFJ pools: {}", e);
+        } else {
+            // Individual RPC calls (legacy mode)
+            let uniswap_v3 = UniswapV3Client::new(provider.clone());
+            let pancakeswap = PancakeSwapClient::new(provider.clone());
+            let lfj = LfjClient::new(provider.clone());
+
+            // Uniswap V3
+            match uniswap_v3.get_pools(&tokens_to_monitor).await {
+                Ok(pools) => {
+                    uniswap_v3_count = pools.len();
+                    for pool in &pools {
+                        graph.add_pool(pool);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch Uniswap V3 pools: {}", e);
+                }
+            }
+
+            // Uniswap V4
+            match uniswap_v4.get_pools(&tokens_to_monitor).await {
+                Ok(pools) => {
+                    uniswap_v4_count = pools.len();
+                    for pool in &pools {
+                        graph.add_pool(pool);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch Uniswap V4 pools: {}", e);
+                }
+            }
+
+            // PancakeSwap
+            match pancakeswap.get_pools(&tokens_to_monitor).await {
+                Ok(pools) => {
+                    pancakeswap_count = pools.len();
+                    for pool in &pools {
+                        graph.add_pool(pool);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch PancakeSwap pools: {}", e);
+                }
+            }
+
+            // LFJ
+            match lfj.get_pools(&tokens_to_monitor).await {
+                Ok(pools) => {
+                    lfj_count = pools.len();
+                    for pool in &pools {
+                        graph.add_pool(pool);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch LFJ pools: {}", e);
+                }
             }
         }
 
