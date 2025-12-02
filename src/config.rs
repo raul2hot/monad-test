@@ -26,6 +26,13 @@ pub const CHOG: &str = "0x350035555E10d9AfAF1566AaebfCeD5BA6C27777";
 pub const MOLANDAK: &str = "0x7B2728c04aD436153285702e969e6EfAc3a97777";
 pub const GMONAD: &str = "0x7db552eeb6b77a6babe6e0a739b5382cd653cc3e";
 
+// Additional tokens to monitor (from active trading pairs)
+pub const USDC: &str = "0xf817257fed379853cDe0fa4F97AB987181B1E5Ea";  // Circle USDC
+pub const WETH: &str = "0xB5a30b0FDc5EA94A52fDc42e3E9760Cb8449Fb37";  // Wrapped ETH
+
+// High-activity Uniswap pools
+pub const WMON_WETH_V4_POOL: &str = "0x378393c9fAcf16c5bfB3f1cF829c37A1d0F7d28e";
+
 // Pool addresses
 pub const CHOG_NADFUN_POOL: &str = "0x116e7d070f1888b81e1e0324f56d6746b2d7d8f1";
 pub const CHOG_UNISWAP_POOL: &str = "0x745355f47db8c57e7911ef3da2e989b16039d12f";
