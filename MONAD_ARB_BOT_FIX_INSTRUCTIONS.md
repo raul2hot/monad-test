@@ -1,275 +1,276 @@
-# Root Cause Analysis: Monad Arbitrage Bot Graph-Quoter Discrepancy
+# Root causes of arbitrage simulation false rejections on Monad
 
-Your arbitrage bot shows **20.70% profit** via Bellman-Ford but **0 bps** from quoter simulation because of a compound failure across LFJ price calculation, liquidity threshold logic, and graph edge weight construction. The primary issue is the liquidity threshold rejection, but even without that, underlying price calculation bugs would cause incorrect opportunity detection.
+Your arbitrage bot's graph-based cycle detection finding **20-26% profit opportunities** while simulation rejects **all** of them indicates systematic errors in the liquidity validation layer—not actual insufficient liquidity. Based on deep technical research into LFJ, Uniswap V3, decimal handling, and Monad-specific behaviors, the root causes are: incorrect decimal normalization (USDC 6 vs WMON 18), misuse of V3 liquidity metrics, LFJ `amountInLeft` misinterpretation, and overly strict absolute thresholds instead of value-based checks.
 
-## The immediate rejection: flawed liquidity comparison
+## The decimal normalization bug is likely your primary culprit
 
-The log shows the opportunity being rejected with `insufficient liquidity: 44323215691692120251 < 100000000000000000000` (44.3e18 < 100e18). This comparison is fundamentally broken because it compares raw token amounts without normalization.
+When comparing liquidity across tokens with different decimals, a **single fixed threshold causes 10^12x errors**. Consider a minimum liquidity threshold of `1e18`:
 
-**The bug**: Your `MIN_ACTIVE_LIQUIDITY` threshold of **100e18** assumes all pools use 18-decimal tokens. The LFJ pool `0x5E60BC3F7a7303BC4dfE4dc2220bdC90bc04fE22` returns `reserveX + reserveY` in raw decimals. For WMON (18 decimals), 44.3e18 represents 44.3 WMON—which may be perfectly adequate liquidity depending on trade size.
+- For WMON (18 decimals): `1e18` = 1 token ✓
+- For USDC (6 decimals): `1e18` = **1,000,000,000,000 tokens** ($1 trillion!) ✗
 
-**Fix for `src/config.rs`**:
-```rust
-// WRONG: Universal raw threshold
-pub const MIN_ACTIVE_LIQUIDITY: U256 = U256::from_limbs([100_000_000_000_000_000_000u64, 0, 0, 0]);
+Any pool containing USDC will fail this check because the threshold demands impossibly high liquidity. This explains why **all** opportunities are rejected—your arbitrage routes likely include USDC pairs.
 
-// CORRECT: USD-normalized or token-specific thresholds
-pub const MIN_LIQUIDITY_USD: f64 = 10_000.0;  // $10k minimum
-// OR token-specific:
-pub const MIN_WMON_LIQUIDITY: U256 = U256::from_limbs([50_000_000_000_000_000_000u64, 0, 0, 0]); // 50 WMON
-pub const MIN_USDC_LIQUIDITY: U256 = U256::from_limbs([10_000_000_000u64, 0, 0, 0]); // 10,000 USDC (6 decimals)
-```
+**The fix requires normalizing all amounts to a common base before comparison:**
 
-## LFJ price calculation: critical formula errors
+```javascript
+function normalizeToWad(rawAmount, tokenDecimals) {
+  if (tokenDecimals < 18) {
+    return rawAmount * BigInt(10 ** (18 - tokenDecimals));
+  } else if (tokenDecimals > 18) {
+    return rawAmount / BigInt(10 ** (tokenDecimals - 18));
+  }
+  return rawAmount;
+}
 
-LFJ's Liquidity Book uses fundamentally different math than Uniswap V3. Several bugs likely exist in your implementation.
-
-### Token ordering is NOT sorted by address
-
-Unlike Uniswap where `token0 < token1` by address, LFJ's `tokenX` and `tokenY` can be in **any order**. The factory sorts for storage, but the actual pair may have reversed ordering.
-
-**Fix for `src/dex/lfj.rs`**:
-```rust
-// WRONG: Assuming tokenX is always the lower address
-let (token0, token1) = if token_a < token_b { (token_a, token_b) } else { (token_b, token_a) };
-
-// CORRECT: Always query the pair contract
-let token_x = pair.getTokenX().call().await?;
-let token_y = pair.getTokenY().call().await?;
-// Price is ALWAYS tokenY per tokenX (Y/X)
-```
-
-### Price direction interpretation
-
-The LFJ price from `getPriceFromId()` represents **tokenY per tokenX**. If you need the price for swapping X→Y, use the price directly. For Y→X, invert it.
-
-```rust
-// Price from bin: tokenY per tokenX
-let price_y_per_x = calculate_price_from_id(active_id, bin_step);
-
-// For swapping tokenX → tokenY (swapForY = true):
-let effective_rate = price_y_per_x * (1.0 - fee);
-
-// For swapping tokenY → tokenX (swapForY = false):
-let effective_rate = (1.0 / price_y_per_x) * (1.0 - fee);
-```
-
-### Q128.128 fixed-point conversion
-
-LFJ returns prices in 128.128 binary fixed-point. Converting to f64 requires dividing by 2^128:
-
-```rust
-// WRONG: Integer division loses all precision
-let price_f64 = (price_q128 / U256::from(1u128 << 128)).as_u64() as f64;
-
-// CORRECT: Use proper fixed-point conversion
-let price_f64 = price_q128.to_f64_lossy() / (2.0_f64.powi(128));
-
-// OR for more precision:
-let (hi, lo) = (price_q128 >> 128, price_q128 & ((U256::ONE << 128) - U256::ONE));
-let price_f64 = hi.to_f64_lossy() + lo.to_f64_lossy() / 2.0_f64.powi(128);
-```
-
-### Bin price calculation formula
-
-```rust
-// Correct formula: price = (1 + binStep/10000)^(activeId - 8388608)
-const REAL_ID_SHIFT: i32 = 8388608; // 2^23
-
-fn calculate_price_from_id(active_id: u32, bin_step: u16) -> f64 {
-    let base = 1.0 + (bin_step as f64 / 10_000.0);
-    let exponent = (active_id as i32) - REAL_ID_SHIFT;
-    base.powi(exponent)
+// Correct threshold comparison
+const normalizedReserve = normalizeToWad(reserve, tokenDecimals);
+const MIN_LIQUIDITY_WAD = BigInt(1e18); // 1 token normalized
+if (normalizedReserve < MIN_LIQUIDITY_WAD) {
+  return { reject: true, reason: "INSUFFICIENT_LIQUIDITY" };
 }
 ```
 
-## Graph edge weight construction flaws
+Better still, use **value-based thresholds in USD** rather than token amounts:
 
-The 20.70% "profit" detection is almost certainly a false positive from incorrect edge weight calculation.
+```javascript
+const reserveUSD = (reserve * tokenPriceUSD) / BigInt(10 ** tokenDecimals);
+const MIN_LIQUIDITY_USD = BigInt(10000e18); // $10,000 minimum
+if (reserveUSD < MIN_LIQUIDITY_USD) return false;
+```
 
-### Fee unit confusion between DEXes
+## LFJ getSwapOut() requires correct interpretation of amountInLeft
 
-Your graph likely mishandles fee representations:
+The Liquidity Book's `getSwapOut()` function returns three values that are frequently misinterpreted:
 
-| DEX | 0.3% fee representation | Conversion to decimal |
-|-----|------------------------|----------------------|
-| **Uniswap V3/V4** | 3000 (hundredths of bps) | `3000 / 1_000_000 = 0.003` |
-| **PancakeSwap V3** | 2500 (for 0.25%) | `2500 / 1_000_000 = 0.0025` |
-| **LFJ** | Variable (baseFee + variableFee) | Returned from `getSwapOut()` |
+| Return Value | Type | Meaning |
+|-------------|------|---------|
+| `amountInLeft` | uint128 | Amount that **could not be swapped** due to liquidity limits |
+| `amountOut` | uint128 | Output tokens received |
+| `fee` | uint128 | Fees paid |
 
-**Fix for `src/graph/builder.rs`**:
-```rust
-// WRONG: Using fee directly as percentage
-let fee_decimal = pool.fee as f64; // If fee=3000, this gives 3000% fee!
+**Critical insight**: `amountInLeft > 0` does **not** always mean "reject the trade." It indicates the pool cannot handle the **full** requested amount, but a **partial fill** may still be profitable. The correct validation pattern:
 
-// CORRECT: Normalize based on DEX type
-fn normalize_fee(pool: &Pool) -> f64 {
-    match pool.dex_type {
-        DexType::UniswapV3 | DexType::UniswapV4 | DexType::PancakeSwapV3 => {
-            pool.fee as f64 / 1_000_000.0  // 3000 → 0.003
-        }
-        DexType::LFJ => {
-            // LFJ fees should be fetched from getSwapOut() or calculated
-            // baseFee = baseFactor * binStep / 10000
-            (pool.base_factor as f64 * pool.bin_step as f64) / 100_000_000.0
-        }
-    }
+```javascript
+const [amountInLeft, amountOut, fee] = await router.getSwapOut(lbPair, amountIn, swapForY);
+
+if (amountInLeft === amountIn && amountOut === 0n) {
+  // NO liquidity at all - legitimate rejection
+  return { canExecute: false, reason: "NO_LIQUIDITY" };
+}
+
+if (amountInLeft > 0n && amountOut > 0n) {
+  // PARTIAL fill available - calculate if reduced trade is still profitable
+  const maxSwappable = amountIn - amountInLeft;
+  const reducedProfit = calculateProfit(maxSwappable, amountOut);
+  if (reducedProfit > minProfitThreshold) {
+    return { canExecute: true, adjustedAmount: maxSwappable };
+  }
+}
+
+if (amountInLeft === 0n) {
+  // Full swap possible
+  return { canExecute: true, expectedOutput: amountOut };
 }
 ```
 
-### Edge weight formula must include fees correctly
+LFJ's bin-based model differs fundamentally from V3: it uses **constant sum** (`X + Y = k`) within bins rather than constant product. Swaps traverse bins sequentially with zero slippage inside each bin, and `amountInLeft > 0` occurs only when all bins in the swap direction are exhausted.
 
-```rust
-// CORRECT edge weight for Bellman-Ford:
-// w(A→B) = -ln(price * (1 - fee))
+## Uniswap V3 pool.liquidity does not indicate swap capacity
 
-fn calculate_edge_weight(price: f64, fee: f64) -> f64 {
-    let effective_rate = price * (1.0 - fee);
-    -effective_rate.ln()  // Negative log for arbitrage detection
-}
+The most dangerous misconception is treating `pool.liquidity` as a threshold for swap feasibility. **This metric represents only the sum of liquidity from positions containing the current price**—it tells you nothing about:
 
-// WRONG approaches that cause false positives:
-// -ln(price) - fee          ← Additive fee is wrong
-// -ln(price) - ln(1-fee)    ← Mathematical error
-// -ln(price / (1 + fee))    ← Fee direction inverted
+1. Whether adjacent tick ranges have liquidity
+2. How much can actually be swapped in your direction
+3. Whether the swap will cross tick boundaries
+
+The relationship between L and actual reserves within a tick range is:
+
+```
+x_real = L × (√Pb - √P) / (√P × √Pb)  // Token0 reserves
+y_real = L × (√P - √Pa)                // Token1 reserves
 ```
 
-### Bidirectional edge consistency
+where `Pa` and `Pb` are the price bounds of the current tick range. **These are "virtual reserves" that exist only within the current tick**—a large swap will exhaust them and cross into adjacent ticks where liquidity may be zero.
 
-For a token pair A↔B, you need two edges with correct directional prices:
+**The only reliable validation method is using the Quoter contract:**
 
-```rust
-// For pool with tokenX=A, tokenY=B, price = B/A (how much B per A)
+```javascript
+const quoter = new ethers.Contract(QUOTER_V2_ADDRESS, QuoterV2ABI, provider);
 
-// Edge A→B (swap A to get B):
-let weight_a_to_b = -((price_b_per_a * (1.0 - fee)).ln());
-
-// Edge B→A (swap B to get A):  
-let price_a_per_b = 1.0 / price_b_per_a;
-let weight_b_to_a = -((price_a_per_b * (1.0 - fee)).ln());
-
-// These are NOT simply negatives of each other due to fees
-```
-
-## Uniswap V3/V4 sqrtPriceX96 conversion bugs
-
-If you're also using Uniswap pools in the arbitrage path, verify these calculations:
-
-### Correct sqrtPriceX96 conversion
-
-```rust
-// sqrtPriceX96 gives price = token1/token0 (NOT token0/token1)
-fn sqrt_price_to_price(sqrt_price_x96: U256) -> f64 {
-    let sqrt_p = sqrt_price_x96.to_f64_lossy() / 2.0_f64.powi(96);
-    sqrt_p * sqrt_p  // Square it: (sqrtPrice)^2 = price
-}
-
-// For human-readable with decimals:
-fn sqrt_price_to_human_price(sqrt_price_x96: U256, decimals0: u8, decimals1: u8) -> f64 {
-    let raw_price = sqrt_price_to_price(sqrt_price_x96);
-    raw_price * 10.0_f64.powi((decimals0 as i32) - (decimals1 as i32))
+try {
+  const quote = await quoter.quoteExactInputSingle.staticCall({
+    tokenIn: tokenInAddress,
+    tokenOut: tokenOutAddress,
+    fee: poolFee,
+    amountIn: swapAmount,
+    sqrtPriceLimitX96: 0
+  });
+  
+  return {
+    canExecute: true,
+    amountOut: quote.amountOut,
+    ticksCrossed: quote.initializedTicksCrossed,
+    priceImpact: calculatePriceImpact(quote)
+  };
+} catch (error) {
+  // Only NOW can you legitimately reject
+  return { canExecute: false, reason: parseQuoterError(error) };
 }
 ```
 
-### Common mistake: forgetting Q192 scaling
+The Quoter internally executes the actual swap logic and reverts to return the result—it's the only accurate simulation for concentrated liquidity pools.
 
-```rust
-// WRONG: Only shifting by 96
-let price = (sqrt_price_x96 * sqrt_price_x96) >> 96;
+## Monad's gas model adds unique constraints
 
-// CORRECT: Must shift by 192 after squaring
-let price = (sqrt_price_x96 * sqrt_price_x96) >> 192;
-// Or equivalently: (sqrtPrice / 2^96)^2
-```
+Monad mainnet (launched November 24, 2025) has several differences from Ethereum that affect arbitrage simulation:
 
-## Fix for `src/dex/mod.rs` Pool price methods
+**No gas refunds**: Users are charged based on `gasLimit`, not `gasUsed`. Over-estimating gas locks in costs, making accurate simulation critical for profitability calculations.
 
-Your `Pool` struct needs DEX-aware price calculation:
+**State lag**: Due to deferred execution, when building block N, confirmed state may only be at N-2. Simulations against "current" state may fail because pool reserves changed. This requires probabilistic strategies rather than deterministic arbitrage.
 
-```rust
-impl Pool {
-    pub fn get_effective_price(&self, token_in: Address, amount_in: U256) -> Result<f64> {
-        match self.dex_type {
-            DexType::LFJ => {
-                let (token_x, token_y) = (self.token_x, self.token_y);
-                let swap_for_y = token_in == token_x;
-                
-                // Price is tokenY per tokenX
-                let base_price = self.calculate_lfj_price()?;
-                
-                if swap_for_y {
-                    Ok(base_price) // Selling X for Y
-                } else {
-                    Ok(1.0 / base_price) // Selling Y for X
-                }
-            }
-            DexType::UniswapV3 | DexType::UniswapV4 => {
-                // sqrtPriceX96 gives token1/token0
-                let raw_price = self.calculate_v3_price()?;
-                
-                if token_in == self.token0 {
-                    Ok(raw_price) // Selling token0 for token1
-                } else {
-                    Ok(1.0 / raw_price) // Selling token1 for token0
-                }
-            }
-            // ... other DEX types
-        }
-    }
-}
-```
+**Reserve balance protection**: Transactions that would reduce sender's balance below 10 MON (after execution) automatically revert. Factor this into balance checks.
 
-## Fix for `src/simulation/quote_fetcher.rs`
+**Key Monad addresses:**
+- WMON: `0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A`
+- USDC: `0x754704Bc059F8C67012fEd69BC8A327a5aafb603`
 
-The quoter should use on-chain calls, not calculated prices:
+## Recommended simulation module architecture
 
-```rust
-pub async fn fetch_lfj_quote(
-    pair: Address,
-    amount_in: u128,
-    swap_for_y: bool,
-    provider: &Provider,
-) -> Result<QuoteResult> {
-    // Use getSwapOut for accurate quote including fees
-    let (amount_left, amount_out, fees) = lfj_pair
-        .getSwapOut(amount_in, swap_for_y)
-        .call()
-        .await?;
-    
-    // Verify full amount can be swapped
-    if amount_left > 0 {
-        return Err(Error::InsufficientLiquidity(amount_left));
+Replace the current liquidity-check-first approach with a **simulation-first pipeline**:
+
+```javascript
+class ArbitrageValidator {
+  async validate(opportunity) {
+    // Stage 1: Quick filters (no RPC, instant)
+    if (!this.passesQuickFilters(opportunity)) {
+      return { rejected: true, stage: "QUICK_FILTER" };
     }
     
-    Ok(QuoteResult {
-        amount_out,
-        fee_amount: fees,
-        price_impact: calculate_impact(amount_in, amount_out, swap_for_y),
-    })
+    // Stage 2: Actual swap simulation (one RPC per pool)
+    const simResults = await Promise.all(
+      opportunity.route.map(hop => this.simulateHop(hop))
+    );
+    
+    const failedHop = simResults.find(r => !r.success);
+    if (failedHop) {
+      return { rejected: true, stage: "SIMULATION", hop: failedHop };
+    }
+    
+    // Stage 3: Profitability check (after simulation confirms feasibility)
+    const totalOutput = simResults[simResults.length - 1].amountOut;
+    const gasCost = this.estimateGasCost(simResults);
+    const netProfit = totalOutput - opportunity.inputAmount - gasCost;
+    
+    if (netProfit < this.minProfitThreshold) {
+      return { rejected: true, stage: "PROFITABILITY", netProfit };
+    }
+    
+    return { rejected: false, simulation: simResults, netProfit };
+  }
+  
+  async simulateHop(hop) {
+    switch (hop.poolType) {
+      case "LFJ":
+        return this.simulateLFJ(hop);
+      case "UniswapV3":
+      case "PancakeSwapV3":
+        return this.simulateV3(hop);
+    }
+  }
+  
+  async simulateLFJ(hop) {
+    const [amountInLeft, amountOut, fee] = await this.lfjRouter.getSwapOut(
+      hop.pair, hop.amountIn, hop.swapForY
+    );
+    
+    // Accept partial fills if still profitable
+    if (amountInLeft > 0n && amountOut > 0n) {
+      const maxSwappable = hop.amountIn - amountInLeft;
+      return { success: true, amountOut, adjustedInput: maxSwappable, partial: true };
+    }
+    
+    return { success: amountInLeft === 0n, amountOut };
+  }
+  
+  async simulateV3(hop) {
+    try {
+      const quote = await this.quoter.quoteExactInputSingle.staticCall({
+        tokenIn: hop.tokenIn,
+        tokenOut: hop.tokenOut,
+        fee: hop.fee,
+        amountIn: hop.amountIn,
+        sqrtPriceLimitX96: 0
+      });
+      return { success: true, amountOut: quote.amountOut };
+    } catch {
+      return { success: false };
+    }
+  }
 }
 ```
 
-## Monad-specific considerations
+## Specific code changes checklist
 
-Monad's **400ms block time** and **deferred execution** create unique challenges:
+**1. Fix decimal normalization everywhere:**
+```javascript
+// Before any comparison or threshold check:
+const normalizedAmount = rawAmount * BigInt(10 ** (18 - tokenDecimals));
+```
 
-- **State may be 1-2 blocks behind** during quoter simulation—prices can shift between graph construction and execution
-- Use **Multicall3** (`0xcA11bde05977b3631167028862bE2a173976CA11`) to batch all pool state reads atomically
-- **High revert rates expected**—Monad's parallel execution with low fees encourages transaction spam similar to Solana's ~41% revert rate
-- **Gas charged on limit, not usage**—set gas limits carefully to avoid overpaying on reverts
+**2. Replace liquidity threshold checks with simulation:**
+```javascript
+// REMOVE this pattern:
+if (pool.liquidity < MIN_LIQUIDITY) return false;
 
-## Complete diagnosis summary
+// USE this pattern:
+const simulation = await quoter.quoteExactInputSingle.staticCall(params);
+if (!simulation) return false;
+```
 
-The **root causes** of your graph-quoter discrepancy are:
+**3. Handle LFJ partial fills:**
+```javascript
+// REMOVE this pattern:
+if (amountInLeft > 0) return false;
 
-1. **Liquidity threshold comparing raw 18-decimal amounts** without token-specific normalization—fix the threshold logic to be USD-normalized or token-aware
+// USE this pattern:
+if (amountInLeft === amountIn && amountOut === 0n) return false;
+// Otherwise, check if partial fill is profitable
+```
 
-2. **LFJ token ordering assumption** (assuming sorted by address)—always query `getTokenX()` and `getTokenY()` from the pair contract
+**4. Use value-based thresholds:**
+```javascript
+// REMOVE:
+const MIN_RESERVE = 1e18n;
 
-3. **Fee unit confusion**—Uniswap's `3000` means 0.3%, not 3000%; LFJ fees come from getSwapOut or require baseFactor calculation
+// USE:
+const MIN_RESERVE_USD = 10000e18n; // $10k, normalized to 18 decimals
+const reserveUSD = (reserve * priceUSD) / BigInt(10 ** decimals);
+```
 
-4. **Graph edge direction errors**—price represents Y/X for LFJ and token1/token0 for Uniswap; swapping in opposite direction requires inversion
+**5. Add comprehensive rejection logging:**
+```javascript
+console.log({
+  opportunity: opp.id,
+  stage: "LIQUIDITY_CHECK",
+  poolType: pool.type,
+  tokenDecimals: [token0.decimals, token1.decimals],
+  rawReserves: [reserve0, reserve1],
+  normalizedReserves: [normalized0, normalized1],
+  threshold: currentThreshold,
+  verdict: passed ? "PASSED" : "REJECTED"
+});
+```
 
-5. **Q128.128 or sqrtPriceX96 conversion bugs**—ensure proper fixed-point math with 128 or 192 bit shifts
+## Diagnostic approach for existing rejections
 
-The 20.70% "profit" is a phantom caused by these compounding errors creating artificially favorable edge weights in your graph, which the quoter correctly identifies as non-profitable when using actual on-chain getSwapOut calls.
+To confirm these are the issues, add logging to capture:
+
+1. **Token decimals** for every pool in rejected routes—look for 6-decimal tokens
+2. **Raw vs normalized reserve comparisons**—identify 10^12x mismatches
+3. **LFJ getSwapOut full return tuple**—check if `amountOut > 0` when rejected
+4. **V3 quoter results**—verify quoter succeeds where liquidity checks fail
+
+A single test case swapping **1 USDC → WMON** through each DEX will likely reveal the decimal bug immediately: the USDC side will show "insufficient liquidity" despite adequate reserves because `1e6` (1 USDC raw) compared to a `1e18` threshold appears to be zero liquidity.
+
+The combination of proper decimal normalization, simulation-first validation, and correct LFJ partial-fill handling should convert your 0% success rate to match the 20-26% profit rate from your graph-based detection.
