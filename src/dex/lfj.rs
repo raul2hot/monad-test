@@ -46,6 +46,26 @@ sol! {
 
         /// Get the price from the active bin
         function getPriceFromId(uint24 id) external view returns (uint256);
+
+        /// Get static fee parameters for accurate fee calculation
+        /// Returns: baseFactor, filterPeriod, decayPeriod, reductionFactor, variableFeeControl, protocolShare, maxVolatilityAccumulator
+        function getStaticFeeParameters() external view returns (
+            uint16 baseFactor,
+            uint16 filterPeriod,
+            uint16 decayPeriod,
+            uint16 reductionFactor,
+            uint24 variableFeeControl,
+            uint16 protocolShare,
+            uint24 maxVolatilityAccumulator
+        );
+
+        /// Get the total fee (base + variable) for a swap
+        /// Returns fee in basis points (1e4 = 100%)
+        function getSwapOut(uint128 amountIn, bool swapForY) external view returns (
+            uint128 amountInLeft,
+            uint128 amountOut,
+            uint128 fee
+        );
     }
 }
 
@@ -140,11 +160,32 @@ impl<P: Provider + Clone> LfjClient<P> {
         // LFJ getPriceFromId() returns price of tokenY per tokenX
         // We need to check if our sorted token0/token1 matches the pair's tokenX/tokenY
         let token_x = pair_contract.getTokenX().call().await?;
-        let _token_y = pair_contract.getTokenY().call().await?;
+        let token_y = pair_contract.getTokenY().call().await?;
 
         // Get reserves and active bin
         let reserves = pair_contract.getReserves().call().await?;
         let active_id: u32 = pair_contract.getActiveId().call().await?.to();
+
+        // CRITICAL FIX: Fetch actual fee parameters from contract
+        // LFJ fees consist of: baseFee = baseFactor * binStep / 10000
+        // Plus potential variable fee from volatility
+        let fee = match pair_contract.getStaticFeeParameters().call().await {
+            Ok(params) => {
+                // baseFee = baseFactor * binStep / 10000 (result in basis points)
+                // We need it in hundredths of bips for consistency with V3
+                // baseFactor is typically 5000-15000, binStep is 1-100
+                // Example: baseFactor=5000, binStep=10 → baseFee = 5000*10/10000 = 5 bps = 500 hundredths of bips
+                let base_fee_bps = (params.baseFactor as u32 * bin_step) / 10_000;
+                // Convert to hundredths of bips (multiply by 100)
+                base_fee_bps * 100
+            }
+            Err(e) => {
+                // Fallback to simple bin_step calculation if getStaticFeeParameters fails
+                tracing::debug!("Failed to get LFJ fee params for {}: {}, using fallback", pair_address, e);
+                // LFJ default: bin_step as basis points * 100 = hundredths of bips
+                bin_step * 100
+            }
+        };
 
         // Get price from active bin (this is a Q128.128 fixed point number)
         // price_x128 represents: price of tokenY per tokenX (i.e., tokenY/tokenX)
@@ -193,6 +234,10 @@ impl<P: Provider + Clone> LfjClient<P> {
         let decimals0 = tokens::decimals(token0);
         let decimals1 = tokens::decimals(token1);
 
+        // CRITICAL FIX: Get decimals for tokenX and tokenY (may differ from sorted token0/token1)
+        let decimals_x = tokens::decimals(token_x);
+        let decimals_y = tokens::decimals(token_y);
+
         // Convert to sqrtPriceX96 format for consistency with Uniswap V3
         // sqrtPriceX96 = sqrt(price) * 2^96
         // where price is the raw ratio (token1_units / token0_units)
@@ -200,11 +245,17 @@ impl<P: Provider + Clone> LfjClient<P> {
         let sqrt_price = actual_price.sqrt();
         let sqrt_price_x96 = (sqrt_price * 2_f64.powi(96)) as u128;
 
-        // Total liquidity is approximated from reserves
-        let total_liquidity = U256::from(reserves.reserveX) + U256::from(reserves.reserveY);
-
-        // LFJ fee is bin_step * 0.01% (e.g., bin_step=10 means 0.1% fee)
-        let fee = bin_step * 100; // Convert to hundredths of bip
+        // CRITICAL FIX: Normalize reserves to 18 decimals before summing
+        // This avoids the bug where we compare 44e18 WMON + 100e6 USDC against 100e18 threshold
+        let normalized_reserve_x = thresholds::normalize_to_18_decimals(
+            U256::from(reserves.reserveX),
+            decimals_x,
+        );
+        let normalized_reserve_y = thresholds::normalize_to_18_decimals(
+            U256::from(reserves.reserveY),
+            decimals_y,
+        );
+        let total_normalized_liquidity = normalized_reserve_x.saturating_add(normalized_reserve_y);
 
         Ok(Pool {
             address: pair_address,
@@ -212,7 +263,7 @@ impl<P: Provider + Clone> LfjClient<P> {
             token1,
             fee,
             dex: Dex::LFJ,
-            liquidity: total_liquidity,
+            liquidity: total_normalized_liquidity, // Now in normalized 18-decimal units
             sqrt_price_x96: U256::from(sqrt_price_x96),
             decimals0,
             decimals1,
@@ -239,12 +290,13 @@ impl<P: Provider + Clone + Send + Sync> DexClient for LfjClient<P> {
                         match self.get_pool_state(pair_addr, token0, token1, bin_step).await {
                             Ok(pool) => {
                                 // Multiple validity checks: liquidity, price validity, and minimum threshold
+                                // NOTE: pool.liquidity is now normalized to 18 decimals
                                 if pool.liquidity > U256::ZERO
                                     && pool.is_price_valid()
-                                    && pool.has_sufficient_liquidity(thresholds::MIN_TOTAL_LIQUIDITY)
+                                    && pool.has_sufficient_liquidity_normalized(thresholds::MIN_NORMALIZED_LIQUIDITY)
                                 {
                                     tracing::debug!(
-                                        "Found valid LFJ pool: {} (bin_step: {}, liq: {}, price: {:.8})",
+                                        "Found valid LFJ pool: {} (bin_step: {}, normalized_liq: {}, price: {:.8})",
                                         pair_addr,
                                         bin_step,
                                         pool.liquidity,
@@ -253,8 +305,10 @@ impl<P: Provider + Clone + Send + Sync> DexClient for LfjClient<P> {
                                     pools.push(pool);
                                 } else {
                                     tracing::trace!(
-                                        "Skipping LFJ pool {} - insufficient liquidity or invalid price",
-                                        pair_addr
+                                        "Skipping LFJ pool {} - insufficient liquidity ({}) or invalid price (threshold: {})",
+                                        pair_addr,
+                                        pool.liquidity,
+                                        thresholds::MIN_NORMALIZED_LIQUIDITY
                                     );
                                 }
                             }
