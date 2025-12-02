@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use super::{Dex, DexClient, Pool};
 use crate::config::contracts::pancakeswap_v3::{FACTORY, FEE_TIERS};
+use crate::config::thresholds;
 use crate::config::tokens;
 
 // PancakeSwap V3 Factory ABI (same interface as Uniswap V3)
@@ -98,9 +99,6 @@ impl<P: Provider + Clone> PancakeSwapClient<P> {
     }
 }
 
-/// Minimum liquidity threshold (1000 units with 18 decimals)
-const MIN_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
-
 #[async_trait]
 impl<P: Provider + Clone + Send + Sync> DexClient for PancakeSwapClient<P> {
     async fn get_pools(&self, tokens: &[Address]) -> eyre::Result<Vec<Pool>> {
@@ -122,7 +120,7 @@ impl<P: Provider + Clone + Send + Sync> DexClient for PancakeSwapClient<P> {
                                 // Multiple validity checks: liquidity, price validity, and minimum threshold
                                 if pool.liquidity > U256::ZERO
                                     && pool.is_price_valid()
-                                    && pool.has_sufficient_liquidity(MIN_LIQUIDITY)
+                                    && pool.has_sufficient_liquidity(thresholds::MIN_TOTAL_LIQUIDITY)
                                 {
                                     tracing::debug!(
                                         "Found valid PancakeSwap V3 pool: {} (fee: {}, liq: {}, price: {:.8})",

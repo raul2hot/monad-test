@@ -11,11 +11,9 @@ use tracing::{debug, info, warn};
 
 use super::{Dex, DexClient, Pool};
 use crate::config::contracts;
+use crate::config::thresholds;
 use crate::config::tokens;
 use crate::multicall::{BatchFetcher, LfjPairData};
-
-/// Minimum liquidity threshold (1000 units with 18 decimals)
-const MIN_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
 
 /// Common LFJ bin steps to query
 const LFJ_BIN_STEPS: [u16; 6] = [1, 5, 10, 15, 20, 25];
@@ -54,7 +52,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> DexClient for BatchUniswapV3Cl
                 tokens,
                 &self.fee_tiers,
                 Dex::UniswapV3,
-                MIN_LIQUIDITY,
+                thresholds::MIN_TOTAL_LIQUIDITY,
             )
             .await
     }
@@ -98,7 +96,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> DexClient for BatchPancakeSwap
                 tokens,
                 &self.fee_tiers,
                 Dex::PancakeSwapV3,
-                MIN_LIQUIDITY,
+                thresholds::MIN_TOTAL_LIQUIDITY,
             )
             .await
     }
@@ -149,10 +147,34 @@ impl<P: Provider + Clone + 'static> BatchLfjClient<P> {
         // Calculate liquidity from reserves
         let total_liquidity = data.reserve_x + data.reserve_y;
 
-        // Calculate sqrt price from active ID
-        // Price at bin = (1 + binStep/10000)^(activeId - 8388608)
-        // This is an approximation for display purposes
-        let sqrt_price = calculate_lfj_sqrt_price(data.active_id, data.bin_step);
+        // Calculate price from active ID
+        // LFJ bin formula: price = (1 + binStep/10000)^(activeId - 8388608)
+        // This gives the price of tokenY per tokenX (tokenY/tokenX)
+        let lfj_price = calculate_lfj_price(data.active_id, data.bin_step);
+
+        // CRITICAL FIX: Determine if we need to invert the price
+        // LFJ price is tokenY/tokenX
+        // Pool convention: price_0_to_1 = token1/token0
+        // So if tokenX == token0 and tokenY == token1, price is already correct (token1/token0)
+        // If tokenX == token1 and tokenY == token0, price is token0/token1, need to invert
+        let actual_price = if data.token_x == token0 {
+            // tokenX == token0, tokenY == token1
+            // LFJ price is tokenY/tokenX = token1/token0 ✓ (correct direction)
+            lfj_price
+        } else {
+            // tokenX == token1, tokenY == token0
+            // LFJ price is tokenY/tokenX = token0/token1 (inverted)
+            // We need token1/token0, so invert
+            if lfj_price > 0.0 {
+                1.0 / lfj_price
+            } else {
+                0.0
+            }
+        };
+
+        // Convert to sqrtPriceX96 format for consistency with Uniswap V3
+        let sqrt_price = actual_price.sqrt();
+        let sqrt_price_x96 = (sqrt_price * 2_f64.powi(96)) as u128;
 
         Pool {
             address: pair_addr,
@@ -161,31 +183,27 @@ impl<P: Provider + Clone + 'static> BatchLfjClient<P> {
             fee: fee_bps * 100, // Convert to hundredths of bps like V3
             dex: Dex::LFJ,
             liquidity: total_liquidity,
-            sqrt_price_x96: sqrt_price,
+            sqrt_price_x96: U256::from(sqrt_price_x96),
             decimals0: tokens::decimals(token0),
             decimals1: tokens::decimals(token1),
         }
     }
 }
 
-/// Calculate approximate sqrt price from LFJ active ID and bin step
-fn calculate_lfj_sqrt_price(active_id: u32, bin_step: u16) -> U256 {
+/// Calculate price from LFJ active ID and bin step
+/// Returns the actual price (tokenY per tokenX), not sqrt price
+fn calculate_lfj_price(active_id: u32, bin_step: u16) -> f64 {
     // LFJ uses: price = (1 + binStep/10000)^(activeId - 2^23)
-    // We calculate an approximate sqrtPriceX96 for consistency
     const ID_OFFSET: i64 = 8388608; // 2^23
     let exponent = (active_id as i64) - ID_OFFSET;
     let base = 1.0 + (bin_step as f64) / 10000.0;
     let price = base.powf(exponent as f64);
-    let sqrt_price = price.sqrt();
-    let sqrt_price_x96 = sqrt_price * 2_f64.powi(96);
 
-    // Convert to U256, clamping to avoid overflow
-    if sqrt_price_x96 >= u128::MAX as f64 {
-        U256::from(u128::MAX)
-    } else if sqrt_price_x96 <= 0.0 {
-        U256::from(1u64) // Minimum valid price
+    // Sanity check: return valid price or 0 for error cases
+    if price.is_finite() && price > 0.0 {
+        price
     } else {
-        U256::from(sqrt_price_x96 as u128)
+        0.0
     }
 }
 
@@ -229,7 +247,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> DexClient for BatchLfjClient<P
             let pool = Self::lfj_to_pool(addr, &data);
 
             // Filter by liquidity
-            if pool.liquidity > U256::ZERO && pool.has_sufficient_liquidity(MIN_LIQUIDITY) {
+            if pool.liquidity > U256::ZERO && pool.has_sufficient_liquidity(thresholds::MIN_TOTAL_LIQUIDITY) {
                 pools.push(pool);
             }
         }
@@ -336,17 +354,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lfj_sqrt_price_calculation() {
+    fn test_lfj_price_calculation() {
         // Test middle ID (should give price ~1)
-        let sqrt_price = calculate_lfj_sqrt_price(8388608, 10);
-        assert!(sqrt_price > U256::ZERO);
+        let price = calculate_lfj_price(8388608, 10);
+        assert!(price > 0.0);
+        // At ID_OFFSET, price should be exactly 1.0
+        assert!((price - 1.0).abs() < 0.001);
 
         // Test higher ID (should give higher price)
-        let sqrt_price_high = calculate_lfj_sqrt_price(8388708, 10);
-        assert!(sqrt_price_high > sqrt_price);
+        let price_high = calculate_lfj_price(8388708, 10);
+        assert!(price_high > price);
 
         // Test lower ID (should give lower price)
-        let sqrt_price_low = calculate_lfj_sqrt_price(8388508, 10);
-        assert!(sqrt_price_low < sqrt_price);
+        let price_low = calculate_lfj_price(8388508, 10);
+        assert!(price_low < price);
     }
 }

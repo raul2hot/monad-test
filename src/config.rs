@@ -1,6 +1,32 @@
 use alloy::primitives::{Address, address};
 use std::env;
 
+/// Centralized liquidity and profit thresholds
+/// These constants ensure consistent filtering across all phases:
+/// - Pool discovery
+/// - Graph building
+/// - Simulation
+pub mod thresholds {
+    /// Minimum active liquidity for pool inclusion (100 tokens with 18 decimals)
+    /// This is the ACTIVE liquidity near current price, not total reserves.
+    /// For LFJ pools, this is measured across bins [-10, +10] from active bin.
+    /// For V3 pools, this is the current tick's liquidity.
+    pub const MIN_ACTIVE_LIQUIDITY: u128 = 100 * 10u128.pow(18);
+
+    /// Minimum total liquidity/reserves for initial pool discovery (1000 tokens with 18 decimals)
+    /// Used during batch discovery phase. Pools must pass this threshold before
+    /// being added to the graph.
+    pub const MIN_TOTAL_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
+
+    /// Minimum profit in basis points to log/consider an opportunity (10 = 0.1%)
+    pub const MIN_PROFIT_BPS: u32 = 10;
+
+    /// Maximum allowed round-trip price deviation (1% = 0.01)
+    /// If price_0_to_1 * price_1_to_0 deviates from 1.0 by more than this,
+    /// the pool is considered to have invalid pricing and is skipped.
+    pub const MAX_ROUND_TRIP_DEVIATION: f64 = 0.01;
+}
+
 /// Main configuration for the Monad Arbitrage MVP
 pub struct Config {
     pub rpc_url: String,
