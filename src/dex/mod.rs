@@ -44,12 +44,26 @@ pub struct Pool {
 
 impl Pool {
     /// Calculate the ADJUSTED price of token0 in terms of token1
+    /// Uses U256 arithmetic throughout to prevent overflow
     /// Formula: price = (sqrtPriceX96 / 2^96)^2 * 10^(decimals0 - decimals1)
     pub fn price_0_to_1(&self) -> f64 {
-        let sqrt_price = self.sqrt_price_x96.to::<u128>() as f64 / (2_f64.powi(96));
-        let raw_price = sqrt_price * sqrt_price;
+        if self.sqrt_price_x96.is_zero() {
+            return 0.0;
+        }
 
-        // Adjust for decimal difference between tokens
+        // For values that fit in u128, use simple path
+        if self.sqrt_price_x96 <= U256::from(u128::MAX) {
+            let sqrt_price = self.sqrt_price_x96.to::<u128>() as f64 / (2_f64.powi(96));
+            let raw_price = sqrt_price * sqrt_price;
+            let decimal_adjustment = 10_f64.powi(self.decimals0 as i32 - self.decimals1 as i32);
+            return raw_price * decimal_adjustment;
+        }
+
+        // For large values, use high-precision path
+        // Split into high and low parts to avoid overflow
+        let sqrt_f64 = u256_to_f64_safe(self.sqrt_price_x96);
+        let sqrt_price = sqrt_f64 / (2_f64.powi(96));
+        let raw_price = sqrt_price * sqrt_price;
         let decimal_adjustment = 10_f64.powi(self.decimals0 as i32 - self.decimals1 as i32);
         raw_price * decimal_adjustment
     }
@@ -89,8 +103,26 @@ impl Pool {
 
     /// Get liquidity as a normalized value
     pub fn liquidity_normalized(&self) -> f64 {
-        self.liquidity.to::<u128>() as f64
+        u256_to_f64_safe(self.liquidity)
     }
+}
+
+/// Safely convert U256 to f64, handling values larger than u128::MAX
+fn u256_to_f64_safe(value: U256) -> f64 {
+    if value.is_zero() {
+        return 0.0;
+    }
+
+    if value <= U256::from(u128::MAX) {
+        return value.to::<u128>() as f64;
+    }
+
+    // For values > u128::MAX, use bit manipulation
+    // Find the most significant 64 bits and the exponent
+    let bits = 256 - value.leading_zeros();
+    let shift = bits.saturating_sub(64);
+    let mantissa = (value >> shift).to::<u64>() as f64;
+    mantissa * 2_f64.powi(shift as i32)
 }
 
 /// Trait for DEX clients to implement

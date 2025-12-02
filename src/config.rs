@@ -79,7 +79,8 @@ pub mod tokens {
     pub const GMONAD: Address = address!("7db552eeb6b77a6babe6e0a739b5382cd653cc3e"); // GMONAD
 
     // Base tokens for starting arbitrage cycles
-    pub const BASE_TOKENS: [Address; 4] = [WMON, USDC, USDT, WETH];
+    // Expanded to include LSTs for better cross-DEX coverage
+    pub const BASE_TOKENS: [Address; 8] = [WMON, USDC, USDT, WETH, WBTC, SMON, GMON, SHMON];
 
     /// Get the symbol for a token address
     pub fn symbol(addr: Address) -> &'static str {

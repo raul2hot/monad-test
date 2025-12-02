@@ -52,6 +52,30 @@ sol! {
 /// Bin step determines the price increment between bins (in basis points)
 const LB_BIN_STEPS: [u32; 6] = [1, 2, 5, 10, 15, 20];
 
+/// Convert LFJ Q128.128 price to f64 with proper precision
+/// price_x128 = actual_price * 2^128
+/// We need to divide by 2^128 to get actual_price
+fn q128_to_f64(price_x128: U256) -> f64 {
+    if price_x128.is_zero() {
+        return 0.0;
+    }
+
+    // For small values that fit in u128
+    if price_x128 <= U256::from(u128::MAX) {
+        return price_x128.to::<u128>() as f64 / (2_f64.powi(128));
+    }
+
+    // For large values, shift right first to avoid precision loss
+    // Get the top 64 bits and the shift amount
+    let bits = 256 - price_x128.leading_zeros();
+    let shift = bits.saturating_sub(64);
+    let mantissa = (price_x128 >> shift).to::<u64>() as f64;
+
+    // Combine: mantissa * 2^shift / 2^128 = mantissa * 2^(shift-128)
+    let exponent = shift as i32 - 128;
+    mantissa * 2_f64.powi(exponent)
+}
+
 /// Convert U256 to f64 safely, handling values larger than u128::MAX
 fn u256_to_f64(value: U256) -> f64 {
     // If the value fits in u128, use direct conversion
@@ -59,13 +83,11 @@ fn u256_to_f64(value: U256) -> f64 {
         return value.to::<u128>() as f64;
     }
 
-    // For larger values, split into high and low 128-bit parts
-    let shifted: U256 = value >> 128;
-    let high = shifted.to::<u128>() as f64;
-    let low = (value & U256::from(u128::MAX)).to::<u128>() as f64;
-
-    // Combine: high * 2^128 + low
-    high * 2_f64.powi(128) + low
+    // For larger values, use bit manipulation for precision
+    let bits = 256 - value.leading_zeros();
+    let shift = bits.saturating_sub(64);
+    let mantissa = (value >> shift).to::<u64>() as f64;
+    mantissa * 2_f64.powi(shift as i32)
 }
 
 /// LFJ (TraderJoe Liquidity Book) DEX client
@@ -123,13 +145,10 @@ impl<P: Provider + Clone> LfjClient<P> {
             .call()
             .await?;
 
-        // FIXED: Proper conversion from Q128.128
+        // FIXED: Proper conversion from Q128.128 using dedicated function
         // price_x128 = actual_price * 2^128
-        // We need to convert to sqrtPriceX96 = sqrt(actual_price) * 2^96
-
-        // Convert U256 to f64 safely (handle values > u128::MAX)
-        let price_x128_f64 = u256_to_f64(price_x128);
-        let actual_price = price_x128_f64 / (2_f64.powi(128));
+        // q128_to_f64 handles the division by 2^128 with proper precision
+        let actual_price = q128_to_f64(price_x128);
 
         // Get decimals for adjustment
         let decimals0 = tokens::decimals(token0);
