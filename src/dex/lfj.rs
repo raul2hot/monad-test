@@ -328,46 +328,60 @@ impl<P: Provider + Clone> LfjClient<P> {
             }
         };
 
-        // Fallback to getPriceFromId if quote-based pricing failed
-        let actual_price = match quote_based_price {
+        // Determine the raw_price for sqrtPriceX96 conversion
+        // Pool::price_0_to_1() applies decimal adjustment: raw_price * 10^(dec0-dec1)
+        // So we need to store raw_price (NOT decimal-adjusted)
+        //
+        // CRITICAL: The two price sources have different formats:
+        // 1. Quote-based price from get_quote_based_rate() is DECIMAL-ADJUSTED
+        //    (human-readable, e.g., 0.04 USDC per WMON)
+        // 2. Fallback price from getPriceFromId() is RAW
+        //    (raw units ratio, e.g., 4e-14 for WMON→USDC)
+        //
+        // We must handle each case differently to avoid double-adjustment or no-adjustment bugs.
+        let raw_price = match quote_based_price {
             Some(price) if price > 0.0 && price.is_finite() => {
+                // Quote-based price is decimal-adjusted, convert back to raw
+                // Formula: adjusted = raw * 10^(dec0-dec1)
+                // Therefore: raw = adjusted / 10^(dec0-dec1)
+                let raw = price / 10_f64.powi(decimals0 as i32 - decimals1 as i32);
                 tracing::debug!(
-                    "LFJ pool {} using quote-based price: {:.8}",
-                    pair_address, price
+                    "LFJ pool {} using quote-based price: adjusted={:.8}, raw={:.2e}",
+                    pair_address, price, raw
                 );
-                price
+                raw
             }
             _ => {
-                // Fallback: use getPriceFromId (less accurate but still useful)
+                // Fallback: use getPriceFromId which returns RAW price (already correct format)
                 let price_x128: U256 = pair_contract
                     .getPriceFromId(_active_id.try_into()?)
                     .call()
                     .await?;
                 let lfj_price = q128_to_f64(price_x128);
 
-                // Adjust for token ordering
-                let fallback_price = if token_x == token0 {
+                // Adjust for token ordering (lfj_price is Y/X in raw units)
+                let raw = if token_x == token0 {
+                    // tokenX == token0, so lfj_price (Y/X) = price_0_to_1 in raw
                     lfj_price
                 } else {
+                    // tokenX == token1, so lfj_price (Y/X) = price_1_to_0 in raw
+                    // price_0_to_1 = 1 / price_1_to_0
                     if lfj_price > 0.0 { 1.0 / lfj_price } else { 0.0 }
                 };
 
                 tracing::debug!(
-                    "LFJ pool {} using fallback getPriceFromId: {:.8}",
-                    pair_address, fallback_price
+                    "LFJ pool {} using fallback getPriceFromId: raw={:.2e}",
+                    pair_address, raw
                 );
-                fallback_price
+                raw
             }
         };
 
-        // Sanity check: log if price seems unusual
-        if actual_price <= 0.0 || !actual_price.is_finite() {
+        // Sanity check: raw_price should be positive and finite
+        if raw_price <= 0.0 || !raw_price.is_finite() {
             tracing::warn!(
-                "LFJ pool {} has invalid price: {} (tokenX={}, token0={})",
-                pair_address,
-                actual_price,
-                token_x,
-                token0
+                "LFJ pool {} has invalid raw_price: {:.2e} (dec0: {}, dec1: {})",
+                pair_address, raw_price, decimals0, decimals1
             );
         }
 
