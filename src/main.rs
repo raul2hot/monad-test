@@ -3,6 +3,8 @@
 //! Monitors live prices from Uniswap V3 and Nad.fun DEX via Alchemy WebSockets
 
 mod config;
+mod monitor;
+mod pools;
 
 use alloy::primitives::{Address, U160, U256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -15,6 +17,7 @@ use futures::StreamExt;
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
@@ -75,6 +78,29 @@ struct PriceState {
     nadfun_prices: DashMap<String, f64>,
 }
 
+/// Represents a detected arbitrage opportunity
+#[derive(Debug)]
+struct ArbOpportunity {
+    symbol: String,
+    buy_venue: &'static str,
+    sell_venue: &'static str,
+    spread_pct: f64,
+    buy_price: f64,
+    sell_price: f64,
+}
+
+impl ArbOpportunity {
+    fn print(&self) {
+        println!("\n========== ARBITRAGE DETECTED ==========");
+        println!("  Token:  {}", self.symbol);
+        println!("  Spread: {:.2}%", self.spread_pct);
+        println!("  Action: BUY on {} @ {:.10}", self.buy_venue, self.buy_price);
+        println!("  Action: SELL on {} @ {:.10}", self.sell_venue, self.sell_price);
+        println!("  Est. Profit: {:.2}% (before gas)", self.spread_pct - 2.0);
+        println!("=========================================\n");
+    }
+}
+
 impl PriceState {
     fn new() -> Self {
         Self {
@@ -89,6 +115,34 @@ impl PriceState {
 
     fn update_nadfun(&self, symbol: &str, price: f64) {
         self.nadfun_prices.insert(symbol.to_string(), price);
+    }
+
+    /// Check for arbitrage opportunity and return details
+    fn check_arbitrage(&self, symbol: &str) -> Option<ArbOpportunity> {
+        let uniswap_price = self.uniswap_prices.get(symbol).map(|p| *p)?;
+        let nadfun_price = self.nadfun_prices.get(symbol).map(|p| *p)?;
+
+        if uniswap_price <= 0.0 || nadfun_price <= 0.0 {
+            return None;
+        }
+
+        let spread_pct = ((nadfun_price - uniswap_price) / uniswap_price) * 100.0;
+
+        // Minimum 1.5% spread to cover fees (1% each side)
+        const MIN_SPREAD: f64 = 1.5;
+
+        if spread_pct.abs() > MIN_SPREAD {
+            Some(ArbOpportunity {
+                symbol: symbol.to_string(),
+                buy_venue: if spread_pct > 0.0 { "Uniswap" } else { "Nad.fun" },
+                sell_venue: if spread_pct > 0.0 { "Nad.fun" } else { "Uniswap" },
+                spread_pct: spread_pct.abs(),
+                buy_price: if spread_pct > 0.0 { uniswap_price } else { nadfun_price },
+                sell_price: if spread_pct > 0.0 { nadfun_price } else { uniswap_price },
+            })
+        } else {
+            None
+        }
     }
 
     fn print_prices(&self, symbol: &str, block: u64, source: &str) {
@@ -115,7 +169,11 @@ impl PriceState {
                 let spread_sign = if spread >= 0.0 { "+" } else { "" };
                 println!("  Spread:    {}{:.2}%", spread_sign, spread);
 
-                if spread.abs() > 0.5 {
+                // Check for actionable arbitrage (>1.5% to cover fees)
+                if let Some(arb) = self.check_arbitrage(symbol) {
+                    arb.print();
+                } else if spread.abs() > 0.5 {
+                    // Still show basic arbitrage signal for smaller spreads
                     if spread > 0.0 {
                         println!("  >>> ARBITRAGE: Buy on Uniswap, Sell on Nad.fun <<<");
                     } else {
@@ -293,6 +351,65 @@ async fn main() -> Result<()> {
 
     info!("Subscriptions active");
 
+    // Create polling interval (10 seconds)
+    let mut poll_interval = interval(Duration::from_secs(10));
+
+    // Clone providers and addresses for polling task
+    let poll_provider = provider.clone();
+    let poll_state = price_state.clone();
+    let poll_lens = lens_address;
+    let poll_chog = chog;
+    let poll_uniswap_pool = chog_uniswap_pool;
+    let poll_token0_is_wmon = token0_is_wmon;
+
+    // Spawn polling task
+    let polling_task = tokio::spawn(async move {
+        loop {
+            poll_interval.tick().await;
+
+            // Fetch Uniswap price
+            let slot0_call = slot0Call {};
+            let tx = TransactionRequest::default()
+                .to(poll_uniswap_pool)
+                .input(slot0_call.abi_encode().into());
+
+            if let Ok(result) = poll_provider.call(tx.clone()).await {
+                if let Ok(decoded) = slot0Call::abi_decode_returns(&result) {
+                    let price = calculate_price_from_sqrt_price_x96(
+                        decoded.sqrtPriceX96,
+                        poll_token0_is_wmon
+                    );
+                    poll_state.update_uniswap("CHOG", price);
+                }
+            }
+
+            // Fetch Nad.fun price via LENS
+            let lens_call = getAmountOutCall {
+                token: poll_chog,
+                amountIn: U256::from(1_000_000_000_000_000_000u128),
+                isBuy: true,
+            };
+            let tx = TransactionRequest::default()
+                .to(poll_lens)
+                .input(lens_call.abi_encode().into());
+
+            if let Ok(result) = poll_provider.call(tx).await {
+                if let Ok(decoded) = getAmountOutCall::abi_decode_returns(&result) {
+                    let tokens_out = decoded.amountOut.to_string().parse::<f64>().unwrap_or(0.0);
+                    if tokens_out > 0.0 {
+                        let price = 1e18 / tokens_out;
+                        poll_state.update_nadfun("CHOG", price);
+                    }
+                }
+            }
+
+            // Get current block for display
+            if let Ok(block) = poll_provider.get_block_number().await {
+                poll_state.print_prices("CHOG", block, "POLL");
+            }
+        }
+    });
+
     // Process events from both streams
     let state1 = price_state.clone();
     let state2 = price_state.clone();
@@ -335,12 +452,9 @@ async fn main() -> Result<()> {
 
     // Wait for all tasks (they run indefinitely)
     tokio::select! {
-        _ = uniswap_task => {
-            warn!("Uniswap subscription ended");
-        }
-        _ = nadfun_task => {
-            warn!("Nad.fun subscription ended");
-        }
+        _ = uniswap_task => warn!("Uniswap subscription ended"),
+        _ = nadfun_task => warn!("Nad.fun subscription ended"),
+        _ = polling_task => warn!("Polling task ended"),
     }
 
     Ok(())
