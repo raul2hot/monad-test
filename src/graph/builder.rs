@@ -3,6 +3,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
 
 use super::types::EdgeData;
+use crate::config::thresholds;
 use crate::config::tokens;
 use crate::dex::Pool;
 
@@ -43,6 +44,23 @@ impl ArbitrageGraph {
         // Skip pools with invalid prices
         if !pool.is_price_valid() {
             tracing::trace!("Skipping pool {} - invalid price", pool.address);
+            return;
+        }
+
+        // NEW: Skip pools where round-trip price deviates significantly from 1.0
+        // This catches pools with inconsistent or corrupted price data
+        // price_0_to_1 * price_1_to_0 should equal ~1.0 (minus fees)
+        let price_0_to_1 = pool.price_0_to_1();
+        let price_1_to_0 = pool.price_1_to_0();
+        let round_trip = price_0_to_1 * price_1_to_0;
+        if (round_trip - 1.0).abs() > thresholds::MAX_ROUND_TRIP_DEVIATION {
+            tracing::warn!(
+                "Skipping pool {} ({}) - round trip price deviation: {:.4} (expected ~1.0, got {})",
+                pool.address,
+                pool.dex,
+                (round_trip - 1.0).abs(),
+                round_trip
+            );
             return;
         }
 

@@ -22,6 +22,7 @@ use super::fee_validator::FeeValidator;
 use super::liquidity::{LiquidityAnalyzer, LiquidityInfo};
 use super::profit_calculator::{FlashLoanProvider, ProfitBreakdown, ProfitCalculator};
 use super::quote_fetcher::{AtomicQuote, PoolInfo, QuoteFetcher};
+use crate::config::thresholds;
 use crate::config::tokens;
 use crate::dex::Dex;
 use crate::graph::ArbitrageCycle;
@@ -117,10 +118,12 @@ where
             liquidity_analyzer: LiquidityAnalyzer::new((*provider).clone()),
             profit_calculator: ProfitCalculator::new(
                 FlashLoanProvider::Neverland,
-                10,  // 0.1% min profit
+                thresholds::MIN_PROFIT_BPS,  // Use centralized threshold
                 5,   // 0.05% safety margin
             ),
-            min_liquidity: U256::from(100u128 * 10u128.pow(18)), // 100 tokens minimum
+            // Use MIN_ACTIVE_LIQUIDITY since simulation checks active liquidity near current price
+            // This matches what liquidity.rs measures (bins [-10, +10] for LFJ, current tick for V3)
+            min_liquidity: U256::from(thresholds::MIN_ACTIVE_LIQUIDITY),
             provider,
         }
     }
