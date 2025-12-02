@@ -18,6 +18,9 @@ pub const UNISWAP_QUOTER_V2: &str = "0x661E93cca42AfacB172121EF892830cA3b70F08d"
 // WMON (Wrapped MON)
 pub const WMON: &str = "0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A";
 
+// Nad.fun LENS contract (for price queries)
+pub const NADFUN_LENS: &str = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea";
+
 // Target tokens with cross-venue liquidity
 pub const CHOG: &str = "0x350035555E10d9AfAF1566AaebfCeD5BA6C27777";
 pub const MOLANDAK: &str = "0x7B2728c04aD436153285702e969e6EfAc3a97777";

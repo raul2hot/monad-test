@@ -69,6 +69,19 @@ sol! {
     );
 }
 
+// Nad.fun LENS getAmountOut function
+sol! {
+    #[derive(Debug)]
+    function getAmountOut(
+        address token,
+        uint256 amountIn,
+        bool isBuy
+    ) external view returns (
+        address router,
+        uint256 amountOut
+    );
+}
+
 /// Stores the latest prices for each token on each DEX
 struct PriceState {
     uniswap_prices: DashMap<String, f64>,
@@ -280,25 +293,34 @@ async fn main() -> Result<()> {
         Err(e) => warn!("Could not fetch initial Uniswap price: {}", e),
     }
 
-    // Get initial Nad.fun price
-    let reserves_call = getReservesCall {};
+    // Get initial Nad.fun price via LENS contract
+    let lens_address = Address::from_str(config::NADFUN_LENS)?;
+    let amount_in = U256::from(1_000_000_000_000_000_000u128); // 1 MON
+
+    let lens_call = getAmountOutCall {
+        token: chog,
+        amountIn: amount_in,
+        isBuy: true,
+    };
     let tx = TransactionRequest::default()
-        .to(chog_nadfun_pool)
-        .input(reserves_call.abi_encode().into());
+        .to(lens_address)
+        .input(lens_call.abi_encode().into());
 
     match provider.call(tx).await {
         Ok(result) => {
-            if let Ok(decoded) = getReservesCall::abi_decode_returns(&result) {
-                let price = calculate_price_from_reserves(
-                    U256::from(decoded.reserve0),
-                    U256::from(decoded.reserve1),
-                    token0_is_wmon,
-                );
-                println!("Initial CHOG Nad.fun price: {:.10} MON", price);
-                price_state.update_nadfun("CHOG", price);
+            if let Ok(decoded) = getAmountOutCall::abi_decode_returns(&result) {
+                // tokens_out / 1e18 = tokens per MON
+                // price = 1 / tokens_per_mon = MON per token
+                let tokens_out = decoded.amountOut.to_string().parse::<f64>().unwrap_or(0.0);
+                if tokens_out > 0.0 {
+                    let price = 1e18 / tokens_out;
+                    println!("Initial CHOG Nad.fun price: {:.10} MON (via LENS)", price);
+                    println!("  Router: {:?}", decoded.router);
+                    price_state.update_nadfun("CHOG", price);
+                }
             }
         }
-        Err(e) => warn!("Could not fetch initial Nad.fun price: {}", e),
+        Err(e) => warn!("Could not fetch initial Nad.fun price via LENS: {}", e),
     }
 
     println!();
@@ -325,6 +347,11 @@ async fn main() -> Result<()> {
 
     let nadfun_sub = provider.subscribe_logs(&nadfun_filter).await?;
     let mut nadfun_stream = nadfun_sub.into_stream();
+
+    // Debug: Subscribe to ALL events from Nad.fun pool
+    let debug_filter = Filter::new().address(chog_nadfun_pool);
+    let debug_sub = provider.subscribe_logs(&debug_filter).await?;
+    let mut debug_stream = debug_sub.into_stream();
 
     info!("Subscriptions active");
 
@@ -377,13 +404,33 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for both tasks (they run indefinitely)
+    // Debug task to identify what events the pool actually emits
+    let debug_task = tokio::spawn(async move {
+        println!("\n=== DEBUG: Listening for ALL Nad.fun pool events ===\n");
+        while let Some(log) = debug_stream.next().await {
+            let block = log.block_number.unwrap_or(0);
+            println!("\n[DEBUG] Block {} - Topics: {:?}", block, log.topics());
+
+            if let Some(topic0) = log.topics().first() {
+                let t = format!("{:?}", topic0);
+                if t.contains("d78ad95f") { println!("  >> Uniswap V2 Swap"); }
+                else if t.contains("c42079f9") { println!("  >> Uniswap V3 Swap"); }
+                else if t.contains("1c411e9a") { println!("  >> Sync event"); }
+                else { println!("  >> Unknown/Custom event"); }
+            }
+        }
+    });
+
+    // Wait for all tasks (they run indefinitely)
     tokio::select! {
         _ = uniswap_task => {
             warn!("Uniswap subscription ended");
         }
         _ = nadfun_task => {
             warn!("Nad.fun subscription ended");
+        }
+        _ = debug_task => {
+            warn!("Debug subscription ended");
         }
     }
 
