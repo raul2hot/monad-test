@@ -73,6 +73,10 @@ sol! {
 /// Bin step determines the price increment between bins (in basis points)
 const LB_BIN_STEPS: [u32; 6] = [1, 2, 5, 10, 15, 20];
 
+/// Test amount for getting realistic quote-based prices (1 WMON = 1e18)
+/// Using a smaller amount to ensure we don't run into liquidity issues during discovery
+const QUOTE_TEST_AMOUNT: u128 = 1_000_000_000_000_000_000; // 1 token with 18 decimals
+
 /// Convert LFJ Q128.128 price to f64 with proper precision
 /// price_x128 = actual_price * 2^128
 /// We need to divide by 2^128 to get actual_price
@@ -127,6 +131,94 @@ impl<P: Provider + Clone> LfjClient<P> {
         }
     }
 
+    /// Get quote-based exchange rate by calling getSwapOut on the pair contract.
+    /// This gives a realistic price that accounts for actual liquidity in the pool.
+    /// Returns (rate, fee) where rate = amount_out / amount_in (decimal-adjusted)
+    async fn get_quote_based_rate(
+        &self,
+        pair_address: Address,
+        token_x: Address,
+        token_y: Address,
+        swap_for_y: bool,
+    ) -> eyre::Result<Option<(f64, u128)>> {
+        let pair_contract = ILBPair::new(pair_address, &self.provider);
+
+        // Determine decimals for the input token
+        let (token_in, token_out) = if swap_for_y {
+            (token_x, token_y)
+        } else {
+            (token_y, token_x)
+        };
+
+        let decimals_in = tokens::decimals(token_in);
+        let decimals_out = tokens::decimals(token_out);
+
+        // Adjust test amount based on token decimals
+        // We want to test with approximately 1 unit of the token
+        let test_amount: u128 = if decimals_in == 18 {
+            QUOTE_TEST_AMOUNT
+        } else {
+            10u128.pow(decimals_in as u32)
+        };
+
+        // Call getSwapOut to get actual quote
+        let result = match pair_contract
+            .getSwapOut(test_amount, swap_for_y)
+            .call()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!("getSwapOut failed for quote: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let amount_in_left = result.amountInLeft;
+        let amount_out = result.amountOut;
+        let fee = result.fee;
+
+        // If no output or all input left, there's no liquidity in this direction
+        if amount_out == 0 || amount_in_left == test_amount {
+            tracing::trace!(
+                "No liquidity for swap_for_y={}: amountInLeft={}, amountOut={}",
+                swap_for_y, amount_in_left, amount_out
+            );
+            return Ok(None);
+        }
+
+        // Calculate the actual amount that was swapped
+        let actual_amount_in = test_amount - amount_in_left;
+
+        // Reject if partial fill lost too much (less than 50% swapped)
+        if actual_amount_in < test_amount / 2 {
+            tracing::trace!(
+                "Partial fill too severe: only {} of {} swapped",
+                actual_amount_in, test_amount
+            );
+            return Ok(None);
+        }
+
+        // Calculate rate with decimal adjustment
+        // rate = (amount_out / 10^decimals_out) / (actual_amount_in / 10^decimals_in)
+        //      = amount_out * 10^decimals_in / (actual_amount_in * 10^decimals_out)
+        let rate = if decimals_in >= decimals_out {
+            let scale = 10u128.pow((decimals_in - decimals_out) as u32);
+            (amount_out as f64 * scale as f64) / actual_amount_in as f64
+        } else {
+            let scale = 10u128.pow((decimals_out - decimals_in) as u32);
+            amount_out as f64 / (actual_amount_in as f64 * scale as f64)
+        };
+
+        // Sanity check: rate should be positive and reasonable
+        if rate <= 0.0 || !rate.is_finite() || rate > 1e18 || rate < 1e-18 {
+            tracing::trace!("Quote rate out of bounds: {}", rate);
+            return Ok(None);
+        }
+
+        Ok(Some((rate, fee as u128)))
+    }
+
     async fn get_lb_pair(
         &self,
         token0: Address,
@@ -156,87 +248,128 @@ impl<P: Provider + Clone> LfjClient<P> {
     ) -> eyre::Result<Pool> {
         let pair_contract = ILBPair::new(pair_address, &self.provider);
 
-        // CRITICAL FIX: Get the actual tokenX and tokenY from the pair
-        // LFJ getPriceFromId() returns price of tokenY per tokenX
-        // We need to check if our sorted token0/token1 matches the pair's tokenX/tokenY
+        // Get the actual tokenX and tokenY from the pair
+        // LFJ uses tokenX < tokenY ordering (by address)
         let token_x = pair_contract.getTokenX().call().await?;
         let token_y = pair_contract.getTokenY().call().await?;
 
         // Get reserves and active bin
         let reserves = pair_contract.getReserves().call().await?;
-        let active_id: u32 = pair_contract.getActiveId().call().await?.to();
+        let _active_id: u32 = pair_contract.getActiveId().call().await?.to();
 
-        // CRITICAL FIX: Fetch actual fee parameters from contract
-        // LFJ fees consist of: baseFee = baseFactor * binStep / 10000
-        // Plus potential variable fee from volatility
+        // Get fee parameters from contract
         let fee = match pair_contract.getStaticFeeParameters().call().await {
             Ok(params) => {
                 // baseFee = baseFactor * binStep / 10000 (result in basis points)
                 // We need it in hundredths of bips for consistency with V3
-                // baseFactor is typically 5000-15000, binStep is 1-100
-                // Example: baseFactor=5000, binStep=10 → baseFee = 5000*10/10000 = 5 bps = 500 hundredths of bips
                 let base_fee_bps = (params.baseFactor as u32 * bin_step) / 10_000;
                 // Convert to hundredths of bips (multiply by 100)
                 base_fee_bps * 100
             }
             Err(e) => {
-                // Fallback to simple bin_step calculation if getStaticFeeParameters fails
                 tracing::debug!("Failed to get LFJ fee params for {}: {}, using fallback", pair_address, e);
                 // LFJ default: bin_step as basis points * 100 = hundredths of bips
                 bin_step * 100
             }
         };
 
-        // Get price from active bin (this is a Q128.128 fixed point number)
-        // price_x128 represents: price of tokenY per tokenX (i.e., tokenY/tokenX)
-        let price_x128: U256 = pair_contract
-            .getPriceFromId(active_id.try_into()?)
-            .call()
-            .await?;
+        // Get decimals for all tokens
+        let decimals0 = tokens::decimals(token0);
+        let decimals1 = tokens::decimals(token1);
+        let decimals_x = tokens::decimals(token_x);
+        let decimals_y = tokens::decimals(token_y);
 
-        // Convert from Q128.128 to f64
-        // price_x128 = actual_price * 2^128
-        let lfj_price = q128_to_f64(price_x128);
+        // CRITICAL FIX: Use getSwapOut to get REALISTIC quote-based prices
+        // instead of theoretical prices from getPriceFromId.
+        // This accounts for actual liquidity and prevents false positive arbitrage detection.
+        //
+        // We call getSwapOut for the X→Y direction and derive the price from actual quotes.
+        let quote_based_price = match self.get_quote_based_rate(pair_address, token_x, token_y, true).await {
+            Ok(Some((rate_x_to_y, _fee))) => {
+                // rate_x_to_y is the decimal-adjusted rate: how many Y per 1 X
+                // We need price_0_to_1 = how many token1 per 1 token0
 
-        // CRITICAL FIX: Determine if we need to invert the price
-        // LFJ price is tokenY/tokenX
-        // Pool convention: price_0_to_1 = token1/token0
-        // So if tokenX == token0 and tokenY == token1, price is already correct (token1/token0)
-        // If tokenX == token1 and tokenY == token0, price is token0/token1, need to invert
-        let actual_price = if token_x == token0 {
-            // tokenX == token0, tokenY == token1
-            // LFJ price is tokenY/tokenX = token1/token0 ✓ (correct direction)
-            lfj_price
-        } else {
-            // tokenX == token1, tokenY == token0
-            // LFJ price is tokenY/tokenX = token0/token1 (inverted)
-            // We need token1/token0, so invert: 1 / (token0/token1) = token1/token0
-            if lfj_price > 0.0 {
-                1.0 / lfj_price
-            } else {
-                0.0
+                if token_x == token0 {
+                    // tokenX == token0, so rate X→Y = rate 0→1 = price_0_to_1
+                    Some(rate_x_to_y)
+                } else {
+                    // tokenX == token1, so rate X→Y = rate 1→0
+                    // price_0_to_1 = 1 / rate_1_to_0
+                    if rate_x_to_y > 0.0 {
+                        Some(1.0 / rate_x_to_y)
+                    } else {
+                        None
+                    }
+                }
+            }
+            Ok(None) => {
+                // No valid quote available - try the reverse direction
+                match self.get_quote_based_rate(pair_address, token_x, token_y, false).await {
+                    Ok(Some((rate_y_to_x, _fee))) => {
+                        // rate_y_to_x is: how many X per 1 Y
+                        if token_x == token0 {
+                            // rate Y→X = rate 1→0, so price_0_to_1 = 1/rate
+                            if rate_y_to_x > 0.0 {
+                                Some(1.0 / rate_y_to_x)
+                            } else {
+                                None
+                            }
+                        } else {
+                            // rate Y→X = rate 0→1 = price_0_to_1
+                            Some(rate_y_to_x)
+                        }
+                    }
+                    _ => None
+                }
+            }
+            Err(e) => {
+                tracing::trace!("Quote-based price failed for {}: {}", pair_address, e);
+                None
+            }
+        };
+
+        // Fallback to getPriceFromId if quote-based pricing failed
+        let actual_price = match quote_based_price {
+            Some(price) if price > 0.0 && price.is_finite() => {
+                tracing::debug!(
+                    "LFJ pool {} using quote-based price: {:.8}",
+                    pair_address, price
+                );
+                price
+            }
+            _ => {
+                // Fallback: use getPriceFromId (less accurate but still useful)
+                let price_x128: U256 = pair_contract
+                    .getPriceFromId(_active_id.try_into()?)
+                    .call()
+                    .await?;
+                let lfj_price = q128_to_f64(price_x128);
+
+                // Adjust for token ordering
+                let fallback_price = if token_x == token0 {
+                    lfj_price
+                } else {
+                    if lfj_price > 0.0 { 1.0 / lfj_price } else { 0.0 }
+                };
+
+                tracing::debug!(
+                    "LFJ pool {} using fallback getPriceFromId: {:.8}",
+                    pair_address, fallback_price
+                );
+                fallback_price
             }
         };
 
         // Sanity check: log if price seems unusual
         if actual_price <= 0.0 || !actual_price.is_finite() {
             tracing::warn!(
-                "LFJ pool {} has invalid price: {} (lfj_price={}, tokenX={}, token0={})",
+                "LFJ pool {} has invalid price: {} (tokenX={}, token0={})",
                 pair_address,
                 actual_price,
-                lfj_price,
                 token_x,
                 token0
             );
         }
-
-        // Get decimals for the Pool struct
-        let decimals0 = tokens::decimals(token0);
-        let decimals1 = tokens::decimals(token1);
-
-        // CRITICAL FIX: Get decimals for tokenX and tokenY (may differ from sorted token0/token1)
-        let decimals_x = tokens::decimals(token_x);
-        let decimals_y = tokens::decimals(token_y);
 
         // Convert to sqrtPriceX96 format for consistency with Uniswap V3
         // sqrtPriceX96 = sqrt(price) * 2^96
@@ -245,8 +378,7 @@ impl<P: Provider + Clone> LfjClient<P> {
         let sqrt_price = actual_price.sqrt();
         let sqrt_price_x96 = (sqrt_price * 2_f64.powi(96)) as u128;
 
-        // CRITICAL FIX: Normalize reserves to 18 decimals before summing
-        // This avoids the bug where we compare 44e18 WMON + 100e6 USDC against 100e18 threshold
+        // Normalize reserves to 18 decimals for consistent liquidity comparison
         let normalized_reserve_x = thresholds::normalize_to_18_decimals(
             U256::from(reserves.reserveX),
             decimals_x,

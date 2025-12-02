@@ -186,8 +186,63 @@ where
         }
 
         // 3. Get atomic quotes for the path (this is the REAL validation)
+        //
+        // DIAGNOSTIC LOGGING: Log the expected path and direction for each hop
+        // This helps debug issues where swapForY direction might be wrong
+        debug!("=== QUOTE PATH DETAILS ===");
+        for (i, pool_info) in pool_infos.iter().enumerate() {
+            let (token_in, token_out) = if pool_info.zero_for_one {
+                (pool_info.token0, pool_info.token1)
+            } else {
+                (pool_info.token1, pool_info.token0)
+            };
+            debug!(
+                "  Hop {}: {} -> {} via {} pool {} (zero_for_one={})",
+                i + 1,
+                tokens::symbol(token_in),
+                tokens::symbol(token_out),
+                pool_info.dex,
+                pool_info.address,
+                pool_info.zero_for_one
+            );
+        }
+
         let quotes = match self.quote_fetcher.get_path_quotes(&pool_infos, input_amount).await {
-            Ok(q) => q,
+            Ok(q) => {
+                // Log successful quote details for debugging
+                debug!("=== QUOTE RESULTS ===");
+                for (i, quote) in q.quotes.iter().enumerate() {
+                    let rate = if quote.amount_in > U256::ZERO {
+                        quote.amount_out.to::<u128>() as f64 / quote.amount_in.to::<u128>() as f64
+                    } else {
+                        0.0
+                    };
+                    debug!(
+                        "  Hop {}: {} {} -> {} {} | rate={:.8} | fee={} bps",
+                        i + 1,
+                        quote.amount_in,
+                        tokens::symbol(quote.token_in),
+                        quote.amount_out,
+                        tokens::symbol(quote.token_out),
+                        rate,
+                        quote.fee_bps
+                    );
+                }
+                let final_output = q.final_amount_out();
+                let gross_ratio = if input_amount > U256::ZERO {
+                    final_output.to::<u128>() as f64 / input_amount.to::<u128>() as f64
+                } else {
+                    0.0
+                };
+                debug!(
+                    "  TOTAL: {} -> {} (ratio: {:.6}, {:+.2}%)",
+                    input_amount,
+                    final_output,
+                    gross_ratio,
+                    (gross_ratio - 1.0) * 100.0
+                );
+                q
+            }
             Err(e) => {
                 // Enhanced diagnostic logging for quote failures
                 warn!(
@@ -201,7 +256,7 @@ where
                 for (i, pool_info) in pool_infos.iter().enumerate() {
                     let liq = liquidity_info.get(i);
                     debug!(
-                        "  Pool {}: {} ({}) | token0={} ({}d), token1={} ({}d) | fee={} | liq={}",
+                        "  Pool {}: {} ({}) | token0={} ({}d), token1={} ({}d) | fee={} | liq={} | zero_for_one={}",
                         i,
                         pool_info.address,
                         pool_info.dex,
@@ -210,7 +265,8 @@ where
                         tokens::symbol(pool_info.token1),
                         tokens::decimals(pool_info.token1),
                         pool_info.fee,
-                        liq.map(|l| l.total_liquidity.to_string()).unwrap_or_else(|| "N/A".to_string())
+                        liq.map(|l| l.total_liquidity.to_string()).unwrap_or_else(|| "N/A".to_string()),
+                        pool_info.zero_for_one
                     );
                 }
 
