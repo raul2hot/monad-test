@@ -1,339 +1,275 @@
-# Monad Arbitrage Bot - Root Cause Analysis & Fix Instructions
+# Root Cause Analysis: Monad Arbitrage Bot Graph-Quoter Discrepancy
 
-**Date:** December 2, 2025  
-**Issue:** All detected arbitrage opportunities are being rejected despite graph showing "profitable" cycles
+Your arbitrage bot shows **20.70% profit** via Bellman-Ford but **0 bps** from quoter simulation because of a compound failure across LFJ price calculation, liquidity threshold logic, and graph edge weight construction. The primary issue is the liquidity threshold rejection, but even without that, underlying price calculation bugs would cause incorrect opportunity detection.
 
----
+## The immediate rejection: flawed liquidity comparison
 
-## Executive Summary
+The log shows the opportunity being rejected with `insufficient liquidity: 44323215691692120251 < 100000000000000000000` (44.3e18 < 100e18). This comparison is fundamentally broken because it compares raw token amounts without normalization.
 
-The bot is detecting arbitrage cycles (e.g., "WMON → USDC → WMON | 21% profit") but ALL opportunities are rejected during simulation. The root cause is **inconsistent liquidity measurement** between pool discovery and simulation phases, combined with **unrealistic profit calculations** in the graph building phase.
+**The bug**: Your `MIN_ACTIVE_LIQUIDITY` threshold of **100e18** assumes all pools use 18-decimal tokens. The LFJ pool `0x5E60BC3F7a7303BC4dfE4dc2220bdC90bc04fE22` returns `reserveX + reserveY` in raw decimals. For WMON (18 decimals), 44.3e18 represents 44.3 WMON—which may be perfectly adequate liquidity depending on trade size.
 
----
+**Fix for `src/config.rs`**:
+```rust
+// WRONG: Universal raw threshold
+pub const MIN_ACTIVE_LIQUIDITY: U256 = U256::from_limbs([100_000_000_000_000_000_000u64, 0, 0, 0]);
 
-## Issue 1: Inconsistent Liquidity Measurement (CRITICAL)
-
-### Symptom
+// CORRECT: USD-normalized or token-specific thresholds
+pub const MIN_LIQUIDITY_USD: f64 = 10_000.0;  // $10k minimum
+// OR token-specific:
+pub const MIN_WMON_LIQUIDITY: U256 = U256::from_limbs([50_000_000_000_000_000_000u64, 0, 0, 0]); // 50 WMON
+pub const MIN_USDC_LIQUIDITY: U256 = U256::from_limbs([10_000_000_000u64, 0, 0, 0]); // 10,000 USDC (6 decimals)
 ```
-Pool 0x5E60BC3F7a7303BC4dfE4dc2220bdC90bc04fE22 has insufficient liquidity: 
-44323215691692120251 < 100000000000000000000
+
+## LFJ price calculation: critical formula errors
+
+LFJ's Liquidity Book uses fundamentally different math than Uniswap V3. Several bugs likely exist in your implementation.
+
+### Token ordering is NOT sorted by address
+
+Unlike Uniswap where `token0 < token1` by address, LFJ's `tokenX` and `tokenY` can be in **any order**. The factory sorts for storage, but the actual pair may have reversed ordering.
+
+**Fix for `src/dex/lfj.rs`**:
+```rust
+// WRONG: Assuming tokenX is always the lower address
+let (token0, token1) = if token_a < token_b { (token_a, token_b) } else { (token_b, token_a) };
+
+// CORRECT: Always query the pair contract
+let token_x = pair.getTokenX().call().await?;
+let token_y = pair.getTokenY().call().await?;
+// Price is ALWAYS tokenY per tokenX (Y/X)
 ```
 
-The pool has ~44 tokens of liquidity but the simulation requires 100 tokens minimum.
+### Price direction interpretation
 
-### Root Cause
-
-**Two different liquidity measurement methods are used:**
-
-| Phase | Location | Method | What It Measures |
-|-------|----------|--------|------------------|
-| Pool Discovery | `src/dex/batch_client.rs` | `getReserves()` | **Total** reserves across ALL bins |
-| Simulation | `src/simulation/liquidity.rs` | `getBin()` in [-10, +10] range | **Active** liquidity near current price |
-
-For LFJ (Liquidity Book), reserves can be spread across hundreds of bins. A pool might have:
-- 2000 tokens total reserves (passes 1000-token discovery threshold)
-- Only 44 tokens in active bins near current price (fails 100-token simulation threshold)
-
-### Files to Modify
-
-1. **`src/dex/batch_client.rs`** - Line ~180 in `lfj_to_pool()` and `get_pools()`
-2. **`src/simulation/liquidity.rs`** - Line ~100 in `get_lfj_liquidity()`
-3. **`src/config.rs`** - Centralize MIN_LIQUIDITY constant
-
-### Fix Strategy
-
-**Option A (Recommended): Use Active Liquidity Everywhere**
-
-Modify pool discovery to use the same active-bins measurement as simulation:
+The LFJ price from `getPriceFromId()` represents **tokenY per tokenX**. If you need the price for swapping X→Y, use the price directly. For Y→X, invert it.
 
 ```rust
-// In batch_client.rs - Instead of using total reserves from getReserves(),
-// fetch active bin ID and query surrounding bins to get ACTIVE liquidity
-// This matches what simulation/liquidity.rs does
+// Price from bin: tokenY per tokenX
+let price_y_per_x = calculate_price_from_id(active_id, bin_step);
+
+// For swapping tokenX → tokenY (swapForY = true):
+let effective_rate = price_y_per_x * (1.0 - fee);
+
+// For swapping tokenY → tokenX (swapForY = false):
+let effective_rate = (1.0 / price_y_per_x) * (1.0 - fee);
 ```
 
-**Option B: Lower Simulation Threshold**
+### Q128.128 fixed-point conversion
 
-If discovery measures total reserves, simulation could accept lower active liquidity. But this risks executing trades against illiquid pools.
+LFJ returns prices in 128.128 binary fixed-point. Converting to f64 requires dividing by 2^128:
 
-**Option C: Add Active Liquidity Field to Pool Struct**
-
-Extend the `Pool` struct to store both total and active liquidity, then filter appropriately at each stage.
-
-### Specific Code Changes Required
-
-#### File: `src/dex/batch_client.rs`
-
-Location: `BatchLfjClient::lfj_to_pool()` function (~line 140)
-
-Current problematic code:
 ```rust
-fn lfj_to_pool(pair_addr: Address, data: &LfjPairData) -> Pool {
-    // ...
-    // Calculate liquidity from reserves
-    let total_liquidity = data.reserve_x + data.reserve_y;  // BUG: Uses total reserves
-    // ...
+// WRONG: Integer division loses all precision
+let price_f64 = (price_q128 / U256::from(1u128 << 128)).as_u64() as f64;
+
+// CORRECT: Use proper fixed-point conversion
+let price_f64 = price_q128.to_f64_lossy() / (2.0_f64.powi(128));
+
+// OR for more precision:
+let (hi, lo) = (price_q128 >> 128, price_q128 & ((U256::ONE << 128) - U256::ONE));
+let price_f64 = hi.to_f64_lossy() + lo.to_f64_lossy() / 2.0_f64.powi(128);
+```
+
+### Bin price calculation formula
+
+```rust
+// Correct formula: price = (1 + binStep/10000)^(activeId - 8388608)
+const REAL_ID_SHIFT: i32 = 8388608; // 2^23
+
+fn calculate_price_from_id(active_id: u32, bin_step: u16) -> f64 {
+    let base = 1.0 + (bin_step as f64 / 10_000.0);
+    let exponent = (active_id as i32) - REAL_ID_SHIFT;
+    base.powi(exponent)
 }
 ```
 
-Fix: Query active bins to get tradeable liquidity, matching the approach in `simulation/liquidity.rs`.
+## Graph edge weight construction flaws
 
-#### File: `src/simulation/liquidity.rs`
+The 20.70% "profit" detection is almost certainly a false positive from incorrect edge weight calculation.
 
-Location: `get_lfj_liquidity()` function (~line 80)
+### Fee unit confusion between DEXes
 
-This function queries bins in range [-10, +10] which is correct for active liquidity. However, verify the bin range is appropriate (some pools may need wider range).
+Your graph likely mishandles fee representations:
 
-#### File: `src/config.rs`
+| DEX | 0.3% fee representation | Conversion to decimal |
+|-----|------------------------|----------------------|
+| **Uniswap V3/V4** | 3000 (hundredths of bps) | `3000 / 1_000_000 = 0.003` |
+| **PancakeSwap V3** | 2500 (for 0.25%) | `2500 / 1_000_000 = 0.0025` |
+| **LFJ** | Variable (baseFee + variableFee) | Returned from `getSwapOut()` |
 
-Add centralized liquidity constants:
+**Fix for `src/graph/builder.rs`**:
 ```rust
-pub mod thresholds {
-    /// Minimum active liquidity for pool inclusion (100 tokens with 18 decimals)
-    pub const MIN_ACTIVE_LIQUIDITY: u128 = 100 * 10u128.pow(18);
+// WRONG: Using fee directly as percentage
+let fee_decimal = pool.fee as f64; // If fee=3000, this gives 3000% fee!
+
+// CORRECT: Normalize based on DEX type
+fn normalize_fee(pool: &Pool) -> f64 {
+    match pool.dex_type {
+        DexType::UniswapV3 | DexType::UniswapV4 | DexType::PancakeSwapV3 => {
+            pool.fee as f64 / 1_000_000.0  // 3000 → 0.003
+        }
+        DexType::LFJ => {
+            // LFJ fees should be fetched from getSwapOut() or calculated
+            // baseFee = baseFactor * binStep / 10000
+            (pool.base_factor as f64 * pool.bin_step as f64) / 100_000_000.0
+        }
+    }
+}
+```
+
+### Edge weight formula must include fees correctly
+
+```rust
+// CORRECT edge weight for Bellman-Ford:
+// w(A→B) = -ln(price * (1 - fee))
+
+fn calculate_edge_weight(price: f64, fee: f64) -> f64 {
+    let effective_rate = price * (1.0 - fee);
+    -effective_rate.ln()  // Negative log for arbitrage detection
+}
+
+// WRONG approaches that cause false positives:
+// -ln(price) - fee          ← Additive fee is wrong
+// -ln(price) - ln(1-fee)    ← Mathematical error
+// -ln(price / (1 + fee))    ← Fee direction inverted
+```
+
+### Bidirectional edge consistency
+
+For a token pair A↔B, you need two edges with correct directional prices:
+
+```rust
+// For pool with tokenX=A, tokenY=B, price = B/A (how much B per A)
+
+// Edge A→B (swap A to get B):
+let weight_a_to_b = -((price_b_per_a * (1.0 - fee)).ln());
+
+// Edge B→A (swap B to get A):  
+let price_a_per_b = 1.0 / price_b_per_a;
+let weight_b_to_a = -((price_a_per_b * (1.0 - fee)).ln());
+
+// These are NOT simply negatives of each other due to fees
+```
+
+## Uniswap V3/V4 sqrtPriceX96 conversion bugs
+
+If you're also using Uniswap pools in the arbitrage path, verify these calculations:
+
+### Correct sqrtPriceX96 conversion
+
+```rust
+// sqrtPriceX96 gives price = token1/token0 (NOT token0/token1)
+fn sqrt_price_to_price(sqrt_price_x96: U256) -> f64 {
+    let sqrt_p = sqrt_price_x96.to_f64_lossy() / 2.0_f64.powi(96);
+    sqrt_p * sqrt_p  // Square it: (sqrtPrice)^2 = price
+}
+
+// For human-readable with decimals:
+fn sqrt_price_to_human_price(sqrt_price_x96: U256, decimals0: u8, decimals1: u8) -> f64 {
+    let raw_price = sqrt_price_to_price(sqrt_price_x96);
+    raw_price * 10.0_f64.powi((decimals0 as i32) - (decimals1 as i32))
+}
+```
+
+### Common mistake: forgetting Q192 scaling
+
+```rust
+// WRONG: Only shifting by 96
+let price = (sqrt_price_x96 * sqrt_price_x96) >> 96;
+
+// CORRECT: Must shift by 192 after squaring
+let price = (sqrt_price_x96 * sqrt_price_x96) >> 192;
+// Or equivalently: (sqrtPrice / 2^96)^2
+```
+
+## Fix for `src/dex/mod.rs` Pool price methods
+
+Your `Pool` struct needs DEX-aware price calculation:
+
+```rust
+impl Pool {
+    pub fn get_effective_price(&self, token_in: Address, amount_in: U256) -> Result<f64> {
+        match self.dex_type {
+            DexType::LFJ => {
+                let (token_x, token_y) = (self.token_x, self.token_y);
+                let swap_for_y = token_in == token_x;
+                
+                // Price is tokenY per tokenX
+                let base_price = self.calculate_lfj_price()?;
+                
+                if swap_for_y {
+                    Ok(base_price) // Selling X for Y
+                } else {
+                    Ok(1.0 / base_price) // Selling Y for X
+                }
+            }
+            DexType::UniswapV3 | DexType::UniswapV4 => {
+                // sqrtPriceX96 gives token1/token0
+                let raw_price = self.calculate_v3_price()?;
+                
+                if token_in == self.token0 {
+                    Ok(raw_price) // Selling token0 for token1
+                } else {
+                    Ok(1.0 / raw_price) // Selling token1 for token0
+                }
+            }
+            // ... other DEX types
+        }
+    }
+}
+```
+
+## Fix for `src/simulation/quote_fetcher.rs`
+
+The quoter should use on-chain calls, not calculated prices:
+
+```rust
+pub async fn fetch_lfj_quote(
+    pair: Address,
+    amount_in: u128,
+    swap_for_y: bool,
+    provider: &Provider,
+) -> Result<QuoteResult> {
+    // Use getSwapOut for accurate quote including fees
+    let (amount_left, amount_out, fees) = lfj_pair
+        .getSwapOut(amount_in, swap_for_y)
+        .call()
+        .await?;
     
-    /// Minimum total liquidity (for reference, not primary filter)
-    pub const MIN_TOTAL_LIQUIDITY: u128 = 1000 * 10u128.pow(18);
-}
-```
-
-Remove duplicate `MIN_LIQUIDITY` constants from:
-- `src/dex/batch_client.rs` (line ~22)
-- `src/dex/lfj.rs` (line ~95)
-- `src/dex/pancakeswap.rs` (line ~60)
-- `src/dex/uniswap_v3.rs` (line ~60)
-
----
-
-## Issue 2: Unrealistic Profit Detection (HIGH)
-
-### Symptom
-```
-Unique cycle: WMON -> USDC -> WMON | 2 hops | 21.00% profit | single-dex
-```
-
-21% profit on a simple 2-hop same-DEX cycle is unrealistic. Real arbitrage opportunities are typically <1%.
-
-### Root Cause
-
-The LFJ price calculation in `src/dex/lfj.rs` may have precision issues with the Q128.128 fixed-point conversion.
-
-### Files to Examine
-
-1. **`src/dex/lfj.rs`** - `q128_to_f64()` function and `get_pool_state()`
-2. **`src/dex/batch_client.rs`** - `calculate_lfj_sqrt_price()` function
-3. **`src/dex/mod.rs`** - `Pool::price_0_to_1()` method
-
-### Investigation Steps
-
-1. **Add diagnostic logging** to compare:
-   - Graph-calculated price (from `Pool::price_0_to_1()`)
-   - Quoter-returned price (from `QuoteFetcher`)
-   
-2. **Run the diagnostic module** already present in `src/simulation/diagnostics.rs`:
-   ```rust
-   // Add to main.rs after finding cycles:
-   for cycle in cycles.iter().take(1) {
-       diagnose_cycle(provider.clone(), cycle, &all_pools).await?;
-   }
-   ```
-
-3. **Check decimal handling** - LFJ may already include decimal adjustment in its price, causing double-adjustment in `Pool::price_0_to_1()`.
-
-### Specific Areas to Review
-
-#### File: `src/dex/lfj.rs`
-
-Location: `get_pool_state()` function (~line 70)
-
-```rust
-// FIXED: Proper conversion from Q128.128 using dedicated function
-let actual_price = q128_to_f64(price_x128);
-
-// Note: decimal_adjustment is calculated but LFJ already handles decimals in its price
-// The Pool::price_0_to_1() method will apply decimal adjustment using decimals0/decimals1
-let _decimal_adjustment = 10_f64.powi(decimals0 as i32 - decimals1 as i32);
-```
-
-**Potential bug:** The comment says "LFJ already handles decimals" but then `Pool::price_0_to_1()` applies decimal adjustment again. Verify whether this causes double-adjustment.
-
-#### File: `src/dex/batch_client.rs`
-
-Location: `calculate_lfj_sqrt_price()` function (~line 130)
-
-```rust
-fn calculate_lfj_sqrt_price(active_id: u32, bin_step: u16) -> U256 {
-    const ID_OFFSET: i64 = 8388608; // 2^23
-    let exponent = (active_id as i64) - ID_OFFSET;
-    let base = 1.0 + (bin_step as f64) / 10000.0;
-    let price = base.powf(exponent as f64);
-    let sqrt_price = price.sqrt();
-    let sqrt_price_x96 = sqrt_price * 2_f64.powi(96);
-    // ...
-}
-```
-
-**Potential issue:** This approximation may not match what the quoter returns for actual swaps. Consider using the actual price from `getPriceFromId()` instead.
-
----
-
-## Issue 3: Multiple Inconsistent Constants (MEDIUM)
-
-### Symptom
-
-`MIN_LIQUIDITY` is defined in 4+ different files with different values.
-
-### Files with Duplicates
-
-| File | Value | Used For |
-|------|-------|----------|
-| `src/dex/batch_client.rs` | `1000 * 10^18` | Pool discovery |
-| `src/dex/lfj.rs` | `1000 * 10^18` | LFJ pool filtering |
-| `src/dex/pancakeswap.rs` | `1000 * 10^18` | PancakeSwap filtering |
-| `src/dex/uniswap_v3.rs` | `1000 * 10^18` | Uniswap V3 filtering |
-| `src/simulation/simulator.rs` | `100 * 10^18` | **Different!** Simulation filtering |
-| `src/config.rs` | `1000 * 10^18` | Config (unused?) |
-
-### Fix
-
-Centralize all thresholds in `src/config.rs` and import from there:
-
-```rust
-// src/config.rs
-pub mod thresholds {
-    pub const MIN_LIQUIDITY_NATIVE: u128 = 100 * 10u128.pow(18);  // 100 tokens
-    pub const MIN_PROFIT_BPS: u32 = 10;  // 0.1%
-}
-```
-
----
-
-## Issue 4: Graph Builds From Stale/Invalid Pools (LOW)
-
-### Symptom
-
-Pools with unrealistic prices (21% spread on same-DEX) are being added to the graph.
-
-### Root Cause
-
-The validation in `ArbitrageGraph::add_pool()` only checks `is_price_valid()` which allows prices between 1e-18 and 1e18 - a very wide range.
-
-### File to Modify
-
-**`src/graph/builder.rs`** - `add_pool()` function
-
-### Fix
-
-Add cross-validation:
-```rust
-pub fn add_pool(&mut self, pool: &Pool) {
-    // Existing check
-    if !pool.is_price_valid() {
-        return;
+    // Verify full amount can be swapped
+    if amount_left > 0 {
+        return Err(Error::InsufficientLiquidity(amount_left));
     }
     
-    // NEW: Skip pools where price_0_to_1 * price_1_to_0 deviates significantly from 1.0
-    let round_trip = pool.price_0_to_1() * pool.price_1_to_0();
-    if (round_trip - 1.0).abs() > 0.01 {  // 1% tolerance
-        tracing::warn!(
-            "Skipping pool {} - round trip price deviation: {:.4}",
-            pool.address,
-            round_trip
-        );
-        return;
-    }
-    
-    // ... rest of function
+    Ok(QuoteResult {
+        amount_out,
+        fee_amount: fees,
+        price_impact: calculate_impact(amount_in, amount_out, swap_for_y),
+    })
 }
 ```
 
----
+## Monad-specific considerations
 
-## Recommended Fix Order
+Monad's **400ms block time** and **deferred execution** create unique challenges:
 
-1. **Issue 1 (Critical)**: Fix liquidity measurement consistency
-   - This is why ALL opportunities are rejected
-   - Time estimate: 2-3 hours
+- **State may be 1-2 blocks behind** during quoter simulation—prices can shift between graph construction and execution
+- Use **Multicall3** (`0xcA11bde05977b3631167028862bE2a173976CA11`) to batch all pool state reads atomically
+- **High revert rates expected**—Monad's parallel execution with low fees encourages transaction spam similar to Solana's ~41% revert rate
+- **Gas charged on limit, not usage**—set gas limits carefully to avoid overpaying on reverts
 
-2. **Issue 2 (High)**: Fix LFJ price calculation  
-   - This causes false positives in cycle detection
-   - Time estimate: 1-2 hours for investigation, 1-2 hours for fix
+## Complete diagnosis summary
 
-3. **Issue 3 (Medium)**: Centralize constants
-   - Quick win for code maintainability
-   - Time estimate: 30 minutes
+The **root causes** of your graph-quoter discrepancy are:
 
-4. **Issue 4 (Low)**: Add graph validation
-   - Defense in depth
-   - Time estimate: 30 minutes
+1. **Liquidity threshold comparing raw 18-decimal amounts** without token-specific normalization—fix the threshold logic to be USD-normalized or token-aware
 
----
+2. **LFJ token ordering assumption** (assuming sorted by address)—always query `getTokenX()` and `getTokenY()` from the pair contract
 
-## Verification Steps
+3. **Fee unit confusion**—Uniswap's `3000` means 0.3%, not 3000%; LFJ fees come from getSwapOut or require baseFactor calculation
 
-After implementing fixes, verify with:
+4. **Graph edge direction errors**—price represents Y/X for LFJ and token1/token0 for Uniswap; swapping in opposite direction requires inversion
 
-1. **Check pool counts match**: Discovery should find fewer pools (active liquidity filter)
+5. **Q128.128 or sqrtPriceX96 conversion bugs**—ensure proper fixed-point math with 128 or 192 bit shifts
 
-2. **Check profit percentages are realistic**: Most should be <1%, maximum ~5%
-
-3. **Check simulation accepts some opportunities**: At least some verified opportunities should pass
-
-4. **Run diagnostics**:
-   ```rust
-   // Enable in main.rs
-   use crate::simulation::diagnostics::diagnose_cycle;
-   
-   // After finding cycles
-   for cycle in cycles.iter().take(3) {
-       if let Err(e) = diagnose_cycle(provider.clone(), cycle, &all_pools).await {
-           warn!("Diagnostic failed: {}", e);
-       }
-   }
-   ```
-
----
-
-## Quick Diagnostic Command
-
-To quickly verify the fix is working, look for these log patterns:
-
-**Before fix:**
-```
-Total candidates: X
-Verified opportunities: 0
-Rejected opportunities: X
-```
-
-**After fix:**
-```
-Total candidates: Y (Y < X because fewer pools pass active liquidity filter)
-Verified opportunities: Z (Z > 0)
-Rejected opportunities: Y - Z
-```
-
----
-
-## Additional Notes
-
-### LFJ Liquidity Book Specifics
-
-LFJ uses a "Liquidity Book" model where liquidity is distributed across discrete price bins. Key concepts:
-
-- `binStep`: Price increment between bins (e.g., 10 = 0.1% per bin)
-- `activeId`: The bin containing current price
-- Reserves can exist far from active bin but are not tradeable without crossing many bins
-
-When querying liquidity for trading purposes, only bins near the active price matter.
-
-### Flash Loan Integration
-
-The bot uses Neverland (Aave V3 fork) for flash loans with 9 bps fee. This is already correctly accounted for in `profit_calculator.rs`.
-
-### Gas Estimation
-
-The `MAX_REASONABLE_GAS` constant (1M gas) is appropriate. High gas estimates indicate quoter reverts.
-
----
-
-*Generated by Claude for fixing Monad Arbitrage Bot issues*
+The 20.70% "profit" is a phantom caused by these compounding errors creating artificially favorable edge weights in your graph, which the quoter correctly identifies as non-profitable when using actual on-chain getSwapOut calls.
