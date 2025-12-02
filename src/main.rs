@@ -141,11 +141,15 @@ fn calculate_price_from_sqrt_price_x96(sqrt_price_x96: U160, token0_is_wmon: boo
 
     // We want price in MON per token
     if token0_is_wmon {
-        // price is token1/token0 = token/WMON, need to invert to get WMON/token
+        // token0=WMON, token1=TOKEN
+        // price = token1/token0 = TOKEN/WMON (tokens per MON)
+        // Invert to get MON per token
         if price > 0.0 { 1.0 / price } else { 0.0 }
     } else {
-        // price is token0/token1 = token/WMON, need to invert
-        if price > 0.0 { 1.0 / price } else { 0.0 }
+        // token0=TOKEN, token1=WMON
+        // price = token1/token0 = WMON/TOKEN (MON per token)
+        // Already correct! Don't invert.
+        price
     }
 }
 
