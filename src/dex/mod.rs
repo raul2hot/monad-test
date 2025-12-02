@@ -1,3 +1,4 @@
+pub mod batch_client;
 pub mod lfj;
 pub mod pancakeswap;
 pub mod uniswap_v3;
