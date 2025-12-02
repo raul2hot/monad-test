@@ -6,15 +6,18 @@ edition = "2021"
 [dependencies]
 # Async Runtime
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
-# Ethereum/EVM Interaction (Alloy - latest stable version)
+# Ethereum/EVM Interaction
 alloy = { version = "1.0", features = [
     "full",
     "provider-http",
+    "provider-ws",
     "network",
     "contract",
     "sol-types",
-    "json-rpc"
+    "json-rpc",
+    "signers",
 ]}
 
 # Graph algorithms
@@ -22,7 +25,7 @@ petgraph = "0.6"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Configuration
 dotenvy = "0.15"
@@ -33,10 +36,30 @@ serde_json = "1.0"
 
 # Error handling
 eyre = "0.6"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Utilities
 hex = "0.4"
 
 # Async trait support
 async-trait = "0.1"
+
+# Concurrency primitives
+dashmap = "6"
+parking_lot = "0.12"
+
+# Precise math for profit calculations
+rust_decimal = "1.36"
+rust_decimal_macros = "1.36"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client (for multi-RPC fallback)
+reqwest = { version = "0.12", features = ["json"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
