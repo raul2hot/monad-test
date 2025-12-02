@@ -321,8 +321,20 @@ where
     ) -> Result<PoolQuote> {
         let pair = ILBPairQuote::new(pool.address, self.provider.clone());
 
-        // Determine swap direction
+        // Get LFJ pair's token ordering (tokenX < tokenY by address)
         let token_x: Address = pair.getTokenX().call().await?;
+        let token_y: Address = pair.getTokenY().call().await?;
+
+        // Determine swap direction
+        // pool.zero_for_one = true means token0 -> token1
+        // swap_for_y = true means tokenX -> tokenY
+        //
+        // Logic: If our token0 matches LFJ's tokenX, then:
+        //   - zero_for_one=true (0->1) means X->Y, so swap_for_y=true
+        //   - zero_for_one=false (1->0) means Y->X, so swap_for_y=false
+        // If our token0 matches LFJ's tokenY (i.e., token0 != tokenX), then:
+        //   - zero_for_one=true (0->1) means Y->X, so swap_for_y=false
+        //   - zero_for_one=false (1->0) means X->Y, so swap_for_y=true
         let swap_for_y = pool.zero_for_one == (pool.token0 == token_x);
 
         let (token_in, token_out) = if pool.zero_for_one {
@@ -338,6 +350,21 @@ where
         let decimals_in = tokens::decimals(token_in);
         let decimals_out = tokens::decimals(token_out);
 
+        // DIAGNOSTIC: Log the swap direction determination
+        tracing::debug!(
+            "LFJ quote: pool={} | tokenX={} tokenY={} | pool.token0={} pool.token1={} | \
+            zero_for_one={} | swap_for_y={} | {} -> {}",
+            pool.address,
+            tokens::symbol(token_x),
+            tokens::symbol(token_y),
+            tokens::symbol(pool.token0),
+            tokens::symbol(pool.token1),
+            pool.zero_for_one,
+            swap_for_y,
+            tokens::symbol(token_in),
+            tokens::symbol(token_out)
+        );
+
         let result = pair.getSwapOut(amount_in_u128, swap_for_y).call().await.map_err(|e| {
             eyre!(
                 "LFJ getSwapOut failed for {} {} ({} decimals) -> {} ({} decimals) in pool {}: {}",
@@ -351,13 +378,17 @@ where
             )
         })?;
 
-        // CRITICAL FIX: Correctly interpret LFJ getSwapOut() return values
-        // amountInLeft > 0 does NOT always mean reject - partial fills can be profitable
+        // CRITICAL FIX: Properly handle LFJ getSwapOut() return values
         //
         // Interpretation:
         // - amountInLeft == amountIn && amountOut == 0: NO liquidity at all -> reject
-        // - amountInLeft > 0 && amountOut > 0: Partial fill available -> may still be profitable
+        // - amountInLeft > 0 && amountOut > 0: Partial fill available -> REJECT if too severe
         // - amountInLeft == 0: Full swap possible -> accept
+        //
+        // We reject partial fills where less than 75% of the input was swapped, because:
+        // 1. The output will be much smaller than expected
+        // 2. Chaining this to subsequent hops compounds the loss
+        // 3. Real arbitrage requires executing the full trade size
         let amount_in_left = result.amountInLeft;
         let amount_out_raw = result.amountOut;
 
@@ -378,14 +409,29 @@ where
         // Calculate the actual amount that was swapped
         let actual_amount_in = amount_in_u128 - amount_in_left;
 
-        // Log partial fills for visibility
+        // CRITICAL FIX: Reject partial fills that are too severe
+        // If less than 75% of input was swapped, the pool lacks sufficient liquidity
+        // for our trade size and the output will be severely impacted
+        let fill_percentage = (actual_amount_in as f64 / amount_in_u128 as f64) * 100.0;
+        if amount_in_left > 0 && fill_percentage < 75.0 {
+            return Err(eyre!(
+                "LFJ pool {} has INSUFFICIENT liquidity: only {:.1}% fill ({} of {} swapped). \
+                Cannot execute trade at this size. Try smaller amount or different pool.",
+                pool.address,
+                fill_percentage,
+                actual_amount_in,
+                amount_in_u128
+            ));
+        }
+
+        // Log partial fills for visibility (but allow them if >= 75% filled)
         if amount_in_left > 0 && amount_out_raw > 0 {
-            tracing::debug!(
-                "LFJ pool {} partial fill: {} of {} swapped ({:.1}%), output: {}",
+            tracing::warn!(
+                "LFJ pool {} partial fill: {} of {} swapped ({:.1}%), output: {} - proceeding but may impact profitability",
                 pool.address,
                 actual_amount_in,
                 amount_in_u128,
-                (actual_amount_in as f64 / amount_in_u128 as f64) * 100.0,
+                fill_percentage,
                 amount_out_raw
             );
         }
