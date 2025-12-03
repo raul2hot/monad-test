@@ -8,8 +8,8 @@ mod wallet;
 mod zrx;
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::U256;
-use alloy::providers::ProviderBuilder;
+use alloy::primitives::{B256, U256};
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use eyre::Result;
@@ -73,6 +73,10 @@ struct Args {
     /// Spread threshold (%) to trigger auto-execution. 0 = monitoring only (default)
     #[arg(long, default_value = "0.0")]
     spread_threshold: f64,
+
+    /// Check transaction status by hash
+    #[arg(long)]
+    check_tx: Option<String>,
 }
 
 #[derive(Debug)]
@@ -171,6 +175,45 @@ async fn main() -> Result<()> {
         let balances =
             wallet::get_full_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
         balances.print();
+        return Ok(());
+    }
+
+    // ========== CHECK TRANSACTION STATUS MODE ==========
+    if let Some(tx_hash_str) = &args.check_tx {
+        println!("TRANSACTION STATUS CHECK\n");
+
+        // Parse the transaction hash
+        let tx_hash: B256 = tx_hash_str.parse()
+            .map_err(|_| eyre::eyre!("Invalid transaction hash format"))?;
+
+        println!("Tx Hash: {:?}", tx_hash);
+
+        // Try to get the transaction receipt
+        match provider.get_transaction_receipt(tx_hash).await? {
+            Some(receipt) => {
+                let status = if receipt.status() { "SUCCESS ✓" } else { "FAILED ✗" };
+                println!("\n========== TRANSACTION RECEIPT ==========");
+                println!("  Status:       {}", status);
+                println!("  Block:        {:?}", receipt.block_number.unwrap_or(0));
+                println!("  Gas Used:     {}", receipt.gas_used);
+                println!("  From:         {:?}", receipt.from);
+                println!("  To:           {:?}", receipt.to.unwrap_or_default());
+                println!("==========================================\n");
+            }
+            None => {
+                // Transaction not yet mined - check if it's pending
+                match provider.get_transaction_by_hash(tx_hash).await? {
+                    Some(_tx) => {
+                        println!("\n  Status: PENDING (not yet mined)");
+                        println!("  The transaction is in the mempool waiting for confirmation.\n");
+                    }
+                    None => {
+                        println!("\n  Status: NOT FOUND");
+                        println!("  Transaction not found on chain. It may have been dropped.\n");
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
