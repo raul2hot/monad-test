@@ -270,8 +270,8 @@ pub async fn execute_uniswap_buy<P: Provider>(
 
     let call = exactInputSingleCall { params };
 
-    // CRITICAL: Monad charges full gas_limit
-    let gas_limit = 200_000u64;
+    // CRITICAL: Monad charges full gas_limit - but need enough for swap
+    let gas_limit = 500_000u64;  // Increased from 200k - Uniswap V3 swaps can need more
     let tx = TransactionRequest::default()
         .to(router)
         .input(call.abi_encode().into())
