@@ -336,16 +336,34 @@ async fn main() -> Result<()> {
     if args.test_parallel {
         println!("PARALLEL ARBITRAGE TEST MODE");
         println!("Strategy: BUY on Uniswap + SELL via 0x (SIMULTANEOUS)");
-        println!("USDC Amount (Uniswap BUY): ${}", args.usdc_amount);
         println!("WMON Amount (0x SELL): {}", args.wmon_amount);
         println!("Pool Fee: {}bps", args.pool_fee);
         println!("Slippage: {}bps ({}%)", args.slippage_bps, args.slippage_bps as f64 / 100.0);
+
+        // Convert WMON amount to wei
+        let wmon_amount = U256::from((args.wmon_amount * 1e18) as u128);
+
+        // Get 0x price quote to determine equivalent USDC amount
+        println!("\n Fetching 0x price for {} WMON...", args.wmon_amount);
+        let price_quote = zrx.get_price(
+            config::WMON,
+            config::USDC,
+            &wmon_amount.to_string(),
+        ).await?;
+
+        // Use the 0x buy_amount (USDC we'd receive) as the USDC input for Uniswap
+        // This ensures inventory-neutral execution
+        let usdc_from_quote: u128 = price_quote.buy_amount.parse()?;
+        let usdc_amount = U256::from(usdc_from_quote);
+        let usdc_human = usdc_from_quote as f64 / 1e6;
+
+        println!(" 0x Quote: {} WMON -> ${:.6} USDC", args.wmon_amount, usdc_human);
+        println!(" Auto-calculated USDC Amount (Uniswap BUY): ${:.6}", usdc_human);
 
         // Ensure approvals are done BEFORE parallel execution
         println!("\n Checking approvals...");
 
         // USDC approval to SwapRouter
-        let usdc_amount = U256::from((args.usdc_amount * 1_000_000.0) as u128);
         execution::ensure_approval(
             &provider,
             &eth_wallet,
@@ -355,7 +373,6 @@ async fn main() -> Result<()> {
         ).await?;
 
         // WMON approval to AllowanceHolder
-        let wmon_amount = U256::from((args.wmon_amount * 1e18) as u128);
         execution::ensure_approval(
             &provider,
             &eth_wallet,
