@@ -68,12 +68,12 @@ struct Args {
     #[arg(long)]
     test_parallel: bool,
 
-    /// Amount of WMON to sell via 0x in parallel mode
-    #[arg(long, default_value = "10.0")]
+    /// Amount of WMON to sell via 0x in parallel mode (min 30 for profitability)
+    #[arg(long, default_value = "50.0")]
     wmon_amount: f64,
 
     /// Spread threshold (%) to trigger auto-execution. 0 = monitoring only (default)
-    #[arg(long, default_value = "0.0")]
+    #[arg(long, default_value = "1.5")]
     spread_threshold: f64,
 
     /// Check transaction status by hash
@@ -568,6 +568,50 @@ async fn main() -> Result<()> {
                 println!("  [SKIPPED] Execution already in flight, waiting for confirmation...");
                 continue;
             }
+
+            // Profitability guard: Ensure trade size is sufficient for gas costs
+            if args.wmon_amount < config::MIN_WMON_TRADE_AMOUNT {
+                println!(
+                    "  [SKIPPED] Trade size {:.1} WMON too small. Minimum: {:.1} WMON for profitability",
+                    args.wmon_amount,
+                    config::MIN_WMON_TRADE_AMOUNT
+                );
+                continue;
+            }
+
+            // For smaller trades, require higher spread
+            if args.wmon_amount < config::RECOMMENDED_WMON_AMOUNT
+               && spread_pct < config::MIN_SPREAD_FOR_SMALL_TRADE {
+                println!(
+                    "  [SKIPPED] Spread {:.2}% too low for {:.1} WMON trade. Need {:.1}%+ or increase to {:.0} WMON",
+                    spread_pct,
+                    args.wmon_amount,
+                    config::MIN_SPREAD_FOR_SMALL_TRADE,
+                    config::RECOMMENDED_WMON_AMOUNT
+                );
+                continue;
+            }
+
+            // Estimate profitability before executing
+            let trade_value_usdc = args.wmon_amount * uniswap_price;  // Approximate value
+            let (est_gas_mon, is_profitable) = execution::estimate_trade_profitability(
+                spread_pct,
+                trade_value_usdc,
+                uniswap_price,
+            );
+
+            if !is_profitable {
+                println!(
+                    "  [SKIPPED] Estimated unprofitable. Gas: ~{:.4} MON, Trade value: ${:.2}, Spread: {:.2}%",
+                    est_gas_mon,
+                    trade_value_usdc,
+                    spread_pct
+                );
+                println!("  Tip: Increase --wmon-amount to {} or wait for higher spread", config::RECOMMENDED_WMON_AMOUNT);
+                continue;
+            }
+
+            println!("Profitability check PASSED. Est. gas: {:.4} MON", est_gas_mon);
 
             println!("\n========== SPREAD THRESHOLD TRIGGERED ==========");
             println!("Detected: {:+.3}% > Threshold: {}%", spread_pct, args.spread_threshold);

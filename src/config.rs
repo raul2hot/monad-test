@@ -36,3 +36,8 @@ pub const DEFAULT_SLIPPAGE_BPS: u32 = 100;  // 1%
 pub const DEFAULT_POOL_FEE: u32 = 500;      // 0.05% fee tier (most common for stables)
 pub const GAS_BUFFER: u64 = 5_000;
 pub const GAS_PRICE_BUMP_PCT: u64 = 110;    // 10% bump
+
+// Profitability thresholds
+pub const MIN_WMON_TRADE_AMOUNT: f64 = 30.0;     // Minimum 30 WMON per trade
+pub const MIN_SPREAD_FOR_SMALL_TRADE: f64 = 2.0; // If trade < 50 WMON, require 2%+ spread
+pub const RECOMMENDED_WMON_AMOUNT: f64 = 50.0;   // Recommended trade size for profitability

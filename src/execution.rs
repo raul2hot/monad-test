@@ -9,6 +9,36 @@ use alloy::sol_types::SolCall;
 use eyre::Result;
 use std::str::FromStr;
 
+/// Estimate gas cost in MON for a parallel arbitrage trade
+/// Returns (estimated_gas_mon, is_profitable)
+pub fn estimate_trade_profitability(
+    spread_pct: f64,
+    trade_value_usdc: f64,
+    mon_price_usdc: f64,
+) -> (f64, bool) {
+    // Estimated gas usage (conservative safe limits)
+    const UNISWAP_GAS: u64 = 250_000;  // Safe limit for V3 single swap
+    const ZRX_GAS: u64 = 200_000;      // Typical 0x swap (varies by routing)
+    const TOTAL_GAS: u64 = UNISWAP_GAS + ZRX_GAS;
+
+    // Monad gas price is typically ~52 gwei (0.000000052 MON per gas)
+    const GAS_PRICE_GWEI: f64 = 52.0;
+    const GWEI_TO_MON: f64 = 0.000000001;
+
+    let gas_cost_mon = (TOTAL_GAS as f64) * GAS_PRICE_GWEI * GWEI_TO_MON;
+    let gas_cost_usdc = gas_cost_mon * mon_price_usdc;
+
+    // Gross profit from spread
+    let gross_profit_usdc = trade_value_usdc * (spread_pct / 100.0);
+
+    // Account for DEX fees (~0.05% Uniswap + ~0.1% 0x routing)
+    let fee_cost_usdc = trade_value_usdc * 0.0015;  // ~0.15% total
+
+    let net_profit_usdc = gross_profit_usdc - gas_cost_usdc - fee_cost_usdc;
+
+    (gas_cost_mon, net_profit_usdc > 0.0)
+}
+
 sol! {
     function approve(address spender, uint256 amount) external returns (bool);
 
@@ -270,8 +300,8 @@ pub async fn execute_uniswap_buy<P: Provider>(
 
     let call = exactInputSingleCall { params };
 
-    // CRITICAL: Monad charges full gas_limit - but need enough for swap
-    let gas_limit = 500_000u64;  // Increased from 200k - Uniswap V3 swaps can need more
+    // CRITICAL: Monad charges full gas_limit - safe reduction saves real money
+    let gas_limit = 250_000u64;  // Safe value - typical V3 single swap uses 150-180k, buffer for edge cases
     let tx = TransactionRequest::default()
         .to(router)
         .input(call.abi_encode().into())
@@ -498,7 +528,7 @@ async fn execute_uniswap_buy_no_wait<P: Provider>(
     };
 
     let call = exactInputSingleCall { params };
-    let gas_limit = 500_000u64;
+    let gas_limit = 250_000u64;  // Safe value - typical V3 single swap uses 150-180k, buffer for edge cases
 
     let tx = TransactionRequest::default()
         .to(router)
