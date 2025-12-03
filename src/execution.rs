@@ -12,6 +12,10 @@ use std::str::FromStr;
 sol! {
     function approve(address spender, uint256 amount) external returns (bool);
 
+    // WMON (Wrapped MON) - same interface as WETH
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+
     // Uniswap V3 SwapRouter02 exactInputSingle
     struct ExactInputSingleParams {
         address tokenIn;
@@ -98,6 +102,83 @@ pub async fn ensure_approval<P: Provider>(
 
     tracing::info!("Approval tx confirmed: {:?}", tx_hash);
     Ok(Some(tx_hash))
+}
+
+/// Wrap native MON to WMON (ERC-20)
+/// Sends native MON to WMON contract, receives WMON tokens
+pub async fn wrap_mon<P: Provider>(
+    provider: &P,
+    wallet: &EthereumWallet,
+    amount: U256,
+) -> Result<ExecutionResult> {
+    let from = wallet.default_signer().address();
+    let wmon_addr = Address::from_str(crate::config::WMON)?;
+
+    // Call deposit() with native MON as value
+    let call = depositCall {};
+
+    let gas_limit = 50_000u64; // Wrapping is simple, doesn't need much gas
+    let tx = TransactionRequest::default()
+        .to(wmon_addr)
+        .input(call.abi_encode().into())
+        .value(amount)
+        .gas_limit(gas_limit)
+        .from(from);
+
+    let start_time = std::time::Instant::now();
+
+    let pending = provider.send_transaction(tx).await?;
+    let tx_hash = *pending.tx_hash();
+
+    tracing::info!("Wrap tx submitted: {:?}", tx_hash);
+
+    let receipt = pending.get_receipt().await?;
+    let elapsed = start_time.elapsed();
+
+    Ok(ExecutionResult {
+        tx_hash,
+        success: receipt.status(),
+        gas_used: receipt.gas_used as u128,
+        gas_limit,
+        execution_time_ms: elapsed.as_millis() as u64,
+    })
+}
+
+/// Unwrap WMON back to native MON
+pub async fn unwrap_mon<P: Provider>(
+    provider: &P,
+    wallet: &EthereumWallet,
+    amount: U256,
+) -> Result<ExecutionResult> {
+    let from = wallet.default_signer().address();
+    let wmon_addr = Address::from_str(crate::config::WMON)?;
+
+    let call = withdrawCall { amount };
+
+    let gas_limit = 50_000u64;
+    let tx = TransactionRequest::default()
+        .to(wmon_addr)
+        .input(call.abi_encode().into())
+        .gas_limit(gas_limit)
+        .from(from);
+
+    let start_time = std::time::Instant::now();
+
+    let pending = provider.send_transaction(tx).await?;
+    let tx_hash = *pending.tx_hash();
+
+    tracing::info!("Unwrap tx submitted: {:?}", tx_hash);
+
+    let receipt = pending.get_receipt().await?;
+    let elapsed = start_time.elapsed();
+
+    Ok(ExecutionResult {
+        tx_hash,
+        success: receipt.status(),
+        gas_used: receipt.gas_used as u128,
+        gas_limit,
+        execution_time_ms: elapsed.as_millis() as u64,
+    })
 }
 
 /// Execute a swap via 0x using the quote response

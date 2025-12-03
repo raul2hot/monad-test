@@ -22,7 +22,23 @@ use tracing::{info, warn, Level};
 #[command(name = "monad-arb-bot")]
 #[command(about = "Monad Arbitrage Bot - 0x vs Direct Pool Strategy")]
 struct Args {
-    /// Run a single test trade (sell MON via 0x)
+    /// Show full wallet balance (native MON, WMON, USDC)
+    #[arg(long)]
+    balance: bool,
+
+    /// Wrap native MON to WMON (required for trading)
+    #[arg(long)]
+    wrap: bool,
+
+    /// Unwrap WMON back to native MON
+    #[arg(long)]
+    unwrap: bool,
+
+    /// Amount of MON to wrap/unwrap
+    #[arg(long, default_value = "100.0")]
+    wrap_amount: f64,
+
+    /// Run a single test trade (sell WMON via 0x)
     #[arg(long)]
     test_trade: bool,
 
@@ -30,7 +46,7 @@ struct Args {
     #[arg(long)]
     test_arb: bool,
 
-    /// Amount of MON to trade in test-trade mode
+    /// Amount of WMON to trade in test-trade mode
     #[arg(long, default_value = "10.0")]
     trade_amount: f64,
 
@@ -136,6 +152,89 @@ async fn main() -> Result<()> {
     println!("  Monad Arbitrage Bot");
     println!("  Wallet: {:?}", wallet_addr);
     println!("==========================================\n");
+
+    // ========== BALANCE CHECK MODE ==========
+    if args.balance {
+        println!("WALLET BALANCE CHECK\n");
+        let balances =
+            wallet::get_full_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+        balances.print();
+        return Ok(());
+    }
+
+    // ========== WRAP MON MODE ==========
+    if args.wrap {
+        println!("WRAP MON -> WMON\n");
+        println!("Amount: {} MON", args.wrap_amount);
+
+        // Get initial balance
+        let initial =
+            wallet::get_full_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+        println!("\nBefore:");
+        initial.print();
+
+        // Convert amount to wei (18 decimals)
+        let wrap_amount = U256::from((args.wrap_amount * 1e18) as u128);
+
+        // Check if we have enough native MON
+        if initial.native_mon < wrap_amount {
+            return Err(eyre::eyre!(
+                "Insufficient native MON. Have: {:.6}, Need: {:.6}",
+                initial.native_mon.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
+                args.wrap_amount
+            ));
+        }
+
+        // Execute wrap
+        let result = execution::wrap_mon(&provider, &eth_wallet, wrap_amount).await?;
+        result.print();
+
+        // Get final balance
+        let final_balance =
+            wallet::get_full_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+        println!("After:");
+        final_balance.print();
+
+        println!("\nWrap complete!");
+        return Ok(());
+    }
+
+    // ========== UNWRAP WMON MODE ==========
+    if args.unwrap {
+        println!("UNWRAP WMON -> MON\n");
+        println!("Amount: {} WMON", args.wrap_amount);
+
+        // Get initial balance
+        let initial =
+            wallet::get_full_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+        println!("\nBefore:");
+        initial.print();
+
+        // Convert amount to wei (18 decimals)
+        let unwrap_amount = U256::from((args.wrap_amount * 1e18) as u128);
+
+        // Check if we have enough WMON
+        if initial.wmon_balance < unwrap_amount {
+            return Err(eyre::eyre!(
+                "Insufficient WMON. Have: {:.6}, Need: {:.6}",
+                initial.wmon_balance.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
+                args.wrap_amount
+            ));
+        }
+
+        // Execute unwrap
+        let result = execution::unwrap_mon(&provider, &eth_wallet, unwrap_amount).await?;
+        result.print();
+
+        // Get final balance
+        let final_balance =
+            wallet::get_full_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+        println!("After:");
+        final_balance.print();
+
+        println!("\nUnwrap complete!");
+        return Ok(());
+    }
 
     // Initialize 0x API client (requires ZRX_API_KEY env var)
     let zrx = zrx::ZrxClient::new()?;
