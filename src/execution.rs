@@ -311,6 +311,13 @@ pub struct ArbTradeReport {
     pub usdc_after: U256,
     pub mon_traded: U256,
     pub profit_loss_usdc: f64,
+    // Price stats
+    pub uniswap_price: f64,      // Price paid on Uniswap (USDC per MON)
+    pub zrx_price: f64,          // Price received via 0x (USDC per MON)
+    pub spread_pct: f64,         // Spread percentage
+    pub usdc_input: f64,         // USDC spent
+    pub usdc_output: f64,        // USDC received from 0x
+    pub total_gas_cost: u128,    // Total gas used
 }
 
 impl ArbTradeReport {
@@ -322,6 +329,11 @@ impl ArbTradeReport {
         println!("\n=====================================================");
         println!("     ARBITRAGE EXECUTION REPORT                      ");
         println!("     BUY on Uniswap -> SELL via 0x                   ");
+        println!("=====================================================");
+        println!(" PRICE ANALYSIS                                      ");
+        println!("   Uniswap Price: ${:.6} per MON", self.uniswap_price);
+        println!("   0x Price:      ${:.6} per MON", self.zrx_price);
+        println!("   Spread:        {:+.4}%", self.spread_pct);
         println!("=====================================================");
         println!(" BUY LEG (Uniswap)                                   ");
         println!("   Tx:     {:?}", self.buy_result.tx_hash);
@@ -338,6 +350,7 @@ impl ArbTradeReport {
             self.buy_result.gas_used, self.buy_result.gas_limit
         );
         println!("   Time:   {}ms", self.buy_result.execution_time_ms);
+        println!("   USDC In:  {:.6}", self.usdc_input);
         println!("=====================================================");
         println!(" SELL LEG (0x)                                       ");
         println!("   Tx:     {:?}", self.sell_result.tx_hash);
@@ -354,12 +367,14 @@ impl ArbTradeReport {
             self.sell_result.gas_used, self.sell_result.gas_limit
         );
         println!("   Time:   {}ms", self.sell_result.execution_time_ms);
+        println!("   USDC Out: {:.6}", self.usdc_output);
         println!("=====================================================");
         println!(" SUMMARY                                             ");
         println!("   MON Traded:    {:.6}", mon_traded);
         println!("   USDC Before:   {:.6}", usdc_before);
         println!("   USDC After:    {:.6}", usdc_after);
-        println!("   Profit/Loss:   {:.6} USDC", self.profit_loss_usdc);
+        println!("   Total Gas:     {}", self.total_gas_cost);
+        println!("   Profit/Loss:   {:+.6} USDC", self.profit_loss_usdc);
         println!("=====================================================");
     }
 }
@@ -467,19 +482,56 @@ pub async fn execute_arbitrage<P: Provider>(
     )
     .await?;
 
-    let usdc_before = balances_before
+    // Convert to human-readable values
+    let usdc_input_f64 = usdc_amount.to_string().parse::<f64>().unwrap_or(0.0) / 1e6;
+    let mon_received_f64 = mon_received.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
+
+    // Calculate USDC received from 0x sell
+    let usdc_output_f64 = balances_after
+        .usdc_balance
+        .saturating_sub(balances_before.usdc_balance.saturating_sub(usdc_amount))
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(0.0)
+        / 1e6;
+
+    // Calculate prices
+    let uniswap_price = if mon_received_f64 > 0.0 {
+        usdc_input_f64 / mon_received_f64
+    } else {
+        0.0
+    };
+
+    let zrx_price = if mon_received_f64 > 0.0 {
+        usdc_output_f64 / mon_received_f64
+    } else {
+        0.0
+    };
+
+    // Calculate spread: (0x price - Uniswap price) / Uniswap price * 100
+    // Positive spread = 0x pays more than Uniswap charged (profitable)
+    // Negative spread = 0x pays less than Uniswap charged (loss)
+    let spread_pct = if uniswap_price > 0.0 {
+        ((zrx_price - uniswap_price) / uniswap_price) * 100.0
+    } else {
+        0.0
+    };
+
+    let usdc_before_f64 = balances_before
         .usdc_balance
         .to_string()
         .parse::<f64>()
         .unwrap_or(0.0)
         / 1e6;
-    let usdc_after = balances_after
+    let usdc_after_f64 = balances_after
         .usdc_balance
         .to_string()
         .parse::<f64>()
         .unwrap_or(0.0)
         / 1e6;
-    let profit_loss = usdc_after - usdc_before;
+    let profit_loss = usdc_after_f64 - usdc_before_f64;
+
+    let total_gas_cost = buy_result.gas_used + sell_result.gas_used;
 
     Ok(ArbTradeReport {
         buy_result,
@@ -488,5 +540,11 @@ pub async fn execute_arbitrage<P: Provider>(
         usdc_after: balances_after.usdc_balance,
         mon_traded: mon_received,
         profit_loss_usdc: profit_loss,
+        uniswap_price,
+        zrx_price,
+        spread_pct,
+        usdc_input: usdc_input_f64,
+        usdc_output: usdc_output_f64,
+        total_gas_cost,
     })
 }
