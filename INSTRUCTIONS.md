@@ -2,9 +2,11 @@
 
 ## Overview
 
-Build a Rust arbitrage bot that detects price differences between **Monorail aggregator** and **direct DEX pools** (Uniswap V3 / PancakeSwap V3) on Monad mainnet.
+Build a Rust arbitrage bot that detects price differences between **0x Swap API** (aggregator) and **direct DEX pools** (Uniswap V3 / PancakeSwap V3) on Monad mainnet.
 
-**Strategy**: Monorail gives the "best aggregated price" across 16 DEXes. Compare this against direct pool prices. When Monorail price differs from a specific pool by >0.5%, there's an arbitrage opportunity.
+**Strategy**: 0x aggregates the best price across 10+ DEXes (Kuru, Crystal, Clober, OctoSwap, Atlantis, IziSwap, Intro, Morpheus, LFJ, Uniswap). Compare this against direct pool prices. When 0x price differs from a specific pool by >0.5%, there's an arbitrage opportunity.
+
+**IMPORTANT**: 0x API requires a free API key from https://dashboard.0x.org/create-account
 
 ---
 
@@ -12,7 +14,7 @@ Build a Rust arbitrage bot that detects price differences between **Monorail agg
 
 ```
 ┌─────────────────┐     ┌──────────────────┐
-│  Monorail API   │     │  Direct Pools    │
+│   0x Swap API   │     │  Direct Pools    │
 │  (aggregated)   │     │  (Uniswap/PCS)   │
 └────────┬────────┘     └────────┬─────────┘
          │                       │
@@ -35,16 +37,20 @@ Build a Rust arbitrage bot that detects price differences between **Monorail agg
 ### Core Tokens
 ```
 WMON:  0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A
-USDC:  0xf817257fed379853cDe0fa4F97AB987181B1E5Ea
+USDC:  0x754704Bc059F8C67012fEd69BC8A327a5aafb603  (Circle native USDC - MAINNET)
 ```
+
+> ⚠️ **WARNING**: `0xf817257fed379853cDe0fa4F97AB987181B1E5Ea` is TESTNET USDC - do NOT use on mainnet!
 
 ### Uniswap V3 (Verified)
 ```
 Factory:         0x204FAca1764B154221e35c0d20aBb3c525710498
 QuoterV2:        0x661E93cca42AfacB172121EF892830cA3b70F08d
 UniversalRouter: 0x0D97Dc33264bfC1c226207428A79b26757fb9dc3
-MON/USDC Pool:   0x659bd0bc4167ba25c62e05656f78043e7ed4a9da
+MON/USDC Pool:   DISCOVER_VIA_FACTORY  (use factory.getPool with new USDC address)
 ```
+
+> ⚠️ **NOTE**: Old pool `0x659bd0bc...` was for testnet USDC. Must discover new pool for mainnet USDC!
 
 ### PancakeSwap V3 (Verified from MonadVision)
 ```
@@ -53,10 +59,15 @@ Factory:         QUERY_FROM_SMARTROUTER (call factory() method)
 MON/USDC Pool:   DISCOVER_VIA_FACTORY
 ```
 
-### Monorail API
+### 0x Swap API (Verified - Primary Aggregator)
 ```
-Base URL:  https://pathfinder.monorail.xyz
-Endpoint:  /v4/quote
+Base URL:        https://api.0x.org
+Price Endpoint:  /swap/allowance-holder/price
+Quote Endpoint:  /swap/allowance-holder/quote
+Chain ID:        143
+Required Header: 0x-api-key: YOUR_API_KEY
+Required Header: 0x-version: v2
+API Key:         FREE from https://dashboard.0x.org/create-account
 ```
 
 ---
@@ -100,101 +111,149 @@ pub const BLOCK_TIME_MS: u64 = 400;
 
 // Tokens
 pub const WMON: &str = "0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A";
-pub const USDC: &str = "0xf817257fed379853cDe0fa4F97AB987181B1E5Ea";
+pub const USDC: &str = "0x754704Bc059F8C67012fEd69BC8A327a5aafb603"; // Circle native USDC (MAINNET)
 
 // Uniswap V3
 pub const UNISWAP_FACTORY: &str = "0x204FAca1764B154221e35c0d20aBb3c525710498";
-pub const UNISWAP_MON_USDC_POOL: &str = "0x659bd0bc4167ba25c62e05656f78043e7ed4a9da";
+pub const UNISWAP_MON_USDC_POOL: &str = "DISCOVER_AT_RUNTIME"; // Must discover for mainnet USDC
 
 // PancakeSwap V3 (Verified from MonadVision)
 pub const PANCAKE_SMART_ROUTER: &str = "0x21114915Ac6d5A2e156931e20B20b038dEd0Be7C";
 pub const PANCAKE_FACTORY: &str = "DISCOVER_AT_RUNTIME"; // Query from SmartRouter
 pub const PANCAKE_MON_USDC_POOL: &str = "DISCOVER_AT_RUNTIME"; // Query from Factory
 
-// Monorail API
-pub const MONORAIL_API: &str = "https://pathfinder.monorail.xyz/v4/quote";
-pub const MONORAIL_APP_ID: &str = "0";
+// 0x Swap API (Primary Aggregator)
+pub const ZRX_API_BASE: &str = "https://api.0x.org";
+pub const ZRX_PRICE_ENDPOINT: &str = "/swap/allowance-holder/price";
 
 // Thresholds
 pub const MIN_SPREAD_PCT: f64 = 0.5;
 pub const MAX_SPREAD_PCT: f64 = 10.0;
 ```
 
-### Step 4: src/monorail.rs
+### Step 4: src/zrx.rs (0x Swap API Client)
 
 ```rust
-//! Monorail API Client
+//! 0x Swap API Client for Monad
 
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use eyre::Result;
+use reqwest::Client;
+use serde::Deserialize;
+use std::env;
 
 #[derive(Debug, Deserialize)]
-pub struct QuoteResponse {
-    pub output: String,
-    pub output_formatted: String,
-    pub price: f64,
-    pub route: Vec<RouteStep>,
+#[serde(rename_all = "camelCase")]
+pub struct PriceResponse {
+    pub buy_amount: String,
+    pub sell_amount: String,
+    pub buy_token: String,
+    pub sell_token: String,
+    pub liquidity_available: bool,
+    pub gas: String,
+    pub gas_price: String,
+    #[serde(default)]
+    pub route: Option<RouteInfo>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RouteStep {
-    pub dex: String,
-    pub pool: String,
+pub struct RouteInfo {
+    pub fills: Vec<Fill>,
 }
 
-pub struct MonorailClient {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Fill {
+    pub source: String,
+    pub proportion_bps: String,
+}
+
+pub struct ZrxClient {
     client: Client,
-    base_url: String,
-    app_id: String,
+    api_key: String,
 }
 
-impl MonorailClient {
-    pub fn new(app_id: &str) -> Self {
-        Self {
+impl ZrxClient {
+    pub fn new() -> Result<Self> {
+        let api_key = env::var("ZRX_API_KEY")
+            .map_err(|_| eyre::eyre!("ZRX_API_KEY not set. Get free key at https://dashboard.0x.org"))?;
+        
+        Ok(Self {
             client: Client::new(),
-            base_url: crate::config::MONORAIL_API.to_string(),
-            app_id: app_id.to_string(),
-        }
+            api_key,
+        })
     }
 
-    /// Get quote for swapping tokens
-    /// Returns price as tokenOut per tokenIn
-    pub async fn get_quote(
+    /// Get price for selling tokens
+    pub async fn get_price(
         &self,
-        token_in: &str,
-        token_out: &str,
-        amount_in: f64,
-    ) -> Result<QuoteResponse> {
+        sell_token: &str,
+        buy_token: &str,
+        sell_amount: &str,
+    ) -> Result<PriceResponse> {
         let url = format!(
-            "{}?source={}&from={}&to={}&amount={}",
-            self.base_url,
-            self.app_id,
-            token_in,
-            token_out,
-            amount_in
+            "{}{}?chainId={}&sellToken={}&buyToken={}&sellAmount={}",
+            crate::config::ZRX_API_BASE,
+            crate::config::ZRX_PRICE_ENDPOINT,
+            crate::config::CHAIN_ID,
+            sell_token,
+            buy_token,
+            sell_amount
         );
+
+        tracing::debug!("0x API URL: {}", url);
 
         let response = self.client
             .get(&url)
+            .header("0x-api-key", &self.api_key)
+            .header("0x-version", "v2")
             .send()
-            .await?
-            .json::<QuoteResponse>()
             .await?;
 
-        Ok(response)
+        let status = response.status();
+        let body = response.text().await?;
+
+        tracing::debug!("0x API status: {}, body length: {}", status, body.len());
+
+        if !status.is_success() {
+            return Err(eyre::eyre!("0x API error: {} - {}", status, body));
+        }
+
+        let price: PriceResponse = serde_json::from_str(&body)
+            .map_err(|e| eyre::eyre!("Failed to parse 0x response: {}. Body: {}", e, body))?;
+
+        if !price.liquidity_available {
+            return Err(eyre::eyre!("No liquidity available for this pair"));
+        }
+
+        Ok(price)
     }
 
     /// Get MON price in USDC
-    pub async fn get_mon_price(&self) -> Result<f64> {
-        // Use native MON address (0x0...0)
-        let quote = self.get_quote(
-            "0x0000000000000000000000000000000000000000",
+    /// Returns price as USDC per 1 MON
+    pub async fn get_mon_usdc_price(&self) -> Result<f64> {
+        // Sell 1 WMON (18 decimals)
+        let sell_amount = "1000000000000000000"; // 1e18
+        
+        let response = self.get_price(
+            crate::config::WMON,
             crate::config::USDC,
-            1.0, // 1 MON
+            sell_amount,
         ).await?;
 
-        Ok(quote.price)
+        // buyAmount is USDC (6 decimals)
+        // Example: buyAmount="29132" means $0.029132
+        let buy_amount: f64 = response.buy_amount.parse().unwrap_or(0.0);
+        let usdc_price = buy_amount / 1_000_000.0; // Convert from 6 decimals
+
+        // Log which DEXes 0x is routing through
+        if let Some(route) = &response.route {
+            let sources: Vec<&str> = route.fills.iter()
+                .map(|f| f.source.as_str())
+                .collect();
+            tracing::info!("0x routing through: {:?}", sources);
+        }
+
+        Ok(usdc_price)
     }
 }
 ```
@@ -349,10 +408,10 @@ pub async fn get_pancake_factory<P: Provider>(provider: &P) -> Result<Address> {
 ### Step 6: src/main.rs
 
 ```rust
-//! Monad Arbitrage Bot - Monorail vs Direct Pool Strategy
+//! Monad Arbitrage Bot - 0x vs Direct Pool Strategy
 
 mod config;
-mod monorail;
+mod zrx;
 mod pools;
 
 use alloy::providers::{Provider, ProviderBuilder};
@@ -364,7 +423,7 @@ use tracing::{info, warn, Level};
 
 #[derive(Debug)]
 struct ArbOpportunity {
-    monorail_price: f64,
+    aggregator_price: f64,
     pool_price: f64,
     pool_name: String,
     spread_pct: f64,
@@ -374,7 +433,7 @@ struct ArbOpportunity {
 impl ArbOpportunity {
     fn print(&self) {
         println!("\n============ ARBITRAGE DETECTED ============");
-        println!("  Monorail Price: ${:.6}", self.monorail_price);
+        println!("  0x Price:       ${:.6}", self.aggregator_price);
         println!("  {} Price:  ${:.6}", self.pool_name, self.pool_price);
         println!("  Spread:         {:.3}%", self.spread_pct);
         println!("  Direction:      {}", self.direction);
@@ -384,16 +443,16 @@ impl ArbOpportunity {
 }
 
 fn check_arbitrage(
-    monorail_price: f64,
+    aggregator_price: f64,
     pool_price: f64,
     pool_name: &str,
 ) -> Option<ArbOpportunity> {
     // Validate prices
-    if monorail_price <= 0.0 || pool_price <= 0.0 {
+    if aggregator_price <= 0.0 || pool_price <= 0.0 {
         return None;
     }
 
-    let spread_pct = ((monorail_price - pool_price) / pool_price) * 100.0;
+    let spread_pct = ((aggregator_price - pool_price) / pool_price) * 100.0;
 
     // Sanity check
     if spread_pct.abs() > config::MAX_SPREAD_PCT {
@@ -404,13 +463,13 @@ fn check_arbitrage(
     // Check minimum spread
     if spread_pct.abs() > config::MIN_SPREAD_PCT {
         let direction = if spread_pct > 0.0 {
-            format!("BUY on {} → SELL via Monorail", pool_name)
+            format!("BUY on {} → SELL via 0x", pool_name)
         } else {
-            format!("BUY via Monorail → SELL on {}", pool_name)
+            format!("BUY via 0x → SELL on {}", pool_name)
         };
 
         Some(ArbOpportunity {
-            monorail_price,
+            aggregator_price,
             pool_price,
             pool_name: pool_name.to_string(),
             spread_pct: spread_pct.abs(),
@@ -431,7 +490,7 @@ async fn main() -> Result<()> {
 
     println!("==========================================");
     println!("  Monad Arbitrage Bot");
-    println!("  Strategy: Monorail vs Direct Pools");
+    println!("  Strategy: 0x API vs Direct Pools");
     println!("  Pair: MON/USDC");
     println!("==========================================\n");
 
@@ -445,8 +504,9 @@ async fn main() -> Result<()> {
     let chain_id = provider.get_chain_id().await?;
     info!("Connected to chain {}", chain_id);
 
-    // Initialize Monorail client
-    let monorail = monorail::MonorailClient::new(config::MONORAIL_APP_ID);
+    // Initialize 0x API client (requires ZRX_API_KEY env var)
+    let zrx = zrx::ZrxClient::new()?;
+    info!("0x API client initialized");
 
     // Determine token0 for price calculation
     let wmon = config::WMON.to_lowercase();
@@ -454,13 +514,29 @@ async fn main() -> Result<()> {
     let token0_is_mon = wmon < usdc;
     info!("Token0 is MON: {}", token0_is_mon);
 
-    // Verify Uniswap pool has liquidity
-    let uni_has_liq = pools::has_liquidity(&provider, config::UNISWAP_MON_USDC_POOL).await?;
-    info!("Uniswap MON/USDC pool has liquidity: {}", uni_has_liq);
-
-    if !uni_has_liq {
-        return Err(eyre::eyre!("Uniswap pool has no liquidity"));
+    // Discover Uniswap MON/USDC pool (try different fee tiers)
+    println!("Discovering Uniswap MON/USDC pool...");
+    let mut uniswap_pool: Option<String> = None;
+    for fee in [500u32, 3000, 10000] {  // 0.05%, 0.3%, 1%
+        if let Some(pool) = pools::discover_pool(
+            &provider,
+            config::UNISWAP_FACTORY,
+            config::WMON,
+            config::USDC,
+            fee,
+        ).await? {
+            let pool_str = format!("{:?}", pool);
+            if pools::has_liquidity(&provider, &pool_str).await? {
+                info!("Found Uniswap MON/USDC pool: {} (fee: {})", pool_str, fee);
+                uniswap_pool = Some(pool_str);
+                break;
+            }
+        }
     }
+
+    let uniswap_pool = uniswap_pool.ok_or_else(|| {
+        eyre::eyre!("No Uniswap MON/USDC pool found with liquidity. Check USDC address.")
+    })?;
 
     // Main loop - poll every 2 seconds
     let mut poll_interval = interval(Duration::from_secs(2));
@@ -470,11 +546,11 @@ async fn main() -> Result<()> {
     loop {
         poll_interval.tick().await;
 
-        // Get Monorail aggregated price
-        let monorail_price = match monorail.get_mon_price().await {
+        // Get 0x aggregated price
+        let zrx_price = match zrx.get_mon_usdc_price().await {
             Ok(p) => p,
             Err(e) => {
-                warn!("Monorail API error: {}", e);
+                warn!("0x API error: {}", e);
                 continue;
             }
         };
@@ -482,7 +558,7 @@ async fn main() -> Result<()> {
         // Get Uniswap direct pool price
         let uniswap_price = match pools::get_pool_price(
             &provider,
-            config::UNISWAP_MON_USDC_POOL,
+            &uniswap_pool,  // Use discovered pool
             token0_is_mon,
         ).await {
             Ok(p) => p,
@@ -494,21 +570,21 @@ async fn main() -> Result<()> {
 
         // Print current prices
         println!(
-            "[{}] MON/USDC | Monorail: ${:.6} | Uniswap: ${:.6} | Spread: {:.3}%",
+            "[{}] MON/USDC | 0x: ${:.6} | Uniswap: ${:.6} | Spread: {:.3}%",
             chrono::Local::now().format("%H:%M:%S"),
-            monorail_price,
+            zrx_price,
             uniswap_price,
-            ((monorail_price - uniswap_price) / uniswap_price * 100.0)
+            ((zrx_price - uniswap_price) / uniswap_price * 100.0)
         );
 
         // Check for arbitrage
-        if let Some(arb) = check_arbitrage(monorail_price, uniswap_price, "Uniswap") {
+        if let Some(arb) = check_arbitrage(zrx_price, uniswap_price, "Uniswap") {
             arb.print();
         }
 
         // TODO: Add PancakeSwap pool comparison here
         // let pancake_price = pools::get_pool_price(...).await?;
-        // if let Some(arb) = check_arbitrage(monorail_price, pancake_price, "PancakeSwap") {
+        // if let Some(arb) = check_arbitrage(zrx_price, pancake_price, "PancakeSwap") {
         //     arb.print();
         // }
     }
@@ -518,11 +594,14 @@ async fn main() -> Result<()> {
 ### Step 7: .env file
 
 ```env
-# Use HTTP RPC (cheaper than WebSocket for polling)
-MONAD_RPC_URL=https://monad-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+# 0x API Key (REQUIRED - Get free key at https://dashboard.0x.org/create-account)
+ZRX_API_KEY=your_0x_api_key_here
+
+# Monad RPC - Use HTTP (cheaper than WebSocket for polling)
+MONAD_RPC_URL=https://monad-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
 
 # Optional: For event subscriptions (not needed for this strategy)
-# ALCHEMY_WS_URL=wss://monad-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+# ALCHEMY_WS_URL=wss://monad-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
 ```
 
 ---
@@ -580,17 +659,24 @@ for fee in [500u32, 2500, 10000] {
 }
 ```
 
-### Task 3: Verify Monorail API Endpoint
+### Task 3: Verify 0x API Access
 
-Test the API manually first:
+1. Get your free API key from https://dashboard.0x.org/create-account
+
+2. Test the API manually:
 
 ```bash
-curl "https://pathfinder.monorail.xyz/v4/quote?source=0&from=0x0000000000000000000000000000000000000000&to=0xf817257fed379853cDe0fa4F97AB987181B1E5Ea&amount=1"
+# Replace YOUR_API_KEY with your actual key
+curl --request GET \
+  --url "https://api.0x.org/swap/allowance-holder/price?chainId=143&sellToken=0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A&buyToken=0x754704Bc059F8C67012fEd69BC8A327a5aafb603&sellAmount=1000000000000000000" \
+  --header "0x-api-key: YOUR_API_KEY" \
+  --header "0x-version: v2"
 ```
 
-If the mainnet endpoint differs, check:
-- https://monorail.xyz/developers
-- Contact @donorail on Telegram
+3. Expected response includes:
+   - `liquidityAvailable: true`
+   - `buyAmount`: USDC amount for 1 WMON
+   - `route.fills`: Which DEXes are being used
 
 ---
 
@@ -598,13 +684,15 @@ If the mainnet endpoint differs, check:
 
 1. **Use HTTP RPC, not WebSocket** - Polling every 2 seconds is sufficient for 400ms blocks. This reduces Alchemy costs significantly.
 
-2. **Monorail gives aggregated best price** - It routes through 16 DEXes. If a direct pool differs significantly, that's the arb.
+2. **0x aggregates best price** - It routes through 10+ DEXes (Kuru, Crystal, Clober, etc.). If a direct pool differs significantly, that's the arb.
 
 3. **Price validation is critical** - Always check prices > 0 and spread < 10% before alerting.
 
 4. **MON/USDC is the target pair** - Highest volume, most liquidity, real arbitrage opportunities.
 
 5. **Start with monitoring only** - Don't execute trades until you've verified the bot correctly detects real opportunities.
+
+6. **0x API Key Required** - Get free key at https://dashboard.0x.org/create-account
 
 ---
 
@@ -613,12 +701,12 @@ If the mainnet endpoint differs, check:
 ```
 monad-arb-bot/
 ├── Cargo.toml
-├── .env
+├── .env              # ZRX_API_KEY and MONAD_RPC_URL
 └── src/
-    ├── main.rs      # Entry point, main loop
-    ├── config.rs    # Addresses and constants
-    ├── monorail.rs  # Monorail API client
-    └── pools.rs     # Direct pool queries
+    ├── main.rs       # Entry point, main loop
+    ├── config.rs     # Addresses and constants
+    ├── zrx.rs        # 0x Swap API client
+    └── pools.rs      # Direct pool queries
 ```
 
 ---
@@ -626,7 +714,7 @@ monad-arb-bot/
 ## Success Criteria
 
 The bot is working correctly when:
-1. Monorail API returns valid MON/USDC prices
+1. 0x API returns valid MON/USDC prices (liquidityAvailable: true)
 2. Uniswap pool slot0() returns valid sqrtPriceX96
 3. Both prices are non-zero and similar (within 10%)
 4. Spread calculation is realistic (typically 0-2%)
