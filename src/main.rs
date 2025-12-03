@@ -14,6 +14,8 @@ use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use eyre::Result;
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::{info, warn, Level};
@@ -515,6 +517,9 @@ async fn main() -> Result<()> {
     // Main loop - poll every 2 seconds
     let mut poll_interval = interval(Duration::from_secs(2));
 
+    // Execution lock to prevent nonce collisions from concurrent arb attempts
+    let execution_in_flight = Arc::new(AtomicBool::new(false));
+
     println!("\nStarting price monitoring...\n");
 
     loop {
@@ -558,6 +563,12 @@ async fn main() -> Result<()> {
 
         // Auto-execute if enabled and spread exceeds threshold
         if args.spread_threshold > 0.0 && spread_pct > args.spread_threshold {
+            // Check if an execution is already in flight (prevent nonce collisions)
+            if execution_in_flight.load(Ordering::SeqCst) {
+                println!("  [SKIPPED] Execution already in flight, waiting for confirmation...");
+                continue;
+            }
+
             println!("\n========== SPREAD THRESHOLD TRIGGERED ==========");
             println!("Detected: {:+.3}% > Threshold: {}%", spread_pct, args.spread_threshold);
 
@@ -580,12 +591,16 @@ async fn main() -> Result<()> {
                     println!("Trade Size: {} WMON / ${:.2} USDC", args.wmon_amount, usdc_from_quote as f64 / 1e6);
                     println!("Firing parallel arbitrage (non-blocking)...\n");
 
+                    // Set execution lock BEFORE spawning
+                    execution_in_flight.store(true, Ordering::SeqCst);
+
                     // Clone everything needed for background task
                     let provider_bg = provider.clone();
                     let wallet_bg = eth_wallet.clone();
                     let zrx_bg = zrx.clone();
                     let pool_fee_bg = args.pool_fee;
                     let slippage_bg = args.slippage_bps;
+                    let lock = execution_in_flight.clone();
 
                     // Fire and forget - spawn execution in background
                     tokio::spawn(async move {
@@ -610,6 +625,9 @@ async fn main() -> Result<()> {
                                 eprintln!("Execution failed: {}", e);
                             }
                         }
+                        // Release execution lock when done
+                        lock.store(false, Ordering::SeqCst);
+                        println!("[READY] Execution complete. Ready for next opportunity.\n");
                     });
 
                     // Continue immediately - don't wait for execution result
