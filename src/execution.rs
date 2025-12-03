@@ -117,7 +117,7 @@ pub async fn wrap_mon<P: Provider>(
     // Call deposit() with native MON as value
     let call = depositCall {};
 
-    let gas_limit = 50_000u64; // Wrapping is simple, doesn't need much gas
+    let gas_limit = 100_000u64; // Increased gas limit for wrapping
     let tx = TransactionRequest::default()
         .to(wmon_addr)
         .input(call.abi_encode().into())
@@ -155,7 +155,7 @@ pub async fn unwrap_mon<P: Provider>(
 
     let call = withdrawCall { amount };
 
-    let gas_limit = 50_000u64;
+    let gas_limit = 100_000u64; // Increased gas limit for unwrapping
     let tx = TransactionRequest::default()
         .to(wmon_addr)
         .input(call.abi_encode().into())
