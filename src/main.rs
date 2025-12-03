@@ -592,47 +592,66 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // Estimate profitability before executing
-            let trade_value_usdc = args.wmon_amount * uniswap_price;  // Approximate value
-            let (est_gas_mon, is_profitable) = execution::estimate_trade_profitability(
-                spread_pct,
-                trade_value_usdc,
-                uniswap_price,
-            );
-
-            if !is_profitable {
-                println!(
-                    "  [SKIPPED] Estimated unprofitable. Gas: ~{:.4} MON, Trade value: ${:.2}, Spread: {:.2}%",
-                    est_gas_mon,
-                    trade_value_usdc,
-                    spread_pct
-                );
-                println!("  Tip: Increase --wmon-amount to {} or wait for higher spread", config::RECOMMENDED_WMON_AMOUNT);
-                continue;
-            }
-
-            println!("Profitability check PASSED. Est. gas: {:.4} MON", est_gas_mon);
-
-            println!("\n========== SPREAD THRESHOLD TRIGGERED ==========");
-            println!("Detected: {:+.3}% > Threshold: {}%", spread_pct, args.spread_threshold);
-
             // Calculate trade amounts
-            // Use fixed WMON amount for sell leg, auto-calculate USDC from 0x quote
             let wmon_amount = U256::from((args.wmon_amount * 1e18) as u128);
 
-            // Get 0x price to determine USDC equivalent
-            let price_quote = zrx.get_price(
+            // ========== CRITICAL FIX: Fetch FULL 0x quote FIRST to get actual gas ==========
+            // This prevents approving trades based on hardcoded gas estimates
+            let full_quote = zrx.get_quote(
                 config::WMON,
                 config::USDC,
                 &wmon_amount.to_string(),
+                &format!("{:?}", wallet_addr),
+                args.slippage_bps,
             ).await;
 
-            match price_quote {
+            match full_quote {
                 Ok(quote) => {
+                    // Parse actual gas from 0x quote
+                    let actual_0x_gas: u64 = quote.transaction.gas.parse().unwrap_or(0);
+
+                    // Log the actual 0x gas BEFORE deciding to trade
+                    println!("  [GAS CHECK] 0x quoted gas: {}", actual_0x_gas);
+
+                    // ========== Gas validation - skip if 0x route is too expensive ==========
+                    if let Err(gas_err) = execution::validate_0x_gas(actual_0x_gas) {
+                        println!("  [SKIPPED] {}", gas_err);
+                        continue;
+                    }
+
+                    // ========== Profitability check with ACTUAL gas from quote ==========
+                    let trade_value_usdc = args.wmon_amount * uniswap_price;
+                    const UNISWAP_GAS: u64 = 250_000;
+                    let (est_gas_mon, net_profit_usdc, is_profitable) = execution::estimate_trade_profitability_with_quote(
+                        spread_pct,
+                        trade_value_usdc,
+                        uniswap_price,
+                        actual_0x_gas,
+                        UNISWAP_GAS,
+                    );
+
+                    if !is_profitable {
+                        println!(
+                            "  [SKIPPED] Unprofitable with actual gas. Gas: {:.4} MON (0x: {}, Uni: {}), Net P/L: ${:.4}",
+                            est_gas_mon,
+                            actual_0x_gas,
+                            UNISWAP_GAS,
+                            net_profit_usdc
+                        );
+                        println!("  Tip: Increase --wmon-amount to {} or wait for higher spread", config::RECOMMENDED_WMON_AMOUNT);
+                        continue;
+                    }
+
+                    println!("  [PROFITABLE] Est. gas: {:.4} MON, Net profit: ${:.4}", est_gas_mon, net_profit_usdc);
+
+                    println!("\n========== SPREAD THRESHOLD TRIGGERED ==========");
+                    println!("Detected: {:+.3}% > Threshold: {}%", spread_pct, args.spread_threshold);
+
                     let usdc_from_quote: u128 = quote.buy_amount.parse().unwrap_or(0);
                     let usdc_amount = U256::from(usdc_from_quote);
 
                     println!("Trade Size: {} WMON / ${:.2} USDC", args.wmon_amount, usdc_from_quote as f64 / 1e6);
+                    println!("0x Gas: {} (validated < {} limit)", actual_0x_gas, config::MAX_0X_GAS);
                     println!("Firing parallel arbitrage (non-blocking)...\n");
 
                     // Set execution lock BEFORE spawning
@@ -641,22 +660,20 @@ async fn main() -> Result<()> {
                     // Clone everything needed for background task
                     let provider_bg = provider.clone();
                     let wallet_bg = eth_wallet.clone();
-                    let zrx_bg = zrx.clone();
                     let pool_fee_bg = args.pool_fee;
-                    let slippage_bg = args.slippage_bps;
                     let lock = execution_in_flight.clone();
 
                     // Fire and forget - spawn execution in background
+                    // Pass the pre-fetched quote to avoid double-fetch
                     tokio::spawn(async move {
                         let start = std::time::Instant::now();
-                        match execution::execute_parallel_arbitrage(
+                        match execution::execute_parallel_arbitrage_with_quote(
                             &provider_bg,
                             &wallet_bg,
-                            &zrx_bg,
                             usdc_amount,
                             wmon_amount,
                             pool_fee_bg,
-                            slippage_bg,
+                            quote,  // Pass pre-fetched quote
                         ).await {
                             Ok(report) => {
                                 report.print();

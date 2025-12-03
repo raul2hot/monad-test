@@ -39,6 +39,63 @@ pub fn estimate_trade_profitability(
     (gas_cost_mon, net_profit_usdc > 0.0)
 }
 
+/// Estimate trade profitability using ACTUAL gas from 0x quote
+/// This should be called AFTER fetching the 0x quote to get real gas costs
+/// Returns (gas_cost_mon, net_profit_usdc, is_profitable)
+pub fn estimate_trade_profitability_with_quote(
+    spread_pct: f64,
+    trade_value_usdc: f64,
+    mon_price_usdc: f64,
+    actual_0x_gas: u64,
+    uniswap_gas: u64,
+) -> (f64, f64, bool) {
+    let total_gas = actual_0x_gas + uniswap_gas;
+
+    // Monad gas price is typically ~52 gwei (0.000000052 MON per gas)
+    const GAS_PRICE_GWEI: f64 = 52.0;
+    const GWEI_TO_MON: f64 = 0.000000001;
+
+    let gas_cost_mon = (total_gas as f64) * GAS_PRICE_GWEI * GWEI_TO_MON;
+    let gas_cost_usdc = gas_cost_mon * mon_price_usdc;
+
+    // Gross profit from spread
+    let gross_profit_usdc = trade_value_usdc * (spread_pct / 100.0);
+
+    // Account for DEX fees (~0.05% Uniswap + ~0.1% 0x routing)
+    let fee_cost_usdc = trade_value_usdc * 0.0015;  // ~0.15% total
+
+    let net_profit_usdc = gross_profit_usdc - gas_cost_usdc - fee_cost_usdc;
+
+    (gas_cost_mon, net_profit_usdc, net_profit_usdc > 0.0)
+}
+
+/// Validate 0x quoted gas against safety limits
+/// Returns Ok(()) if gas is acceptable, Err with reason if rejected
+pub fn validate_0x_gas(quoted_gas: u64) -> Result<(), String> {
+    if quoted_gas > crate::config::MAX_0X_GAS {
+        return Err(format!(
+            "0x gas too high: {} > {} limit",
+            quoted_gas,
+            crate::config::MAX_0X_GAS
+        ));
+    }
+
+    // Also check total gas (0x + Uniswap)
+    const UNISWAP_GAS: u64 = 250_000;
+    let total_gas = quoted_gas + UNISWAP_GAS;
+    if total_gas > crate::config::MAX_TOTAL_GAS {
+        return Err(format!(
+            "Total gas too high: {} > {} limit (0x: {}, Uniswap: {})",
+            total_gas,
+            crate::config::MAX_TOTAL_GAS,
+            quoted_gas,
+            UNISWAP_GAS
+        ));
+    }
+
+    Ok(())
+}
+
 sol! {
     function approve(address spender, uint256 amount) external returns (bool);
 
@@ -625,6 +682,39 @@ pub async fn execute_parallel_arbitrage<P: Provider + Clone + 'static>(
     slippage_bps: u32,      // Slippage for both legs
 ) -> Result<ParallelArbReport> {
     let wallet_addr = wallet.default_signer().address();
+
+    // PRE-FLIGHT: Get 0x quote BEFORE firing transactions
+    // This is needed to build the 0x transaction
+    let sell_quote = zrx.get_quote(
+        crate::config::WMON,
+        crate::config::USDC,
+        &wmon_amount.to_string(),
+        &format!("{:?}", wallet_addr),
+        slippage_bps,
+    ).await?;
+
+    // Delegate to the version that accepts a pre-fetched quote
+    execute_parallel_arbitrage_with_quote(
+        provider,
+        wallet,
+        usdc_amount,
+        wmon_amount,
+        pool_fee,
+        sell_quote,
+    ).await
+}
+
+/// Execute parallel arbitrage with a pre-fetched 0x quote
+/// This avoids double-fetching the quote when gas validation is done first
+pub async fn execute_parallel_arbitrage_with_quote<P: Provider + Clone + 'static>(
+    provider: &P,
+    wallet: &EthereumWallet,
+    usdc_amount: U256,      // Amount of USDC to spend on Uniswap BUY
+    wmon_amount: U256,      // Amount of WMON to sell via 0x
+    pool_fee: u32,          // Uniswap pool fee tier
+    sell_quote: crate::zrx::QuoteResponse,  // Pre-fetched 0x quote
+) -> Result<ParallelArbReport> {
+    let wallet_addr = wallet.default_signer().address();
     let start_time = std::time::Instant::now();
 
     // PRE-FETCH: Get current nonce before any operations
@@ -647,16 +737,6 @@ pub async fn execute_parallel_arbitrage<P: Provider + Clone + 'static>(
     println!("USDC Input (Uniswap): {}", usdc_amount);
     println!("WMON Input (0x):      {}", wmon_amount);
     balances_before.print();
-
-    // PRE-FLIGHT: Get 0x quote BEFORE firing transactions
-    // This is needed to build the 0x transaction
-    let sell_quote = zrx.get_quote(
-        crate::config::WMON,
-        crate::config::USDC,
-        &wmon_amount.to_string(),
-        &format!("{:?}", wallet_addr),
-        slippage_bps,
-    ).await?;
 
     // Calculate expected outputs for reporting
     let expected_usdc_from_0x: f64 = sell_quote.buy_amount.parse::<f64>().unwrap_or(0.0) / 1e6;
