@@ -288,6 +288,12 @@ pub async fn execute_uniswap_buy<P: Provider>(
     let receipt = pending.get_receipt().await?;
     let elapsed = start_time.elapsed();
 
+    if !receipt.status() {
+        tracing::error!("Uniswap BUY FAILED! Tx: {:?}", tx_hash);
+        tracing::error!("Gas used: {} / {} (out of gas: {})", receipt.gas_used, gas_limit, receipt.gas_used >= gas_limit as u64);
+        tracing::error!("Try different pool fee: 500, 3000, or 10000");
+    }
+
     Ok(ExecutionResult {
         tx_hash,
         success: receipt.status(),
