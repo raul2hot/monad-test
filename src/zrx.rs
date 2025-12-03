@@ -68,6 +68,7 @@ pub struct QuoteResponse {
     pub route: Option<RouteInfo>,
 }
 
+#[derive(Clone)]
 pub struct ZrxClient {
     client: Client,
     api_key: String,

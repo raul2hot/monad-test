@@ -535,33 +535,42 @@ async fn main() -> Result<()> {
                     let usdc_amount = U256::from(usdc_from_quote);
 
                     println!("Trade Size: {} WMON / ${:.2} USDC", args.wmon_amount, usdc_from_quote as f64 / 1e6);
-                    println!("Executing parallel arbitrage...\n");
+                    println!("Firing parallel arbitrage (non-blocking)...\n");
 
-                    let start = std::time::Instant::now();
+                    // Clone everything needed for background task
+                    let provider_bg = provider.clone();
+                    let wallet_bg = eth_wallet.clone();
+                    let zrx_bg = zrx.clone();
+                    let pool_fee_bg = args.pool_fee;
+                    let slippage_bg = args.slippage_bps;
 
-                    match execution::execute_parallel_arbitrage(
-                        &provider,
-                        &eth_wallet,
-                        &zrx,
-                        usdc_amount,
-                        wmon_amount,
-                        args.pool_fee,
-                        args.slippage_bps,
-                    ).await {
-                        Ok(report) => {
-                            report.print();
-
-                            // Print post-execution stats
-                            println!("========== POST-EXECUTION STATS ==========");
-                            println!("Total Time: {}ms", start.elapsed().as_millis());
-                            println!("Triggered Spread: {:+.3}%", spread_pct);
-                            println!("USDC P/L: {:+.6}", report.usdc_change);
-                            println!("==========================================\n");
+                    // Fire and forget - spawn execution in background
+                    tokio::spawn(async move {
+                        let start = std::time::Instant::now();
+                        match execution::execute_parallel_arbitrage(
+                            &provider_bg,
+                            &wallet_bg,
+                            &zrx_bg,
+                            usdc_amount,
+                            wmon_amount,
+                            pool_fee_bg,
+                            slippage_bg,
+                        ).await {
+                            Ok(report) => {
+                                report.print();
+                                println!("========== EXECUTION COMPLETE ==========");
+                                println!("Total Time: {}ms", start.elapsed().as_millis());
+                                println!("USDC P/L: {:+.6}", report.usdc_change);
+                                println!("=========================================\n");
+                            }
+                            Err(e) => {
+                                eprintln!("Execution failed: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("Execution failed: {}", e);
-                        }
-                    }
+                    });
+
+                    // Continue immediately - don't wait for execution result
+                    println!("Transactions submitted. Continuing to monitor...\n");
                 }
                 Err(e) => {
                     eprintln!("Failed to get 0x quote: {}", e);
