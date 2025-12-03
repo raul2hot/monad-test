@@ -69,6 +69,10 @@ struct Args {
     /// Amount of WMON to sell via 0x in parallel mode
     #[arg(long, default_value = "10.0")]
     wmon_amount: f64,
+
+    /// Spread threshold (%) to trigger auto-execution. 0 = monitoring only (default)
+    #[arg(long, default_value = "0.0")]
+    spread_threshold: f64,
 }
 
 #[derive(Debug)]
@@ -437,6 +441,34 @@ async fn main() -> Result<()> {
         eyre::eyre!("No Uniswap MON/USDC pool found with liquidity. Check USDC address.")
     })?;
 
+    // Before loop, if auto-execute enabled
+    if args.spread_threshold > 0.0 {
+        println!("AUTO-EXECUTE ENABLED");
+        println!("Spread Threshold: {}%", args.spread_threshold);
+
+        // Pre-approve USDC to SwapRouter (for Uniswap BUY leg)
+        let usdc_approval_amount = U256::from(100_000_000u128); // 100 USDC
+        execution::ensure_approval(
+            &provider,
+            &eth_wallet,
+            config::USDC,
+            config::UNISWAP_SWAP_ROUTER,
+            usdc_approval_amount,
+        ).await?;
+
+        // Pre-approve WMON to AllowanceHolder (for 0x SELL leg)
+        let wmon_approval_amount = U256::from(100_000_000_000_000_000_000u128); // 100 WMON
+        execution::ensure_approval(
+            &provider,
+            &eth_wallet,
+            config::WMON,
+            config::ALLOWANCE_HOLDER,
+            wmon_approval_amount,
+        ).await?;
+
+        println!("Approvals confirmed. Starting monitoring...\n");
+    }
+
     // Main loop - poll every 2 seconds
     let mut poll_interval = interval(Duration::from_secs(2));
 
@@ -469,18 +501,79 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Print current prices
+        // Calculate spread
+        let spread_pct = ((zrx_price - uniswap_price) / uniswap_price) * 100.0;
+
+        // Print current spread on every tick
         println!(
-            "[{}] MON/USDC | 0x: ${:.6} | Uniswap: ${:.6} | Spread: {:.3}%",
+            "[{}] MON/USDC | 0x: ${:.6} | Uniswap: ${:.6} | Spread: {:+.3}%",
             chrono::Local::now().format("%H:%M:%S"),
             zrx_price,
             uniswap_price,
-            ((zrx_price - uniswap_price) / uniswap_price * 100.0)
+            spread_pct
         );
 
-        // Check for arbitrage
-        if let Some(arb) = check_arbitrage(zrx_price, uniswap_price, "Uniswap") {
-            arb.print();
+        // Auto-execute if enabled and spread exceeds threshold
+        if args.spread_threshold > 0.0 && spread_pct > args.spread_threshold {
+            println!("\n========== SPREAD THRESHOLD TRIGGERED ==========");
+            println!("Detected: {:+.3}% > Threshold: {}%", spread_pct, args.spread_threshold);
+
+            // Calculate trade amounts
+            // Use fixed WMON amount for sell leg, auto-calculate USDC from 0x quote
+            let wmon_amount = U256::from((args.wmon_amount * 1e18) as u128);
+
+            // Get 0x price to determine USDC equivalent
+            let price_quote = zrx.get_price(
+                config::WMON,
+                config::USDC,
+                &wmon_amount.to_string(),
+            ).await;
+
+            match price_quote {
+                Ok(quote) => {
+                    let usdc_from_quote: u128 = quote.buy_amount.parse().unwrap_or(0);
+                    let usdc_amount = U256::from(usdc_from_quote);
+
+                    println!("Trade Size: {} WMON / ${:.2} USDC", args.wmon_amount, usdc_from_quote as f64 / 1e6);
+                    println!("Executing parallel arbitrage...\n");
+
+                    let start = std::time::Instant::now();
+
+                    match execution::execute_parallel_arbitrage(
+                        &provider,
+                        &eth_wallet,
+                        &zrx,
+                        usdc_amount,
+                        wmon_amount,
+                        args.pool_fee,
+                        args.slippage_bps,
+                    ).await {
+                        Ok(report) => {
+                            report.print();
+
+                            // Print post-execution stats
+                            println!("========== POST-EXECUTION STATS ==========");
+                            println!("Total Time: {}ms", start.elapsed().as_millis());
+                            println!("Triggered Spread: {:+.3}%", spread_pct);
+                            println!("USDC P/L: {:+.6}", report.usdc_change);
+                            println!("==========================================\n");
+                        }
+                        Err(e) => {
+                            eprintln!("Execution failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to get 0x quote: {}", e);
+                }
+            }
+        }
+
+        // Only print detection box if NOT auto-executing
+        if args.spread_threshold == 0.0 {
+            if let Some(arb) = check_arbitrage(zrx_price, uniswap_price, "Uniswap") {
+                arb.print();
+            }
         }
     }
 }

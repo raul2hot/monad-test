@@ -480,6 +480,7 @@ async fn execute_uniswap_buy_no_wait<P: Provider>(
     usdc_amount: U256,
     min_mon_out: U256,
     pool_fee: u32,
+    nonce: u64,  // Pre-fetched nonce for faster submission
 ) -> Result<PendingLegResult> {
     let from = wallet.default_signer().address();
     let router = Address::from_str(crate::config::UNISWAP_SWAP_ROUTER)?;
@@ -503,7 +504,8 @@ async fn execute_uniswap_buy_no_wait<P: Provider>(
         .to(router)
         .input(call.abi_encode().into())
         .from(from)
-        .gas_limit(gas_limit);
+        .gas_limit(gas_limit)
+        .nonce(nonce);
 
     let submit_time = std::time::Instant::now();
 
@@ -535,6 +537,7 @@ async fn execute_0x_swap_no_wait<P: Provider>(
     provider: &P,
     wallet: &EthereumWallet,
     quote: &crate::zrx::QuoteResponse,
+    nonce: u64,  // Pre-fetched nonce for faster submission
 ) -> Result<PendingLegResult> {
     let from = wallet.default_signer().address();
 
@@ -553,7 +556,8 @@ async fn execute_0x_swap_no_wait<P: Provider>(
         .value(value)
         .gas_limit(adjusted_gas_limit)
         .gas_price(adjusted_gas_price)
-        .from(from);
+        .from(from)
+        .nonce(nonce);
 
     let submit_time = std::time::Instant::now();
 
@@ -593,6 +597,13 @@ pub async fn execute_parallel_arbitrage<P: Provider + Clone + 'static>(
     let wallet_addr = wallet.default_signer().address();
     let start_time = std::time::Instant::now();
 
+    // PRE-FETCH: Get current nonce before any operations
+    let current_nonce = provider.get_transaction_count(wallet_addr).await?;
+    let leg_a_nonce = current_nonce;      // Uniswap BUY
+    let leg_b_nonce = current_nonce + 1;  // 0x SELL
+
+    tracing::info!("Pre-fetched nonces: Leg A = {}, Leg B = {}", leg_a_nonce, leg_b_nonce);
+
     // Get balances BEFORE
     let balances_before = crate::wallet::get_full_balances(
         provider,
@@ -627,10 +638,12 @@ pub async fn execute_parallel_arbitrage<P: Provider + Clone + 'static>(
     let wallet_a = wallet.clone();
     let usdc_amt = usdc_amount;
     let fee = pool_fee;
+    let nonce_a = leg_a_nonce;  // Capture for move
 
     let provider_b = provider.clone();
     let wallet_b = wallet.clone();
     let quote = sell_quote;
+    let nonce_b = leg_b_nonce;  // Capture for move
 
     // Spawn Leg A: Uniswap BUY
     let leg_a_handle = tokio::spawn(async move {
@@ -640,12 +653,13 @@ pub async fn execute_parallel_arbitrage<P: Provider + Clone + 'static>(
             usdc_amt,
             U256::ZERO,  // min_out - set to 0 for now, can add slippage protection
             fee,
+            nonce_a,  // Pass pre-fetched nonce
         ).await
     });
 
     // Spawn Leg B: 0x SELL
     let leg_b_handle = tokio::spawn(async move {
-        execute_0x_swap_no_wait(&provider_b, &wallet_b, &quote).await
+        execute_0x_swap_no_wait(&provider_b, &wallet_b, &quote, nonce_b).await  // Pass pre-fetched nonce
     });
 
     // Wait for BOTH to complete
