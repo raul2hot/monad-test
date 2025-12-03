@@ -1,7 +1,7 @@
-//! Monad Arbitrage Bot - Monorail vs Direct Pool Strategy
+//! Monad Arbitrage Bot - 0x vs Direct Pool Strategy
 
 mod config;
-mod monorail;
+mod zrx;
 mod pools;
 
 use alloy::providers::{Provider, ProviderBuilder};
@@ -9,11 +9,11 @@ use eyre::Result;
 use std::env;
 use std::time::Duration;
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::{info, warn, Level};
 
 #[derive(Debug)]
 struct ArbOpportunity {
-    monorail_price: f64,
+    aggregator_price: f64,
     pool_price: f64,
     pool_name: String,
     spread_pct: f64,
@@ -23,29 +23,26 @@ struct ArbOpportunity {
 impl ArbOpportunity {
     fn print(&self) {
         println!("\n============ ARBITRAGE DETECTED ============");
-        println!("  Monorail Price: ${:.6}", self.monorail_price);
+        println!("  0x Price:       ${:.6}", self.aggregator_price);
         println!("  {} Price:  ${:.6}", self.pool_name, self.pool_price);
         println!("  Spread:         {:.3}%", self.spread_pct);
         println!("  Direction:      {}", self.direction);
-        println!(
-            "  Est. Profit:    {:.3}% (before gas)",
-            self.spread_pct - 0.3
-        );
+        println!("  Est. Profit:    {:.3}% (before gas)", self.spread_pct - 0.3);
         println!("=============================================\n");
     }
 }
 
 fn check_arbitrage(
-    monorail_price: f64,
+    aggregator_price: f64,
     pool_price: f64,
     pool_name: &str,
 ) -> Option<ArbOpportunity> {
     // Validate prices
-    if monorail_price <= 0.0 || pool_price <= 0.0 {
+    if aggregator_price <= 0.0 || pool_price <= 0.0 {
         return None;
     }
 
-    let spread_pct = ((monorail_price - pool_price) / pool_price) * 100.0;
+    let spread_pct = ((aggregator_price - pool_price) / pool_price) * 100.0;
 
     // Sanity check
     if spread_pct.abs() > config::MAX_SPREAD_PCT {
@@ -56,13 +53,13 @@ fn check_arbitrage(
     // Check minimum spread
     if spread_pct.abs() > config::MIN_SPREAD_PCT {
         let direction = if spread_pct > 0.0 {
-            format!("BUY on {} -> SELL via Monorail", pool_name)
+            format!("BUY on {} → SELL via 0x", pool_name)
         } else {
-            format!("BUY via Monorail -> SELL on {}", pool_name)
+            format!("BUY via 0x → SELL on {}", pool_name)
         };
 
         Some(ArbOpportunity {
-            monorail_price,
+            aggregator_price,
             pool_price,
             pool_name: pool_name.to_string(),
             spread_pct: spread_pct.abs(),
@@ -76,17 +73,14 @@ fn check_arbitrage(
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::DEBUG.into()),
-        )
+        .with_max_level(Level::INFO)
         .init();
 
     dotenvy::dotenv().ok();
 
     println!("==========================================");
     println!("  Monad Arbitrage Bot");
-    println!("  Strategy: Monorail vs Direct Pools");
+    println!("  Strategy: 0x API vs Direct Pools");
     println!("  Pair: MON/USDC");
     println!("==========================================\n");
 
@@ -94,13 +88,15 @@ async fn main() -> Result<()> {
     let rpc_url = env::var("MONAD_RPC_URL")
         .unwrap_or_else(|_| "https://monad-mainnet.g.alchemy.com/v2/YOUR_KEY".to_string());
 
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new()
+        .connect_http(rpc_url.parse()?);
 
     let chain_id = provider.get_chain_id().await?;
     info!("Connected to chain {}", chain_id);
 
-    // Initialize Monorail client
-    let monorail = monorail::MonorailClient::new(config::MONORAIL_APP_ID);
+    // Initialize 0x API client (requires ZRX_API_KEY env var)
+    let zrx = zrx::ZrxClient::new()?;
+    info!("0x API client initialized");
 
     // Determine token0 for price calculation
     let wmon = config::WMON.to_lowercase();
@@ -108,13 +104,29 @@ async fn main() -> Result<()> {
     let token0_is_mon = wmon < usdc;
     info!("Token0 is MON: {}", token0_is_mon);
 
-    // Verify Uniswap pool has liquidity
-    let uni_has_liq = pools::has_liquidity(&provider, config::UNISWAP_MON_USDC_POOL).await?;
-    info!("Uniswap MON/USDC pool has liquidity: {}", uni_has_liq);
-
-    if !uni_has_liq {
-        return Err(eyre::eyre!("Uniswap pool has no liquidity"));
+    // Discover Uniswap MON/USDC pool (try different fee tiers)
+    println!("Discovering Uniswap MON/USDC pool...");
+    let mut uniswap_pool: Option<String> = None;
+    for fee in [500u32, 3000, 10000] {  // 0.05%, 0.3%, 1%
+        if let Some(pool) = pools::discover_pool(
+            &provider,
+            config::UNISWAP_FACTORY,
+            config::WMON,
+            config::USDC,
+            fee,
+        ).await? {
+            let pool_str = format!("{:?}", pool);
+            if pools::has_liquidity(&provider, &pool_str).await? {
+                info!("Found Uniswap MON/USDC pool: {} (fee: {})", pool_str, fee);
+                uniswap_pool = Some(pool_str);
+                break;
+            }
+        }
     }
+
+    let uniswap_pool = uniswap_pool.ok_or_else(|| {
+        eyre::eyre!("No Uniswap MON/USDC pool found with liquidity. Check USDC address.")
+    })?;
 
     // Main loop - poll every 2 seconds
     let mut poll_interval = interval(Duration::from_secs(2));
@@ -124,11 +136,11 @@ async fn main() -> Result<()> {
     loop {
         poll_interval.tick().await;
 
-        // Get Monorail aggregated price
-        let monorail_price = match monorail.get_mon_price().await {
+        // Get 0x aggregated price
+        let zrx_price = match zrx.get_mon_usdc_price().await {
             Ok(p) => p,
             Err(e) => {
-                warn!("Monorail API error: {}", e);
+                warn!("0x API error: {}", e);
                 continue;
             }
         };
@@ -136,11 +148,9 @@ async fn main() -> Result<()> {
         // Get Uniswap direct pool price
         let uniswap_price = match pools::get_pool_price(
             &provider,
-            config::UNISWAP_MON_USDC_POOL,
+            &uniswap_pool,  // Use discovered pool
             token0_is_mon,
-        )
-        .await
-        {
+        ).await {
             Ok(p) => p,
             Err(e) => {
                 warn!("Uniswap pool error: {}", e);
@@ -150,21 +160,21 @@ async fn main() -> Result<()> {
 
         // Print current prices
         println!(
-            "[{}] MON/USDC | Monorail: ${:.6} | Uniswap: ${:.6} | Spread: {:.3}%",
+            "[{}] MON/USDC | 0x: ${:.6} | Uniswap: ${:.6} | Spread: {:.3}%",
             chrono::Local::now().format("%H:%M:%S"),
-            monorail_price,
+            zrx_price,
             uniswap_price,
-            ((monorail_price - uniswap_price) / uniswap_price * 100.0)
+            ((zrx_price - uniswap_price) / uniswap_price * 100.0)
         );
 
         // Check for arbitrage
-        if let Some(arb) = check_arbitrage(monorail_price, uniswap_price, "Uniswap") {
+        if let Some(arb) = check_arbitrage(zrx_price, uniswap_price, "Uniswap") {
             arb.print();
         }
 
         // TODO: Add PancakeSwap pool comparison here
         // let pancake_price = pools::get_pool_price(...).await?;
-        // if let Some(arb) = check_arbitrage(monorail_price, pancake_price, "PancakeSwap") {
+        // if let Some(arb) = check_arbitrage(zrx_price, pancake_price, "PancakeSwap") {
         //     arb.print();
         // }
     }
