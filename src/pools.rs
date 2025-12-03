@@ -1,122 +1,142 @@
-//! Pool discovery utilities
+//! Direct Pool Price Queries
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U160};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
+use std::str::FromStr;
 
-// Uniswap V3 Factory getPool function
 sol! {
+    function slot0() external view returns (
+        uint160 sqrtPriceX96,
+        int24 tick,
+        uint16 observationIndex,
+        uint16 observationCardinality,
+        uint16 observationCardinalityNext,
+        uint8 feeProtocol,
+        bool unlocked
+    );
+
     function getPool(
         address tokenA,
         address tokenB,
         uint24 fee
     ) external view returns (address pool);
-}
 
-// Uniswap V3 pool liquidity function
-sol! {
     function liquidity() external view returns (uint128);
+
+    // For PancakeSwap SmartRouter -> get factory address
+    function factory() external view returns (address);
 }
 
-/// Fee tiers for Uniswap V3
-pub const FEE_TIERS: [u32; 4] = [100, 500, 3000, 10000];
+/// Convert sqrtPriceX96 to human readable price
+/// MON (18 decimals) / USDC (6 decimals)
+pub fn sqrt_price_to_mon_usdc(sqrt_price_x96: U160, token0_is_mon: bool) -> f64 {
+    let sqrt_price: f64 = sqrt_price_x96.to_string().parse().unwrap_or(0.0);
+    let q96: f64 = 2f64.powi(96);
 
-/// Discover Uniswap V3 pool address for a token pair
-pub async fn find_uniswap_v3_pool<P: Provider>(
-    provider: &P,
-    factory: Address,
-    token_a: Address,
-    token_b: Address,
-) -> Result<Option<(Address, u32)>> {
-    for fee in FEE_TIERS {
-        let call = getPoolCall {
-            tokenA: token_a,
-            tokenB: token_b,
-            fee: fee.try_into().unwrap(),
-        };
+    let ratio = sqrt_price / q96;
+    let raw_price = ratio * ratio;
 
-        let tx = TransactionRequest::default()
-            .to(factory)
-            .input(call.abi_encode().into());
+    // Adjust for decimals: MON=18, USDC=6, diff=12
+    let decimal_adj = 10f64.powi(12);
 
-        if let Ok(result) = provider.call(tx).await {
-            if let Ok(decoded) = getPoolCall::abi_decode_returns(&result) {
-                // decoded is the return value (address pool)
-                if decoded != Address::ZERO {
-                    return Ok(Some((decoded, fee)));
-                }
-            }
+    if token0_is_mon {
+        // price = USDC/MON, we want MON in USDC terms
+        raw_price * decimal_adj
+    } else {
+        // price = MON/USDC, invert
+        if raw_price > 0.0 {
+            decimal_adj / raw_price
+        } else {
+            0.0
         }
     }
-    Ok(None)
 }
 
-/// Check if a pool has liquidity (non-zero reserves)
-pub async fn pool_has_liquidity<P: Provider>(
+/// Query pool price via slot0
+pub async fn get_pool_price<P: Provider>(
     provider: &P,
-    pool: Address,
-) -> Result<bool> {
-    let call = liquidityCall {};
+    pool_address: &str,
+    token0_is_mon: bool,
+) -> Result<f64> {
+    let pool = Address::from_str(pool_address)?;
+
+    let call = slot0Call {};
     let tx = TransactionRequest::default()
         .to(pool)
         .input(call.abi_encode().into());
 
+    let result = provider.call(tx).await?;
+    let decoded = slot0Call::abi_decode_returns(&result)?;
+
+    let price = sqrt_price_to_mon_usdc(decoded.sqrtPriceX96, token0_is_mon);
+    Ok(price)
+}
+
+/// Discover pool address from factory
+pub async fn discover_pool<P: Provider>(
+    provider: &P,
+    factory: &str,
+    token_a: &str,
+    token_b: &str,
+    fee: u32,
+) -> Result<Option<Address>> {
+    let factory_addr = Address::from_str(factory)?;
+    let token_a_addr = Address::from_str(token_a)?;
+    let token_b_addr = Address::from_str(token_b)?;
+
+    let call = getPoolCall {
+        tokenA: token_a_addr,
+        tokenB: token_b_addr,
+        fee: fee.try_into()?,
+    };
+
+    let tx = TransactionRequest::default()
+        .to(factory_addr)
+        .input(call.abi_encode().into());
+
+    let result = provider.call(tx).await?;
+    let pool = getPoolCall::abi_decode_returns(&result)?;
+
+    if pool == Address::ZERO {
+        Ok(None)
+    } else {
+        Ok(Some(pool))
+    }
+}
+
+/// Check if pool has liquidity
+pub async fn has_liquidity<P: Provider>(provider: &P, pool: &str) -> Result<bool> {
+    let pool_addr = Address::from_str(pool)?;
+
+    let call = liquidityCall {};
+    let tx = TransactionRequest::default()
+        .to(pool_addr)
+        .input(call.abi_encode().into());
+
     match provider.call(tx).await {
         Ok(result) => {
-            if let Ok(decoded) = liquidityCall::abi_decode_returns(&result) {
-                // decoded is u128
-                Ok(decoded > 0)
-            } else {
-                Ok(false)
-            }
+            let liq = liquidityCall::abi_decode_returns(&result)?;
+            Ok(liq > 0)
         }
         Err(_) => Ok(false),
     }
 }
 
-/// Discover all pools for a token pair and return the one with most liquidity
-pub async fn find_best_uniswap_v3_pool<P: Provider>(
-    provider: &P,
-    factory: Address,
-    token_a: Address,
-    token_b: Address,
-) -> Result<Option<(Address, u32, u128)>> {
-    let mut best_pool: Option<(Address, u32, u128)> = None;
+/// Get PancakeSwap factory address from SmartRouter
+pub async fn get_pancake_factory<P: Provider>(provider: &P) -> Result<Address> {
+    let router = Address::from_str("0x21114915Ac6d5A2e156931e20B20b038dEd0Be7C")?;
 
-    for fee in FEE_TIERS {
-        let call = getPoolCall {
-            tokenA: token_a,
-            tokenB: token_b,
-            fee: fee.try_into().unwrap(),
-        };
+    let call = factoryCall {};
+    let tx = TransactionRequest::default()
+        .to(router)
+        .input(call.abi_encode().into());
 
-        let tx = TransactionRequest::default()
-            .to(factory)
-            .input(call.abi_encode().into());
+    let result = provider.call(tx).await?;
+    let factory = factoryCall::abi_decode_returns(&result)?;
 
-        if let Ok(result) = provider.call(tx).await {
-            if let Ok(pool_address) = getPoolCall::abi_decode_returns(&result) {
-                if pool_address != Address::ZERO {
-                    // Check liquidity
-                    let liq_call = liquidityCall {};
-                    let liq_tx = TransactionRequest::default()
-                        .to(pool_address)
-                        .input(liq_call.abi_encode().into());
-
-                    if let Ok(liq_result) = provider.call(liq_tx).await {
-                        if let Ok(liquidity) = liquidityCall::abi_decode_returns(&liq_result) {
-                            if best_pool.is_none() || liquidity > best_pool.unwrap().2 {
-                                best_pool = Some((pool_address, fee, liquidity));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(best_pool)
+    Ok(factory)
 }
