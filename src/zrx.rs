@@ -31,6 +31,43 @@ pub struct Fill {
     pub proportion_bps: String,
 }
 
+// Quote response types for actual execution
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteTransaction {
+    pub to: String,
+    pub data: String,
+    pub gas: String,
+    pub gas_price: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteIssues {
+    pub allowance: Option<AllowanceIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AllowanceIssue {
+    pub spender: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteResponse {
+    pub buy_amount: String,
+    pub min_buy_amount: String,
+    pub sell_amount: String,
+    pub buy_token: String,
+    pub sell_token: String,
+    pub liquidity_available: bool,
+    pub transaction: QuoteTransaction,
+    pub issues: QuoteIssues,
+    #[serde(default)]
+    pub route: Option<RouteInfo>,
+}
+
 pub struct ZrxClient {
     client: Client,
     api_key: String,
@@ -118,5 +155,120 @@ impl ZrxClient {
         }
 
         Ok(usdc_price)
+    }
+
+    /// Get executable quote for selling tokens
+    /// Returns transaction data ready for submission
+    pub async fn get_quote(
+        &self,
+        sell_token: &str,
+        buy_token: &str,
+        sell_amount: &str,
+        taker: &str, // Your wallet address
+        slippage_bps: u32, // e.g., 100 = 1%
+    ) -> Result<QuoteResponse> {
+        let url = format!(
+            "{}/swap/allowance-holder/quote?chainId={}&sellToken={}&buyToken={}&sellAmount={}&taker={}&slippageBps={}",
+            crate::config::ZRX_API_BASE,
+            crate::config::CHAIN_ID,
+            sell_token,
+            buy_token,
+            sell_amount,
+            taker,
+            slippage_bps
+        );
+
+        tracing::debug!("0x Quote URL: {}", url);
+
+        let response = self.client
+            .get(&url)
+            .header("0x-api-key", &self.api_key)
+            .header("0x-version", "v2")
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            return Err(eyre::eyre!("0x API error: {} - {}", status, body));
+        }
+
+        let quote: QuoteResponse = serde_json::from_str(&body)
+            .map_err(|e| eyre::eyre!("Failed to parse 0x quote: {}. Body: {}", e, body))?;
+
+        if !quote.liquidity_available {
+            return Err(eyre::eyre!("No liquidity available for this pair"));
+        }
+
+        // Log routing info
+        if let Some(route) = &quote.route {
+            let sources: Vec<&str> = route.fills.iter()
+                .map(|f| f.source.as_str())
+                .collect();
+            tracing::info!("0x quote routing through: {:?}", sources);
+        }
+
+        Ok(quote)
+    }
+
+    /// Get quote with optional source exclusions
+    /// Use excludedSources to force different routing for arbitrage
+    pub async fn get_quote_with_exclusions(
+        &self,
+        sell_token: &str,
+        buy_token: &str,
+        sell_amount: &str,
+        taker: &str,
+        slippage_bps: u32,
+        excluded_sources: Option<&str>, // e.g., "Uniswap_V3,Sushiswap"
+    ) -> Result<QuoteResponse> {
+        let mut url = format!(
+            "{}/swap/allowance-holder/quote?chainId={}&sellToken={}&buyToken={}&sellAmount={}&taker={}&slippageBps={}",
+            crate::config::ZRX_API_BASE,
+            crate::config::CHAIN_ID,
+            sell_token,
+            buy_token,
+            sell_amount,
+            taker,
+            slippage_bps
+        );
+
+        if let Some(excluded) = excluded_sources {
+            url.push_str(&format!("&excludedSources={}", excluded));
+        }
+
+        tracing::debug!("0x Quote URL: {}", url);
+
+        let response = self.client
+            .get(&url)
+            .header("0x-api-key", &self.api_key)
+            .header("0x-version", "v2")
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            return Err(eyre::eyre!("0x API error: {} - {}", status, body));
+        }
+
+        let quote: QuoteResponse = serde_json::from_str(&body)
+            .map_err(|e| eyre::eyre!("Failed to parse 0x quote: {}. Body: {}", e, body))?;
+
+        if !quote.liquidity_available {
+            return Err(eyre::eyre!("No liquidity available for this pair"));
+        }
+
+        // Log routing info
+        if let Some(route) = &quote.route {
+            let sources: Vec<&str> = route.fills.iter()
+                .map(|f| f.source.as_str())
+                .collect();
+            tracing::info!("0x quote routing through: {:?}", sources);
+        }
+
+        Ok(quote)
     }
 }
