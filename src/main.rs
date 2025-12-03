@@ -9,7 +9,7 @@ use eyre::Result;
 use std::env;
 use std::time::Duration;
 use tokio::time::interval;
-use tracing::{info, warn, Level};
+use tracing::{info, warn};
 
 #[derive(Debug)]
 struct ArbOpportunity {
@@ -75,7 +75,12 @@ fn check_arbitrage(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::DEBUG.into()),
+        )
+        .init();
 
     dotenvy::dotenv().ok();
 

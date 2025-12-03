@@ -46,15 +46,19 @@ impl MonorailClient {
             self.base_url, self.app_id, token_in, token_out, amount_in
         );
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .json::<QuoteResponse>()
-            .await?;
+        tracing::debug!("Monorail API URL: {}", url);
 
-        Ok(response)
+        let response = self.client.get(&url).send().await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        tracing::debug!("Monorail API status: {}, body: {}", status, body);
+
+        let quote: QuoteResponse = serde_json::from_str(&body)
+            .map_err(|e| eyre::eyre!("Failed to parse response: {}. Body: {}", e, body))?;
+
+        Ok(quote)
     }
 
     /// Get MON price in USDC
