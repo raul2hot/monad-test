@@ -1,15 +1,51 @@
 //! Monad Arbitrage Bot - 0x vs Direct Pool Strategy
 
 mod config;
-mod zrx;
+mod execution;
 mod pools;
+mod trader;
+mod wallet;
+mod zrx;
 
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::network::EthereumWallet;
+use alloy::primitives::U256;
+use alloy::providers::ProviderBuilder;
+use alloy::signers::local::PrivateKeySigner;
+use clap::Parser;
 use eyre::Result;
 use std::env;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::{info, warn, Level};
+
+#[derive(Parser, Debug)]
+#[command(name = "monad-arb-bot")]
+#[command(about = "Monad Arbitrage Bot - 0x vs Direct Pool Strategy")]
+struct Args {
+    /// Run a single test trade (sell MON via 0x)
+    #[arg(long)]
+    test_trade: bool,
+
+    /// Run a full arbitrage test (buy on Uniswap + sell via 0x)
+    #[arg(long)]
+    test_arb: bool,
+
+    /// Amount of MON to trade in test-trade mode
+    #[arg(long, default_value = "10.0")]
+    trade_amount: f64,
+
+    /// Amount of USDC to use in test-arb mode
+    #[arg(long, default_value = "5.0")]
+    usdc_amount: f64,
+
+    /// Uniswap pool fee tier in basis points (500=0.05%, 3000=0.3%, 10000=1%)
+    #[arg(long, default_value = "500")]
+    pool_fee: u32,
+
+    /// Slippage tolerance in basis points (100 = 1%)
+    #[arg(long, default_value = "100")]
+    slippage_bps: u32,
+}
 
 #[derive(Debug)]
 struct ArbOpportunity {
@@ -53,9 +89,9 @@ fn check_arbitrage(
     // Check minimum spread
     if spread_pct.abs() > config::MIN_SPREAD_PCT {
         let direction = if spread_pct > 0.0 {
-            format!("BUY on {} → SELL via 0x", pool_name)
+            format!("BUY on {} -> SELL via 0x", pool_name)
         } else {
-            format!("BUY via 0x → SELL on {}", pool_name)
+            format!("BUY via 0x -> SELL on {}", pool_name)
         };
 
         Some(ArbOpportunity {
@@ -72,31 +108,126 @@ fn check_arbitrage(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .init();
 
     dotenvy::dotenv().ok();
 
-    println!("==========================================");
-    println!("  Monad Arbitrage Bot");
-    println!("  Strategy: 0x API vs Direct Pools");
-    println!("  Pair: MON/USDC");
-    println!("==========================================\n");
+    // Setup wallet from private key
+    let private_key = env::var("PRIVATE_KEY")
+        .map_err(|_| eyre::eyre!("PRIVATE_KEY not set in .env"))?;
 
-    // HTTP RPC is sufficient (no WebSocket needed)
+    let signer: PrivateKeySigner = private_key.parse()?;
+    let eth_wallet = EthereumWallet::from(signer);
+
     let rpc_url = env::var("MONAD_RPC_URL")
         .unwrap_or_else(|_| "https://monad-mainnet.g.alchemy.com/v2/YOUR_KEY".to_string());
 
     let provider = ProviderBuilder::new()
+        .wallet(eth_wallet.clone())
         .connect_http(rpc_url.parse()?);
 
-    let chain_id = provider.get_chain_id().await?;
-    info!("Connected to chain {}", chain_id);
+    let wallet_addr = eth_wallet.default_signer().address();
+
+    println!("==========================================");
+    println!("  Monad Arbitrage Bot");
+    println!("  Wallet: {:?}", wallet_addr);
+    println!("==========================================\n");
 
     // Initialize 0x API client (requires ZRX_API_KEY env var)
     let zrx = zrx::ZrxClient::new()?;
     info!("0x API client initialized");
+
+    // ========== TEST TRADE MODE ==========
+    if args.test_trade {
+        println!("TEST TRADE MODE");
+        println!("Amount: {} MON", args.trade_amount);
+        println!(
+            "Slippage: {}bps ({}%)",
+            args.slippage_bps,
+            args.slippage_bps as f64 / 100.0
+        );
+
+        // Get initial balance
+        let initial =
+            wallet::get_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+
+        println!("\n Starting Balance:");
+        initial.print();
+
+        let params = trader::TradeParams {
+            amount_mon: args.trade_amount,
+            slippage_bps: args.slippage_bps,
+            min_profit_bps: 30,
+        };
+
+        // Execute test trade (sell MON via 0x)
+        let report = trader::execute_0x_sell(&provider, &eth_wallet, &zrx, &params).await?;
+        report.print();
+
+        // Final balance
+        let final_balance =
+            wallet::get_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+
+        println!(" Final Balance:");
+        final_balance.print();
+
+        println!(" Test trade complete!");
+        return Ok(());
+    }
+
+    // ========== TEST ARBITRAGE MODE ==========
+    if args.test_arb {
+        println!("ARBITRAGE TEST MODE");
+        println!("Strategy: BUY on Uniswap -> SELL via 0x");
+        println!("USDC Amount: ${}", args.usdc_amount);
+        println!("Pool Fee: {}bps", args.pool_fee);
+        println!(
+            "Slippage: {}bps ({}%)",
+            args.slippage_bps,
+            args.slippage_bps as f64 / 100.0
+        );
+
+        // Get initial balance
+        let initial =
+            wallet::get_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+
+        println!("\n Starting Balance:");
+        initial.print();
+
+        // Convert USDC amount to 6 decimals
+        let usdc_amount = U256::from((args.usdc_amount * 1_000_000.0) as u128);
+
+        // Execute full arbitrage: BUY on Uniswap -> SELL via 0x
+        let report = execution::execute_arbitrage(
+            &provider,
+            &eth_wallet,
+            &zrx,
+            usdc_amount,
+            args.pool_fee,     // Uniswap pool fee tier
+            args.slippage_bps, // 0x slippage
+        )
+        .await?;
+
+        report.print();
+
+        // Final balance
+        let final_balance =
+            wallet::get_balances(&provider, wallet_addr, config::WMON, config::USDC).await?;
+
+        println!(" Final Balance:");
+        final_balance.print();
+
+        println!(" Arbitrage test complete!");
+        return Ok(());
+    }
+
+    // ========== MONITORING MODE (Default) ==========
+    println!("Strategy: 0x API vs Direct Pools");
+    println!("Pair: MON/USDC\n");
 
     // Determine token0 for price calculation
     let wmon = config::WMON.to_lowercase();
@@ -107,14 +238,17 @@ async fn main() -> Result<()> {
     // Discover Uniswap MON/USDC pool (try different fee tiers)
     println!("Discovering Uniswap MON/USDC pool...");
     let mut uniswap_pool: Option<String> = None;
-    for fee in [500u32, 3000, 10000] {  // 0.05%, 0.3%, 1%
+    for fee in [500u32, 3000, 10000] {
+        // 0.05%, 0.3%, 1%
         if let Some(pool) = pools::discover_pool(
             &provider,
             config::UNISWAP_FACTORY,
             config::WMON,
             config::USDC,
             fee,
-        ).await? {
+        )
+        .await?
+        {
             let pool_str = format!("{:?}", pool);
             if pools::has_liquidity(&provider, &pool_str).await? {
                 info!("Found Uniswap MON/USDC pool: {} (fee: {})", pool_str, fee);
@@ -148,9 +282,11 @@ async fn main() -> Result<()> {
         // Get Uniswap direct pool price
         let uniswap_price = match pools::get_pool_price(
             &provider,
-            &uniswap_pool,  // Use discovered pool
+            &uniswap_pool, // Use discovered pool
             token0_is_mon,
-        ).await {
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 warn!("Uniswap pool error: {}", e);
@@ -171,11 +307,5 @@ async fn main() -> Result<()> {
         if let Some(arb) = check_arbitrage(zrx_price, uniswap_price, "Uniswap") {
             arb.print();
         }
-
-        // TODO: Add PancakeSwap pool comparison here
-        // let pancake_price = pools::get_pool_price(...).await?;
-        // if let Some(arb) = check_arbitrage(zrx_price, pancake_price, "PancakeSwap") {
-        //     arb.print();
-        // }
     }
 }

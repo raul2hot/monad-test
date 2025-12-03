@@ -19,7 +19,20 @@ pub const PANCAKE_MON_USDC_POOL: &str = "DISCOVER_AT_RUNTIME"; // Query from Fac
 // 0x Swap API (Primary Aggregator)
 pub const ZRX_API_BASE: &str = "https://api.0x.org";
 pub const ZRX_PRICE_ENDPOINT: &str = "/swap/allowance-holder/price";
+pub const ZRX_QUOTE_ENDPOINT: &str = "/swap/allowance-holder/quote";
+
+// Uniswap V3 SwapRouter02 - VERIFIED from MonadVision
+pub const UNISWAP_SWAP_ROUTER: &str = "0xfE31F71C1b106EAc32F1A19239c9a9A72ddfb900";
+
+// 0x AllowanceHolder - VERIFIED (same address on all EVM chains)
+pub const ALLOWANCE_HOLDER: &str = "0x0000000000001fF3684f28c67538d4D072C22734";
 
 // Thresholds
 pub const MIN_SPREAD_PCT: f64 = 0.5;
 pub const MAX_SPREAD_PCT: f64 = 10.0;
+
+// Execution settings
+pub const DEFAULT_SLIPPAGE_BPS: u32 = 100;  // 1%
+pub const DEFAULT_POOL_FEE: u32 = 500;      // 0.05% fee tier (most common for stables)
+pub const GAS_BUFFER: u64 = 5_000;
+pub const GAS_PRICE_BUMP_PCT: u64 = 110;    // 10% bump
