@@ -379,6 +379,314 @@ impl ArbTradeReport {
     }
 }
 
+// ========== PARALLEL EXECUTION STRUCTS ==========
+
+#[derive(Debug)]
+pub struct PendingLegResult {
+    pub tx_hash: alloy::primitives::TxHash,
+    pub success: bool,
+    pub gas_used: u128,
+    pub gas_limit: u64,
+    pub submit_latency_ms: u64,      // Time to submit tx
+    pub confirmation_time_ms: u64,   // Time until confirmed
+    pub leg_name: String,
+}
+
+impl PendingLegResult {
+    pub fn print(&self) {
+        println!("  {} | Tx: {:?}", self.leg_name, self.tx_hash);
+        println!("    Status: {}", if self.success { "SUCCESS" } else { "FAILED" });
+        println!("    Submit Latency: {}ms", self.submit_latency_ms);
+        println!("    Confirmation: {}ms", self.confirmation_time_ms);
+        println!("    Gas: {} / {}", self.gas_used, self.gas_limit);
+    }
+}
+
+#[derive(Debug)]
+pub struct ParallelArbReport {
+    pub leg_a_result: PendingLegResult,  // Uniswap BUY
+    pub leg_b_result: PendingLegResult,  // 0x SELL
+    pub balances_before: crate::wallet::FullWalletInfo,
+    pub balances_after: crate::wallet::FullWalletInfo,
+    pub usdc_input: f64,                 // USDC spent on Uniswap
+    pub wmon_input: f64,                 // WMON sold via 0x
+    pub usdc_change: f64,                // Net USDC change (profit/loss)
+    pub wmon_change: f64,                // Net WMON change (should be ~0)
+    pub total_execution_time_ms: u64,    // Wall clock time for entire operation
+    pub expected_usdc_from_0x: f64,
+}
+
+impl ParallelArbReport {
+    pub fn print(&self) {
+        println!("\n=====================================================");
+        println!("       PARALLEL ARBITRAGE EXECUTION REPORT           ");
+        println!("=====================================================");
+
+        println!("\n TIMING");
+        println!("  Total Execution Time: {}ms", self.total_execution_time_ms);
+        println!("  Leg A Submit: {}ms | Confirm: {}ms",
+            self.leg_a_result.submit_latency_ms,
+            self.leg_a_result.confirmation_time_ms);
+        println!("  Leg B Submit: {}ms | Confirm: {}ms",
+            self.leg_b_result.submit_latency_ms,
+            self.leg_b_result.confirmation_time_ms);
+
+        println!("\n LEG A: UNISWAP BUY (USDC -> WMON)");
+        self.leg_a_result.print();
+
+        println!("\n LEG B: 0x SELL (WMON -> USDC)");
+        self.leg_b_result.print();
+
+        println!("\n BALANCES BEFORE");
+        self.balances_before.print();
+
+        println!("\n BALANCES AFTER");
+        self.balances_after.print();
+
+        println!("\n INPUTS");
+        println!("  USDC Spent (Uniswap): {:.6}", self.usdc_input);
+        println!("  WMON Sold (0x):       {:.6}", self.wmon_input);
+        println!("  Expected USDC (0x):   {:.6}", self.expected_usdc_from_0x);
+
+        println!("\n NET RESULT");
+        println!("  USDC Change: {:+.6}", self.usdc_change);
+        println!("  WMON Change: {:+.6}", self.wmon_change);
+
+        let both_success = self.leg_a_result.success && self.leg_b_result.success;
+        println!("\n STATUS: {}", if both_success { "BOTH LEGS SUCCESS" } else { "ONE OR MORE LEGS FAILED" });
+
+        // Calculate effective spread if both succeeded
+        if both_success && self.usdc_input > 0.0 {
+            // Spread = net USDC change / USDC spent
+            let spread_pct = (self.usdc_change / self.usdc_input) * 100.0;
+            println!("  Effective Spread: {:+.4}%", spread_pct);
+        }
+
+        println!("\n TOTAL GAS COST");
+        let total_gas = self.leg_a_result.gas_used + self.leg_b_result.gas_used;
+        println!("  Total Gas Used: {}", total_gas);
+
+        println!("=====================================================\n");
+    }
+}
+
+// ========== PARALLEL EXECUTION FUNCTIONS ==========
+
+/// Submit Uniswap BUY transaction and wait for confirmation
+/// Used as a spawned task in parallel execution
+async fn execute_uniswap_buy_no_wait<P: Provider>(
+    provider: &P,
+    wallet: &EthereumWallet,
+    usdc_amount: U256,
+    min_mon_out: U256,
+    pool_fee: u32,
+) -> Result<PendingLegResult> {
+    let from = wallet.default_signer().address();
+    let router = Address::from_str(crate::config::UNISWAP_SWAP_ROUTER)?;
+    let usdc = Address::from_str(crate::config::USDC)?;
+    let wmon = Address::from_str(crate::config::WMON)?;
+
+    let params = ExactInputSingleParams {
+        tokenIn: usdc,
+        tokenOut: wmon,
+        fee: pool_fee.try_into()?,
+        recipient: from,
+        amountIn: usdc_amount,
+        amountOutMinimum: min_mon_out,
+        sqrtPriceLimitX96: U160::ZERO,
+    };
+
+    let call = exactInputSingleCall { params };
+    let gas_limit = 500_000u64;
+
+    let tx = TransactionRequest::default()
+        .to(router)
+        .input(call.abi_encode().into())
+        .from(from)
+        .gas_limit(gas_limit);
+
+    let submit_time = std::time::Instant::now();
+
+    let pending = provider.send_transaction(tx).await?;
+    let tx_hash = *pending.tx_hash();
+
+    let submit_latency = submit_time.elapsed();
+
+    tracing::info!("Leg A (Uniswap BUY) submitted: {:?} in {}ms", tx_hash, submit_latency.as_millis());
+
+    // Now wait for receipt
+    let receipt = pending.get_receipt().await?;
+    let total_time = submit_time.elapsed();
+
+    Ok(PendingLegResult {
+        tx_hash,
+        success: receipt.status(),
+        gas_used: receipt.gas_used as u128,
+        gas_limit,
+        submit_latency_ms: submit_latency.as_millis() as u64,
+        confirmation_time_ms: total_time.as_millis() as u64,
+        leg_name: "Uniswap BUY".to_string(),
+    })
+}
+
+/// Submit 0x SELL transaction and wait for confirmation
+/// Used as a spawned task in parallel execution
+async fn execute_0x_swap_no_wait<P: Provider>(
+    provider: &P,
+    wallet: &EthereumWallet,
+    quote: &crate::zrx::QuoteResponse,
+) -> Result<PendingLegResult> {
+    let from = wallet.default_signer().address();
+
+    let to = Address::from_str(&quote.transaction.to)?;
+    let data: Bytes = quote.transaction.data.parse()?;
+    let gas_limit: u64 = quote.transaction.gas.parse()?;
+    let gas_price: u128 = quote.transaction.gas_price.parse()?;
+    let value: U256 = quote.transaction.value.parse()?;
+
+    let adjusted_gas_limit = gas_limit + crate::config::GAS_BUFFER;
+    let adjusted_gas_price = gas_price * crate::config::GAS_PRICE_BUMP_PCT as u128 / 100;
+
+    let tx = TransactionRequest::default()
+        .to(to)
+        .input(data.into())
+        .value(value)
+        .gas_limit(adjusted_gas_limit)
+        .gas_price(adjusted_gas_price)
+        .from(from);
+
+    let submit_time = std::time::Instant::now();
+
+    let pending = provider.send_transaction(tx).await?;
+    let tx_hash = *pending.tx_hash();
+
+    let submit_latency = submit_time.elapsed();
+
+    tracing::info!("Leg B (0x SELL) submitted: {:?} in {}ms", tx_hash, submit_latency.as_millis());
+
+    // Now wait for receipt
+    let receipt = pending.get_receipt().await?;
+    let total_time = submit_time.elapsed();
+
+    Ok(PendingLegResult {
+        tx_hash,
+        success: receipt.status(),
+        gas_used: receipt.gas_used as u128,
+        gas_limit: adjusted_gas_limit,
+        submit_latency_ms: submit_latency.as_millis() as u64,
+        confirmation_time_ms: total_time.as_millis() as u64,
+        leg_name: "0x SELL".to_string(),
+    })
+}
+
+/// Execute parallel arbitrage: BUY on Uniswap AND SELL via 0x simultaneously
+/// Requires inventory of BOTH WMON and USDC
+pub async fn execute_parallel_arbitrage<P: Provider + Clone + 'static>(
+    provider: &P,
+    wallet: &EthereumWallet,
+    zrx: &crate::zrx::ZrxClient,
+    usdc_amount: U256,      // Amount of USDC to spend on Uniswap BUY
+    wmon_amount: U256,      // Amount of WMON to sell via 0x
+    pool_fee: u32,          // Uniswap pool fee tier
+    slippage_bps: u32,      // Slippage for both legs
+) -> Result<ParallelArbReport> {
+    let wallet_addr = wallet.default_signer().address();
+    let start_time = std::time::Instant::now();
+
+    // Get balances BEFORE
+    let balances_before = crate::wallet::get_full_balances(
+        provider,
+        wallet_addr,
+        crate::config::WMON,
+        crate::config::USDC,
+    ).await?;
+
+    println!("\n========== PARALLEL ARBITRAGE ==========");
+    println!("Strategy: BUY on Uniswap + SELL via 0x (simultaneous)");
+    println!("USDC Input (Uniswap): {}", usdc_amount);
+    println!("WMON Input (0x):      {}", wmon_amount);
+    balances_before.print();
+
+    // PRE-FLIGHT: Get 0x quote BEFORE firing transactions
+    // This is needed to build the 0x transaction
+    let sell_quote = zrx.get_quote(
+        crate::config::WMON,
+        crate::config::USDC,
+        &wmon_amount.to_string(),
+        &format!("{:?}", wallet_addr),
+        slippage_bps,
+    ).await?;
+
+    // Calculate expected outputs for reporting
+    let expected_usdc_from_0x: f64 = sell_quote.buy_amount.parse::<f64>().unwrap_or(0.0) / 1e6;
+
+    println!("\nExpected USDC from 0x: {:.6}", expected_usdc_from_0x);
+
+    // ========== FIRE BOTH LEGS SIMULTANEOUSLY ==========
+    let provider_a = provider.clone();
+    let wallet_a = wallet.clone();
+    let usdc_amt = usdc_amount;
+    let fee = pool_fee;
+
+    let provider_b = provider.clone();
+    let wallet_b = wallet.clone();
+    let quote = sell_quote;
+
+    // Spawn Leg A: Uniswap BUY
+    let leg_a_handle = tokio::spawn(async move {
+        execute_uniswap_buy_no_wait(
+            &provider_a,
+            &wallet_a,
+            usdc_amt,
+            U256::ZERO,  // min_out - set to 0 for now, can add slippage protection
+            fee,
+        ).await
+    });
+
+    // Spawn Leg B: 0x SELL
+    let leg_b_handle = tokio::spawn(async move {
+        execute_0x_swap_no_wait(&provider_b, &wallet_b, &quote).await
+    });
+
+    // Wait for BOTH to complete
+    let (leg_a_result, leg_b_result) = tokio::join!(leg_a_handle, leg_b_handle);
+
+    let leg_a = leg_a_result??;
+    let leg_b = leg_b_result??;
+
+    let execution_time = start_time.elapsed();
+
+    // Get balances AFTER
+    let balances_after = crate::wallet::get_full_balances(
+        provider,
+        wallet_addr,
+        crate::config::WMON,
+        crate::config::USDC,
+    ).await?;
+
+    // Calculate results
+    let usdc_before_f64 = balances_before.usdc_balance.to_string().parse::<f64>().unwrap_or(0.0) / 1e6;
+    let usdc_after_f64 = balances_after.usdc_balance.to_string().parse::<f64>().unwrap_or(0.0) / 1e6;
+    let wmon_before_f64 = balances_before.wmon_balance.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
+    let wmon_after_f64 = balances_after.wmon_balance.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
+
+    let usdc_change = usdc_after_f64 - usdc_before_f64;
+    let wmon_change = wmon_after_f64 - wmon_before_f64;
+
+    Ok(ParallelArbReport {
+        leg_a_result: leg_a,
+        leg_b_result: leg_b,
+        balances_before,
+        balances_after,
+        usdc_input: usdc_amount.to_string().parse::<f64>().unwrap_or(0.0) / 1e6,
+        wmon_input: wmon_amount.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
+        usdc_change,
+        wmon_change,
+        total_execution_time_ms: execution_time.as_millis() as u64,
+        expected_usdc_from_0x,
+    })
+}
+
 /// Execute full arbitrage: BUY on Uniswap, SELL via 0x
 /// This is the SRS-compliant implementation
 pub async fn execute_arbitrage<P: Provider>(

@@ -61,6 +61,14 @@ struct Args {
     /// Slippage tolerance in basis points (100 = 1%)
     #[arg(long, default_value = "100")]
     slippage_bps: u32,
+
+    /// Run parallel arbitrage test (both legs simultaneously)
+    #[arg(long)]
+    test_parallel: bool,
+
+    /// Amount of WMON to sell via 0x in parallel mode
+    #[arg(long, default_value = "10.0")]
+    wmon_amount: f64,
 }
 
 #[derive(Debug)]
@@ -321,6 +329,57 @@ async fn main() -> Result<()> {
         final_balance.print();
 
         println!(" Arbitrage test complete!");
+        return Ok(());
+    }
+
+    // ========== PARALLEL ARBITRAGE TEST MODE ==========
+    if args.test_parallel {
+        println!("PARALLEL ARBITRAGE TEST MODE");
+        println!("Strategy: BUY on Uniswap + SELL via 0x (SIMULTANEOUS)");
+        println!("USDC Amount (Uniswap BUY): ${}", args.usdc_amount);
+        println!("WMON Amount (0x SELL): {}", args.wmon_amount);
+        println!("Pool Fee: {}bps", args.pool_fee);
+        println!("Slippage: {}bps ({}%)", args.slippage_bps, args.slippage_bps as f64 / 100.0);
+
+        // Ensure approvals are done BEFORE parallel execution
+        println!("\n Checking approvals...");
+
+        // USDC approval to SwapRouter
+        let usdc_amount = U256::from((args.usdc_amount * 1_000_000.0) as u128);
+        execution::ensure_approval(
+            &provider,
+            &eth_wallet,
+            config::USDC,
+            config::UNISWAP_SWAP_ROUTER,
+            usdc_amount,
+        ).await?;
+
+        // WMON approval to AllowanceHolder
+        let wmon_amount = U256::from((args.wmon_amount * 1e18) as u128);
+        execution::ensure_approval(
+            &provider,
+            &eth_wallet,
+            config::WMON,
+            config::ALLOWANCE_HOLDER,
+            wmon_amount,
+        ).await?;
+
+        println!(" Approvals confirmed. Executing parallel arbitrage...\n");
+
+        // Execute parallel arbitrage
+        let report = execution::execute_parallel_arbitrage(
+            &provider,
+            &eth_wallet,
+            &zrx,
+            usdc_amount,
+            wmon_amount,
+            args.pool_fee,
+            args.slippage_bps,
+        ).await?;
+
+        report.print();
+
+        println!(" Parallel arbitrage test complete!");
         return Ok(());
     }
 
