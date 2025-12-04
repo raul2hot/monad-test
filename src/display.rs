@@ -52,6 +52,24 @@ pub fn calculate_spreads(prices: &[PoolPrice]) -> Vec<SpreadOpportunity> {
     spreads
 }
 
+/// Log arb opportunities with net spread > 0.1% to stderr
+fn log_arb_opportunities(spreads: &[SpreadOpportunity], timestamp: &str) {
+    for spread in spreads.iter() {
+        if spread.net_spread_pct > 0.1 {
+            eprintln!(
+                "[{}] ARB DETECTED | {} → {} | Gross: {:.2}% | Net: {:.2}% | Buy: {:.5} | Sell: {:.5}",
+                timestamp,
+                spread.buy_pool,
+                spread.sell_pool,
+                spread.gross_spread_pct,
+                spread.net_spread_pct,
+                spread.buy_price,
+                spread.sell_price
+            );
+        }
+    }
+}
+
 /// Clears the terminal screen
 pub fn clear_screen() {
     print!("\x1B[2J\x1B[1;1H");
@@ -118,6 +136,9 @@ pub fn display_prices(prices: &[PoolPrice], elapsed_ms: u128) {
 
     // Spread opportunities
     let spreads = calculate_spreads(&sorted_prices);
+
+    // Log profitable arb opportunities (net > 0.1%) to stderr so they persist
+    log_arb_opportunities(&spreads, &timestamp.to_string());
 
     println!(
         "\x1b[1;36m{}\x1b[0m",
