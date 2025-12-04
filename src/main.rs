@@ -15,8 +15,7 @@ use config::{get_all_pools, get_lfj_pool, get_monday_trade_pool, get_v3_pools, P
 use display::display_prices;
 use multicall::fetch_prices_batched;
 use pools::{
-    create_lfj_active_id_call, create_lfj_bin_step_call, create_monday_reserves_call,
-    create_slot0_call, PriceCall,
+    create_lfj_active_id_call, create_lfj_bin_step_call, create_slot0_call, PriceCall,
 };
 
 #[tokio::main]
@@ -58,9 +57,9 @@ async fn main() -> Result<()> {
     price_calls.push(create_lfj_active_id_call(&lfj_pool));
     price_calls.push(create_lfj_bin_step_call(&lfj_pool));
 
-    // Monday Trade uses getReserves()
+    // Monday Trade uses slot0() (V3-style, inspired by Uniswap V3)
     let monday_pool = get_monday_trade_pool();
-    price_calls.push(create_monday_reserves_call(&monday_pool));
+    price_calls.push(create_slot0_call(&monday_pool));
 
     // Polling loop
     let mut poll_interval = interval(Duration::from_millis(POLL_INTERVAL_MS));

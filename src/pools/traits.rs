@@ -3,10 +3,9 @@ use alloy::primitives::{Address, Bytes};
 /// Type of call for decoding purposes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallType {
-    V3Slot0,
+    V3Slot0, // Used for Uniswap V3, PancakeSwap V3, and Monday Trade (all V3-style)
     LfjActiveId,
     LfjBinStep,
-    MondayReserves,
 }
 
 /// Represents the calldata needed to fetch price from a pool

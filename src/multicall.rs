@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::config::MULTICALL3_ADDRESS;
 use crate::pools::{
     calculate_lfj_price, decode_active_id_response, decode_bin_step_response,
-    decode_reserves_to_price, decode_slot0_to_price, CallType, PoolPrice, PriceCall,
+    decode_slot0_to_price, CallType, PoolPrice, PriceCall,
 };
 
 // Multicall3 interface
@@ -128,23 +128,6 @@ pub async fn fetch_prices_batched<P: Provider>(
                     Err(e) => {
                         debug!(
                             "Failed to decode LFJ binStep for {}: {}",
-                            price_calls[i].pool_name, e
-                        );
-                    }
-                }
-            }
-            CallType::MondayReserves => {
-                match decode_reserves_to_price(&res.returnData) {
-                    Ok(price) => {
-                        prices.push(PoolPrice {
-                            pool_name: price_calls[i].pool_name.clone(),
-                            price,
-                            fee_bps: price_calls[i].fee_bps,
-                        });
-                    }
-                    Err(e) => {
-                        debug!(
-                            "Failed to decode Monday reserves for {}: {}",
                             price_calls[i].pool_name, e
                         );
                     }

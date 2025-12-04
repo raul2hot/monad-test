@@ -17,7 +17,7 @@ pub enum PoolType {
     UniswapV3,
     PancakeV3,
     LiquidityBook, // LFJ - TraderJoe style
-    MondayTrade,   // Unknown type - will try V2 style
+    MondayTrade,   // V3-style (inspired by Uniswap V3, uses slot0())
 }
 
 #[derive(Debug, Clone)]
