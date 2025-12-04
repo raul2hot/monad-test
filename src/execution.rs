@@ -17,7 +17,7 @@ pub fn estimate_trade_profitability(
     mon_price_usdc: f64,
 ) -> (f64, bool) {
     // Estimated gas usage (conservative safe limits)
-    const UNISWAP_GAS: u64 = 250_000;  // Safe limit for V3 single swap
+    const UNISWAP_GAS: u64 = 400_000;  // exactOutput needs more gas
     const ZRX_GAS: u64 = 200_000;      // Typical 0x swap (varies by routing)
     const TOTAL_GAS: u64 = UNISWAP_GAS + ZRX_GAS;
 
@@ -81,7 +81,7 @@ pub fn validate_0x_gas(quoted_gas: u64) -> Result<(), String> {
     }
 
     // Also check total gas (0x + Uniswap)
-    const UNISWAP_GAS: u64 = 250_000;
+    const UNISWAP_GAS: u64 = 400_000;
     let total_gas = quoted_gas + UNISWAP_GAS;
     if total_gas > crate::config::MAX_TOTAL_GAS {
         return Err(format!(
@@ -373,7 +373,7 @@ pub async fn execute_uniswap_buy<P: Provider>(
     let call = exactInputSingleCall { params };
 
     // CRITICAL: Monad charges full gas_limit - safe reduction saves real money
-    let gas_limit = 250_000u64;  // Safe value - typical V3 single swap uses 150-180k, buffer for edge cases
+    let gas_limit = 400_000u64;  // exactOutput needs more gas than exactInput
     let tx = TransactionRequest::default()
         .to(router)
         .input(call.abi_encode().into())
@@ -601,7 +601,7 @@ async fn execute_uniswap_buy_no_wait<P: Provider>(
     };
 
     let call = exactInputSingleCall { params };
-    let gas_limit = 250_000u64;  // Safe value - typical V3 single swap uses 150-180k, buffer for edge cases
+    let gas_limit = 400_000u64;  // exactOutput needs more gas than exactInput
 
     let tx = TransactionRequest::default()
         .to(router)
@@ -661,7 +661,7 @@ async fn execute_uniswap_buy_exact_output_no_wait<P: Provider>(
     };
 
     let call = exactOutputSingleCall { params };
-    let gas_limit = 250_000u64;
+    let gas_limit = 400_000u64;  // exactOutput needs more gas than exactInput
 
     let tx = TransactionRequest::default()
         .to(router)

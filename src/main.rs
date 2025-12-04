@@ -621,7 +621,7 @@ async fn main() -> Result<()> {
 
                     // ========== Profitability check with ACTUAL gas from quote ==========
                     let trade_value_usdc = args.wmon_amount * uniswap_price;
-                    const UNISWAP_GAS: u64 = 250_000;
+                    const UNISWAP_GAS: u64 = 400_000;
                     let (est_gas_mon, net_profit_usdc, is_profitable) = execution::estimate_trade_profitability_with_quote(
                         spread_pct,
                         trade_value_usdc,
