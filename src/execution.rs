@@ -116,6 +116,21 @@ sol! {
 
     function exactInputSingle(ExactInputSingleParams calldata params)
         external payable returns (uint256 amountOut);
+
+    // Uniswap V3 SwapRouter02 exactOutputSingle
+    // Used to buy an EXACT amount of tokenOut, spending up to amountInMaximum of tokenIn
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountOut;        // The exact amount we want to receive
+        uint256 amountInMaximum;  // Max we're willing to spend
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactOutputSingle(ExactOutputSingleParams calldata params)
+        external payable returns (uint256 amountIn);
 }
 
 #[derive(Debug)]
@@ -530,14 +545,15 @@ impl ParallelArbReport {
         println!("\n BALANCES AFTER");
         self.balances_after.print();
 
-        println!("\n INPUTS");
-        println!("  USDC Spent (Uniswap): {:.6}", self.usdc_input);
-        println!("  WMON Sold (0x):       {:.6}", self.wmon_input);
-        println!("  Expected USDC (0x):   {:.6}", self.expected_usdc_from_0x);
+        println!("\n TRADE AMOUNTS (exactOutput ensures match)");
+        println!("  WMON Bought (Uniswap): {:.6}", self.wmon_input);
+        println!("  WMON Sold (0x):        {:.6}", self.wmon_input);
+        println!("  USDC Spent (Uniswap):  {:.6}", self.usdc_input);
+        println!("  Expected USDC (0x):    {:.6}", self.expected_usdc_from_0x);
 
         println!("\n NET RESULT");
-        println!("  USDC Change: {:+.6}", self.usdc_change);
-        println!("  WMON Change: {:+.6}", self.wmon_change);
+        println!("  WMON Change: {:+.6} (should be ~0)", self.wmon_change);
+        println!("  USDC Change: {:+.6} (this is the profit/loss)", self.usdc_change);
 
         let both_success = self.leg_a_result.success && self.leg_b_result.success;
         println!("\n STATUS: {}", if both_success { "BOTH LEGS SUCCESS" } else { "ONE OR MORE LEGS FAILED" });
@@ -615,6 +631,69 @@ async fn execute_uniswap_buy_no_wait<P: Provider>(
         submit_latency_ms: submit_latency.as_millis() as u64,
         confirmation_time_ms: total_time.as_millis() as u64,
         leg_name: "Uniswap BUY".to_string(),
+    })
+}
+
+/// Submit Uniswap BUY transaction using exactOutputSingle (buy EXACT amount of WMON)
+/// This ensures WMON amounts match between buy and sell legs
+/// Used as a spawned task in parallel execution
+async fn execute_uniswap_buy_exact_output_no_wait<P: Provider>(
+    provider: &P,
+    wallet: &EthereumWallet,
+    wmon_amount_out: U256,    // Exact WMON we want to receive
+    max_usdc_in: U256,        // Maximum USDC we're willing to spend
+    pool_fee: u32,
+    nonce: u64,
+) -> Result<PendingLegResult> {
+    let from = wallet.default_signer().address();
+    let router = Address::from_str(crate::config::UNISWAP_SWAP_ROUTER)?;
+    let usdc = Address::from_str(crate::config::USDC)?;
+    let wmon = Address::from_str(crate::config::WMON)?;
+
+    let params = ExactOutputSingleParams {
+        tokenIn: usdc,
+        tokenOut: wmon,
+        fee: pool_fee.try_into()?,
+        recipient: from,
+        amountOut: wmon_amount_out,      // Exact WMON we want
+        amountInMaximum: max_usdc_in,    // Max USDC to spend (with slippage buffer)
+        sqrtPriceLimitX96: U160::ZERO,
+    };
+
+    let call = exactOutputSingleCall { params };
+    let gas_limit = 250_000u64;
+
+    let tx = TransactionRequest::default()
+        .to(router)
+        .input(call.abi_encode().into())
+        .from(from)
+        .gas_limit(gas_limit)
+        .nonce(nonce);
+
+    let submit_time = std::time::Instant::now();
+
+    let pending = provider.send_transaction(tx).await?;
+    let tx_hash = *pending.tx_hash();
+
+    let submit_latency = submit_time.elapsed();
+
+    tracing::info!(
+        "Leg A (Uniswap BUY exactOutput) submitted: {:?} in {}ms",
+        tx_hash,
+        submit_latency.as_millis()
+    );
+
+    let receipt = pending.get_receipt().await?;
+    let total_time = submit_time.elapsed();
+
+    Ok(PendingLegResult {
+        tx_hash,
+        success: receipt.status(),
+        gas_used: receipt.gas_used as u128,
+        gas_limit,
+        submit_latency_ms: submit_latency.as_millis() as u64,
+        confirmation_time_ms: total_time.as_millis() as u64,
+        leg_name: "Uniswap BUY (exactOutput)".to_string(),
     })
 }
 
@@ -706,11 +785,16 @@ pub async fn execute_parallel_arbitrage<P: Provider + Clone + 'static>(
 
 /// Execute parallel arbitrage with a pre-fetched 0x quote
 /// This avoids double-fetching the quote when gas validation is done first
+///
+/// CRITICAL FIX: Uses exactOutputSingle to ensure WMON amounts match between legs
+/// - Leg A: Buy EXACTLY wmon_amount on Uniswap (spend variable USDC)
+/// - Leg B: Sell EXACTLY wmon_amount via 0x (receive USDC)
+/// Result: WMON inventory unchanged, profit/loss is purely in USDC
 pub async fn execute_parallel_arbitrage_with_quote<P: Provider + Clone + 'static>(
     provider: &P,
     wallet: &EthereumWallet,
-    usdc_amount: U256,      // Amount of USDC to spend on Uniswap BUY
-    wmon_amount: U256,      // Amount of WMON to sell via 0x
+    _usdc_amount: U256,     // Deprecated: now calculated from quote with buffer
+    wmon_amount: U256,      // Amount of WMON to buy/sell (MUST MATCH on both legs)
     pool_fee: u32,          // Uniswap pool fee tier
     sell_quote: crate::zrx::QuoteResponse,  // Pre-fetched 0x quote
 ) -> Result<ParallelArbReport> {
@@ -732,38 +816,45 @@ pub async fn execute_parallel_arbitrage_with_quote<P: Provider + Clone + 'static
         crate::config::USDC,
     ).await?;
 
-    println!("\n========== PARALLEL ARBITRAGE ==========");
-    println!("Strategy: BUY on Uniswap + SELL via 0x (simultaneous)");
-    println!("USDC Input (Uniswap): {}", usdc_amount);
-    println!("WMON Input (0x):      {}", wmon_amount);
-    balances_before.print();
-
     // Calculate expected outputs for reporting
     let expected_usdc_from_0x: f64 = sell_quote.buy_amount.parse::<f64>().unwrap_or(0.0) / 1e6;
 
-    println!("\nExpected USDC from 0x: {:.6}", expected_usdc_from_0x);
+    // CRITICAL: Calculate max USDC to spend with slippage buffer (2%)
+    // This is used for exactOutputSingle - we specify the exact WMON we want,
+    // and set a maximum USDC we're willing to spend
+    let usdc_from_quote: u128 = sell_quote.buy_amount.parse().unwrap_or(0);
+    let max_usdc_with_buffer = U256::from((usdc_from_quote as f64 * 1.02) as u128);
+
+    println!("\n========== PARALLEL ARBITRAGE (EXACT OUTPUT) ==========");
+    println!("Strategy: BUY EXACT WMON on Uniswap + SELL EXACT WMON via 0x");
+    println!("WMON Amount (both legs): {}", wmon_amount);
+    println!("Max USDC (Uniswap):      {} (with 2% buffer)", max_usdc_with_buffer);
+    println!("Expected USDC (0x):      {:.6}", expected_usdc_from_0x);
+    balances_before.print();
 
     // ========== FIRE BOTH LEGS SIMULTANEOUSLY ==========
     let provider_a = provider.clone();
     let wallet_a = wallet.clone();
-    let usdc_amt = usdc_amount;
+    let wmon_out = wmon_amount;           // Exact WMON we want from Uniswap
+    let max_usdc = max_usdc_with_buffer;  // Max USDC to spend
     let fee = pool_fee;
-    let nonce_a = leg_a_nonce;  // Capture for move
+    let nonce_a = leg_a_nonce;
 
     let provider_b = provider.clone();
     let wallet_b = wallet.clone();
     let quote = sell_quote;
-    let nonce_b = leg_b_nonce;  // Capture for move
+    let nonce_b = leg_b_nonce;
 
-    // Spawn Leg A: Uniswap BUY
+    // Spawn Leg A: Uniswap BUY using exactOutputSingle
+    // This buys EXACTLY wmon_amount, spending up to max_usdc
     let leg_a_handle = tokio::spawn(async move {
-        execute_uniswap_buy_no_wait(
+        execute_uniswap_buy_exact_output_no_wait(
             &provider_a,
             &wallet_a,
-            usdc_amt,
-            U256::ZERO,  // min_out - set to 0 for now, can add slippage protection
+            wmon_out,      // Exact WMON we want to receive
+            max_usdc,      // Max USDC we're willing to spend
             fee,
-            nonce_a,  // Pass pre-fetched nonce
+            nonce_a,
         ).await
     });
 
@@ -797,12 +888,17 @@ pub async fn execute_parallel_arbitrage_with_quote<P: Provider + Clone + 'static
     let usdc_change = usdc_after_f64 - usdc_before_f64;
     let wmon_change = wmon_after_f64 - wmon_before_f64;
 
+    // Calculate actual USDC spent on Uniswap by looking at the balance difference
+    // This is more accurate than using max_usdc_with_buffer since exactOutputSingle
+    // only spends what's needed
+    let usdc_spent_on_uniswap = usdc_before_f64 - usdc_after_f64 + expected_usdc_from_0x;
+
     Ok(ParallelArbReport {
         leg_a_result: leg_a,
         leg_b_result: leg_b,
         balances_before,
         balances_after,
-        usdc_input: usdc_amount.to_string().parse::<f64>().unwrap_or(0.0) / 1e6,
+        usdc_input: usdc_spent_on_uniswap.max(0.0),  // Actual USDC spent (not max)
         wmon_input: wmon_amount.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
         usdc_change,
         wmon_change,
