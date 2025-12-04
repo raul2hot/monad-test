@@ -31,6 +31,14 @@ pub const ALLOWANCE_HOLDER: &str = "0x0000000000001fF3684f28c67538d4D072C22734";
 pub const MIN_SPREAD_PCT: f64 = 0.5;
 pub const MAX_SPREAD_PCT: f64 = 10.0;
 
+/// Minimum spread required at execution time (after quote fetch)
+/// This prevents executing trades where spread collapsed between detection and execution
+pub const MIN_EXECUTION_SPREAD_PCT: f64 = 0.5;
+
+/// Default spread threshold for triggering trades
+/// With 7-second confirmation times, small spreads will be arbed away before transaction lands
+pub const DEFAULT_SPREAD_THRESHOLD: f64 = 2.0;
+
 // Execution settings
 pub const DEFAULT_SLIPPAGE_BPS: u32 = 100;  // 1%
 pub const DEFAULT_POOL_FEE: u32 = 500;      // 0.05% fee tier (most common for stables)
