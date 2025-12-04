@@ -4,7 +4,7 @@ use alloy::sol_types::SolCall;
 use eyre::Result;
 
 use crate::config::PoolConfig;
-use crate::pools::traits::PriceCall;
+use crate::pools::traits::{CallType, PriceCall};
 use crate::price::sqrt_price_x96_to_price;
 
 // Define the slot0 interface for V3 pools
@@ -30,6 +30,7 @@ pub fn create_slot0_call(pool: &PoolConfig) -> PriceCall {
         pool_address: pool.address,
         calldata: Bytes::from(calldata),
         fee_bps: pool.fee_bps,
+        call_type: CallType::V3Slot0,
     }
 }
 
