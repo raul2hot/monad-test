@@ -73,7 +73,7 @@ struct Args {
     wmon_amount: f64,
 
     /// Spread threshold (%) to trigger auto-execution. 0 = monitoring only (default)
-    #[arg(long, default_value = "1.5")]
+    #[arg(long, default_value = "2.0")]
     spread_threshold: f64,
 
     /// Check transaction status by hash
@@ -643,6 +643,29 @@ async fn main() -> Result<()> {
                     }
 
                     println!("  [PROFITABLE] Est. gas: {:.4} MON, Net profit: ${:.4}", est_gas_mon, net_profit_usdc);
+
+                    // ========== STALE PRICE PROTECTION: Re-check spread before execution ==========
+                    let fresh_uniswap_price = match pools::get_pool_price(
+                        &provider,
+                        &uniswap_pool,
+                        token0_is_mon,
+                    ).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Failed to get fresh Uniswap price: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let fresh_spread = (zrx_price - fresh_uniswap_price) / fresh_uniswap_price * 100.0;
+
+                    println!("  [SPREAD CHECK] Original: {:.3}% | Fresh: {:.3}% | Decay: {:.3}%",
+                        spread_pct, fresh_spread, spread_pct - fresh_spread);
+
+                    if fresh_spread < config::MIN_EXECUTION_SPREAD_PCT {
+                        println!("  [ABORTED] Spread collapsed: {:.3}% -> {:.3}%", spread_pct, fresh_spread);
+                        continue;
+                    }
 
                     println!("\n========== SPREAD THRESHOLD TRIGGERED ==========");
                     println!("Detected: {:+.3}% > Threshold: {}%", spread_pct, args.spread_threshold);
