@@ -135,7 +135,7 @@ pub fn display_prices(prices: &[PoolPrice], elapsed_ms: u128) {
     if spreads.is_empty() {
         println!("  No spread opportunities found.");
     } else {
-        for spread in spreads.iter().take(5) {
+        for spread in spreads.iter() {
             let profit_indicator = if spread.net_spread_pct > 0.0 {
                 "\x1b[1;32m✓\x1b[0m"
             } else {
