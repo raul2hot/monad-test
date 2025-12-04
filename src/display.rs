@@ -25,26 +25,24 @@ pub fn calculate_spreads(prices: &[PoolPrice]) -> Vec<SpreadOpportunity> {
                 continue;
             }
 
-            // Buy low, sell high
-            if sell.price > buy.price {
-                let gross_spread_pct = ((sell.price - buy.price) / buy.price) * 100.0;
+            // Show all pairs (positive and negative spreads)
+            let gross_spread_pct = ((sell.price - buy.price) / buy.price) * 100.0;
 
-                // Net spread accounts for both buy and sell fees
-                let buy_fee_pct = buy.fee_bps as f64 / 100.0;
-                let sell_fee_pct = sell.fee_bps as f64 / 100.0;
-                let net_spread_pct = gross_spread_pct - buy_fee_pct - sell_fee_pct;
+            // Net spread accounts for both buy and sell fees
+            let buy_fee_pct = buy.fee_bps as f64 / 100.0;
+            let sell_fee_pct = sell.fee_bps as f64 / 100.0;
+            let net_spread_pct = gross_spread_pct - buy_fee_pct - sell_fee_pct;
 
-                spreads.push(SpreadOpportunity {
-                    buy_pool: buy.pool_name.clone(),
-                    buy_price: buy.price,
-                    buy_fee_bps: buy.fee_bps,
-                    sell_pool: sell.pool_name.clone(),
-                    sell_price: sell.price,
-                    sell_fee_bps: sell.fee_bps,
-                    gross_spread_pct,
-                    net_spread_pct,
-                });
-            }
+            spreads.push(SpreadOpportunity {
+                buy_pool: buy.pool_name.clone(),
+                buy_price: buy.price,
+                buy_fee_bps: buy.fee_bps,
+                sell_pool: sell.pool_name.clone(),
+                sell_price: sell.price,
+                sell_fee_bps: sell.fee_bps,
+                gross_spread_pct,
+                net_spread_pct,
+            });
         }
     }
 

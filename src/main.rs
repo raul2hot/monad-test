@@ -11,10 +11,12 @@ mod multicall;
 mod pools;
 mod price;
 
-use config::{get_v3_pools, POLL_INTERVAL_MS};
+use config::{get_all_pools, get_lfj_pool, get_monday_trade_pool, get_v3_pools, POLL_INTERVAL_MS};
 use display::display_prices;
 use multicall::fetch_prices_batched;
-use pools::create_slot0_call;
+use pools::{
+    create_lfj_active_id_call, create_lfj_bin_step_call, create_slot0_call, PriceCall,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,13 +39,27 @@ async fn main() -> Result<()> {
     let url: reqwest::Url = rpc_url.parse()?;
     let provider = ProviderBuilder::new().connect_http(url);
 
-    // Get V3 pool configurations
-    let v3_pools = get_v3_pools();
+    // Get all pool configurations
+    let all_pools = get_all_pools();
 
-    info!("Monitoring {} V3 pools", v3_pools.len());
+    info!("Monitoring {} pools", all_pools.len());
 
-    // Create price calls for all V3 pools
-    let price_calls: Vec<_> = v3_pools.iter().map(create_slot0_call).collect();
+    // Create price calls for all pools based on their type
+    let mut price_calls: Vec<PriceCall> = Vec::new();
+
+    // V3 pools use slot0()
+    for pool in get_v3_pools() {
+        price_calls.push(create_slot0_call(&pool));
+    }
+
+    // LFJ pool needs both getActiveId() and getBinStep()
+    let lfj_pool = get_lfj_pool();
+    price_calls.push(create_lfj_active_id_call(&lfj_pool));
+    price_calls.push(create_lfj_bin_step_call(&lfj_pool));
+
+    // Monday Trade uses slot0() (V3-style, inspired by Uniswap V3)
+    let monday_pool = get_monday_trade_pool();
+    price_calls.push(create_slot0_call(&monday_pool));
 
     // Polling loop
     let mut poll_interval = interval(Duration::from_millis(POLL_INTERVAL_MS));

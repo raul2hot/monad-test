@@ -16,6 +16,8 @@ pub const POLL_INTERVAL_MS: u64 = 1000;
 pub enum PoolType {
     UniswapV3,
     PancakeV3,
+    LiquidityBook, // LFJ - TraderJoe style
+    MondayTrade,   // V3-style (inspired by Uniswap V3, uses slot0())
 }
 
 #[derive(Debug, Clone)]
@@ -56,8 +58,30 @@ pub fn get_v3_pools() -> Vec<PoolConfig> {
     ]
 }
 
-// Placeholder for future pools
-pub fn get_other_pools() -> Vec<PoolConfig> {
-    // LFJ and Monday Trade - to be implemented in Phase 2
-    vec![]
+// LFJ Pool (Liquidity Book / DLMM)
+pub fn get_lfj_pool() -> PoolConfig {
+    PoolConfig {
+        name: "LFJ",
+        address: alloy::primitives::address!("5e60bc3f7a7303bc4dfe4dc2220bdc90bc04fe22"),
+        pool_type: PoolType::LiquidityBook,
+        fee_bps: 15, // LFJ typically has variable fees, using 0.15% as estimate
+    }
+}
+
+// Monday Trade Pool
+pub fn get_monday_trade_pool() -> PoolConfig {
+    PoolConfig {
+        name: "MondayTrade",
+        address: alloy::primitives::address!("8f889ba499c0a176fb8f233d9d35b1c132eb868c"),
+        pool_type: PoolType::MondayTrade,
+        fee_bps: 30, // Assuming 0.30% fee, adjust as needed
+    }
+}
+
+// Get all pools
+pub fn get_all_pools() -> Vec<PoolConfig> {
+    let mut pools = get_v3_pools();
+    pools.push(get_lfj_pool());
+    pools.push(get_monday_trade_pool());
+    pools
 }

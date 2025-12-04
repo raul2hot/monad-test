@@ -1,5 +1,13 @@
 use alloy::primitives::{Address, Bytes};
 
+/// Type of call for decoding purposes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallType {
+    V3Slot0, // Used for Uniswap V3, PancakeSwap V3, and Monday Trade (all V3-style)
+    LfjActiveId,
+    LfjBinStep,
+}
+
 /// Represents the calldata needed to fetch price from a pool
 #[derive(Debug, Clone)]
 pub struct PriceCall {
@@ -7,6 +15,7 @@ pub struct PriceCall {
     pub pool_address: Address,
     pub calldata: Bytes,
     pub fee_bps: u32,
+    pub call_type: CallType,
 }
 
 /// Represents a successfully fetched price
