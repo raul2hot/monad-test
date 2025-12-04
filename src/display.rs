@@ -1,6 +1,11 @@
 use chrono::Local;
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 use crate::pools::PoolPrice;
+
+// Track active arb opportunities to only log new ones
+static ACTIVE_ARBS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Represents an arbitrage opportunity between two pools
 #[derive(Debug)]
@@ -52,22 +57,37 @@ pub fn calculate_spreads(prices: &[PoolPrice]) -> Vec<SpreadOpportunity> {
     spreads
 }
 
-/// Log arb opportunities with net spread > 0.1% to stderr
+/// Log arb opportunities with net spread > 0.1% to stderr (only new ones)
 fn log_arb_opportunities(spreads: &[SpreadOpportunity], timestamp: &str) {
+    let mut active_arbs = ACTIVE_ARBS.lock().unwrap();
+    let prev_arbs = active_arbs.get_or_insert_with(HashSet::new);
+
+    // Build current set of arb opportunities
+    let mut current_arbs = HashSet::new();
+
     for spread in spreads.iter() {
         if spread.net_spread_pct > 0.1 {
-            eprintln!(
-                "[{}] ARB DETECTED | {} → {} | Gross: {:.2}% | Net: {:.2}% | Buy: {:.5} | Sell: {:.5}",
-                timestamp,
-                spread.buy_pool,
-                spread.sell_pool,
-                spread.gross_spread_pct,
-                spread.net_spread_pct,
-                spread.buy_price,
-                spread.sell_price
-            );
+            let key = format!("{}→{}", spread.buy_pool, spread.sell_pool);
+            current_arbs.insert(key.clone());
+
+            // Only log if this is a new opportunity
+            if !prev_arbs.contains(&key) {
+                eprintln!(
+                    "[{}] ARB DETECTED | {} → {} | Gross: {:.2}% | Net: {:.2}% | Buy: {:.5} | Sell: {:.5}",
+                    timestamp,
+                    spread.buy_pool,
+                    spread.sell_pool,
+                    spread.gross_spread_pct,
+                    spread.net_spread_pct,
+                    spread.buy_price,
+                    spread.sell_price
+                );
+            }
         }
     }
+
+    // Update tracked arbs for next cycle
+    *prev_arbs = current_arbs;
 }
 
 /// Clears the terminal screen
