@@ -1,11 +1,60 @@
 use chrono::Local;
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::pools::PoolPrice;
 
+/// Default log file name for ARB opportunities
+const ARB_LOG_FILE: &str = "arb_opportunities.log";
+
 // Track active arb opportunities to only log new ones
 static ACTIVE_ARBS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Get the path to the ARB log file
+fn get_arb_log_path() -> PathBuf {
+    PathBuf::from(ARB_LOG_FILE)
+}
+
+/// Write an ARB opportunity to the log file
+fn write_arb_to_file(message: &str) {
+    let log_path = get_arb_log_path();
+
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{}", message) {
+                // Only print error once, avoid spamming stderr
+                eprintln!("Warning: Failed to write to arb log file: {}", e);
+            }
+        }
+        Err(e) => {
+            // Only print error once, avoid spamming stderr
+            eprintln!("Warning: Failed to open arb log file {}: {}", log_path.display(), e);
+        }
+    }
+}
+
+/// Initialize the ARB log file and return the path for display
+/// Call this at startup to inform the user where logs are written
+pub fn init_arb_log() -> PathBuf {
+    let log_path = get_arb_log_path();
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+
+    // Write a session start marker to the log file
+    let message = format!(
+        "\n[{}] === ARB MONITOR SESSION STARTED ===",
+        timestamp
+    );
+    write_arb_to_file(&message);
+
+    log_path
+}
 
 /// Represents an arbitrage opportunity between two pools
 #[derive(Debug)]
@@ -57,7 +106,7 @@ pub fn calculate_spreads(prices: &[PoolPrice]) -> Vec<SpreadOpportunity> {
     spreads
 }
 
-/// Log arb opportunities with net spread > 0.1% to stderr (only new ones)
+/// Log arb opportunities with net spread > 0.1% to log file (only new ones)
 fn log_arb_opportunities(spreads: &[SpreadOpportunity], timestamp: &str) {
     let mut active_arbs = ACTIVE_ARBS.lock().unwrap();
     let prev_arbs = active_arbs.get_or_insert_with(HashSet::new);
@@ -72,7 +121,7 @@ fn log_arb_opportunities(spreads: &[SpreadOpportunity], timestamp: &str) {
 
             // Only log if this is a new opportunity
             if !prev_arbs.contains(&key) {
-                eprintln!(
+                let message = format!(
                     "[{}] ARB DETECTED | {} → {} | Gross: {:.2}% | Net: {:.2}% | Buy: {:.5} | Sell: {:.5}",
                     timestamp,
                     spread.buy_pool,
@@ -82,6 +131,7 @@ fn log_arb_opportunities(spreads: &[SpreadOpportunity], timestamp: &str) {
                     spread.buy_price,
                     spread.sell_price
                 );
+                write_arb_to_file(&message);
             }
         }
     }

@@ -12,7 +12,7 @@ mod pools;
 mod price;
 
 use config::{get_all_pools, get_lfj_pool, get_monday_trade_pool, get_v3_pools, POLL_INTERVAL_MS};
-use display::display_prices;
+use display::{display_prices, init_arb_log};
 use multicall::fetch_prices_batched;
 use pools::{
     create_lfj_active_id_call, create_lfj_bin_step_call, create_slot0_call, PriceCall,
@@ -43,6 +43,14 @@ async fn main() -> Result<()> {
     let all_pools = get_all_pools();
 
     info!("Monitoring {} pools", all_pools.len());
+
+    // Initialize ARB log file
+    let arb_log_path = init_arb_log();
+    info!("ARB opportunities will be logged to: {}", arb_log_path.display());
+    eprintln!(
+        "\x1b[1;33mARB opportunities are logged to: {}\x1b[0m",
+        arb_log_path.canonicalize().unwrap_or(arb_log_path).display()
+    );
 
     // Create price calls for all pools based on their type
     let mut price_calls: Vec<PriceCall> = Vec::new();
