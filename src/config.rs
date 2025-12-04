@@ -44,4 +44,4 @@ pub const RECOMMENDED_WMON_AMOUNT: f64 = 50.0;   // Recommended trade size for p
 
 // Gas guard limits - reject 0x routes that are too expensive
 pub const MAX_0X_GAS: u64 = 400_000;             // Max gas for 0x leg (reject if higher)
-pub const MAX_TOTAL_GAS: u64 = 700_000;          // Max total gas for both legs combined
+pub const MAX_TOTAL_GAS: u64 = 850_000;          // Max total gas for both legs combined (400k Uni + 400k 0x + buffer)
