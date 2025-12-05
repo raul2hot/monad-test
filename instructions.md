@@ -1,147 +1,256 @@
-# Fix Instructions for Monad Arbitrage Bot
+# Fix Instructions for Monad Arbitrage Bot - BUY Direction Failure
 
-## 3 Critical Bugs to Fix
+## Root Cause Analysis
 
-Use `test-arb` for the arbitrage bot (not `test-swap`).
+**Pattern observed:**
+- SELL direction (WMON → USDC): Works on all DEXes
+- BUY direction (USDC → WMON): Fails on all DEXes (LFJ, PancakeSwap)
+
+This is a **direction-specific bug**, not a gas limit issue.
 
 ---
 
-## BUG #1: `to_wei` Function Precision Overflow
+## BUG #1: PancakeSwap SmartRouter Uses Different Interface
 
-### Files to Modify
-- `src/execution/swap.rs` (lines ~65-69)
-- `src/wallet/wrap.rs` (lines ~35-39)  
-- `src/main.rs` (lines ~455-459)
+### File
+`src/execution/routers/pancake_v3.rs`
 
 ### Problem
+PancakeSwap SmartRouter V3 (`0x21114915Ac6d5A2e156931e20B20b038dEd0Be7C`) uses **IV3SwapRouter** interface which is DIFFERENT from Uniswap's SwapRouter02.
+
+The PancakeSwap SmartRouter's `exactInputSingle` requires **deadline** in the struct (like Monday Trade), but the current code uses the Uniswap SwapRouter02 style (no deadline).
+
+### Current (Wrong)
 ```rust
-fn to_wei(amount: f64, decimals: u8) -> U256 {
-    let multiplier = 10u64.pow(decimals as u32);
-    let wei_amount = (amount * multiplier as f64) as u64;  // OVERFLOW: u64 max is ~18.4 for 18 decimals
-    U256::from(wei_amount)
+struct ExactInputSingleParams {
+    address tokenIn;
+    address tokenOut;
+    uint24 fee;
+    address recipient;
+    uint256 amountIn;
+    uint256 amountOutMinimum;
+    uint160 sqrtPriceLimitX96;
 }
 ```
-
-Any WMON amount > 18.4 silently overflows, causing wrong swap amounts.
 
 ### Fix
-Replace ALL THREE `to_wei` functions with:
+Replace the entire `src/execution/routers/pancake_v3.rs` with:
 
 ```rust
-fn to_wei(amount: f64, decimals: u8) -> U256 {
-    let multiplier = U256::from(10u64).pow(U256::from(decimals));
-    let amount_scaled = (amount * 1e18) as u128;
-    U256::from(amount_scaled) * multiplier / U256::from(10u64).pow(U256::from(18u8))
+use alloy::primitives::{Address, Bytes, U256, U160, Uint};
+use alloy::sol;
+use alloy::sol_types::SolCall;
+use eyre::Result;
+
+// PancakeSwap V3 SmartRouter Interface
+// IMPORTANT: PancakeSwap SmartRouter uses IV3SwapRouter which has deadline OUTSIDE the struct
+// but wrapped in a multicall with deadline. For direct calls, we need to use the
+// exactInputSingle that matches their deployed bytecode.
+//
+// After checking PancakeSwap's SmartRouter, it actually uses the SAME interface as SwapRouter02
+// BUT the function selector might be different, OR we need to go through multicall.
+//
+// Alternative: Use the V3Pool directly or use exactInputSingleHop
+sol! {
+    // Standard exactInputSingle (SwapRouter02 style - no deadline in struct)
+    #[derive(Debug)]
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    #[derive(Debug)]
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external
+        payable
+        returns (uint256 amountOut);
+}
+
+pub fn build_exact_input_single(
+    token_in: Address,
+    token_out: Address,
+    fee: u32,
+    recipient: Address,
+    amount_in: U256,
+    amount_out_min: U256,
+) -> Result<Bytes> {
+    let fee_uint24: Uint<24, 1> = Uint::from(fee);
+
+    let params = ExactInputSingleParams {
+        tokenIn: token_in,
+        tokenOut: token_out,
+        fee: fee_uint24,
+        recipient,
+        amountIn: amount_in,
+        amountOutMinimum: amount_out_min,
+        sqrtPriceLimitX96: U160::ZERO,
+    };
+
+    let calldata = exactInputSingleCall { params }.abi_encode();
+    Ok(Bytes::from(calldata))
 }
 ```
+
+**NOTE:** If this doesn't work, PancakeSwap might require going through their `multicall` with deadline. Check their docs.
 
 ---
 
-## BUG #3: Monad State Commitment Race Condition
+## BUG #2: LFJ Token Order Issue
 
-### File to Modify
-- `src/main.rs` (lines ~620-660 in `run_test_arb`)
+### File
+`src/execution/routers/lfj.rs`
 
 ### Problem
-Monad has delayed state commitment. Current code waits for 1 block then queries balance, but state may not be committed yet. The 500ms fallback is also insufficient.
+LFJ Liquidity Book requires tokens in a specific order in the path. The token order may need to be sorted (lower address first).
+
+Check the token addresses:
+- WMON: `0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A`
+- USDC: `0x754704Bc059F8C67012fEd69BC8A327a5aafb603`
+
+WMON < USDC by address, so WMON is token0.
+
+### Verification
+For BUY direction (USDC → WMON):
+- `token_in = USDC`
+- `token_out = WMON`
+- Path should be `[USDC, WMON]`
+
+This looks correct, but LFJ might have issues with the direction. 
 
 ### Fix
-Replace the block wait + balance query section in `run_test_arb` (after swap 1 completes):
+Add debug logging to verify the path being sent:
 
 ```rust
-// MONAD STATE COMMITMENT - Wait for block then retry balance query
-let ws_url = std::env::var("MONAD_WS_URL")
-    .unwrap_or_else(|_| rpc_url.replace("https://", "wss://").replace("http://", "ws://"));
-println!("  ⏳ Waiting for Monad state commitment...");
-let t_block = std::time::Instant::now();
+pub fn build_swap_with_bin_step(
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    amount_out_min: U256,
+    recipient: Address,
+    deadline: u64,
+    bin_step: u64,
+) -> Result<Bytes> {
+    println!("  [LFJ DEBUG] token_in: {:?}", token_in);
+    println!("  [LFJ DEBUG] token_out: {:?}", token_out);
+    println!("  [LFJ DEBUG] amount_in: {}", amount_in);
+    println!("  [LFJ DEBUG] amount_out_min: {}", amount_out_min);
+    println!("  [LFJ DEBUG] bin_step: {}", bin_step);
+    
+    let path = Path {
+        pairBinSteps: vec![U256::from(bin_step)],
+        versions: vec![3],
+        tokenPath: vec![token_in, token_out],
+    };
 
-match wait_for_next_block(&ws_url).await {
-    Ok(block_num) => {
-        println!("  ✓ Block {} confirmed in {:?}", block_num, t_block.elapsed());
-    }
-    Err(e) => {
-        println!("  ⚠ WebSocket failed ({}), using 1s delay", e);
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-    }
-}
+    let calldata = swapExactTokensForTokensCall {
+        amountIn: amount_in,
+        amountOutMin: amount_out_min,
+        path,
+        to: recipient,
+        deadline: U256::from(deadline),
+    }.abi_encode();
 
-// Retry balance query up to 3 times with 200ms gaps
-let mut usdc_for_swap2 = 0.0;
-for attempt in 1..=3 {
-    match query_usdc_balance(&provider, signer_address).await {
-        Ok(actual_balance) => {
-            let usdc_received = actual_balance - usdc_before;
-            if usdc_received > 0.0001 {
-                let usdc_received = (usdc_received * 1_000_000.0).floor() / 1_000_000.0;
-                let usdc_safe = usdc_received * 0.998;
-                println!("  ✓ USDC received: {:.6} (using {:.6})", usdc_received, usdc_safe);
-                usdc_for_swap2 = usdc_safe;
-                break;
-            }
-        }
-        Err(_) => {}
-    }
-    if attempt < 3 {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-}
-
-if usdc_for_swap2 < 0.000001 {
-    usdc_for_swap2 = usdc_estimated * 0.99;
-    println!("  ⚠ Using estimated USDC: {:.6}", usdc_for_swap2);
+    Ok(Bytes::from(calldata))
 }
 ```
 
 ---
 
-## BUG #4: Skip Balance Check Returns Estimated (Not Actual) Amount
+## BUG #3: Amount Calculation Issue for Small USDC Amounts
 
-### File to Modify
-- `src/main.rs` (`run_test_arb` function, around line ~590)
+### File
+`src/execution/swap.rs`
 
 ### Problem
-When `skip_balance_check = true`, `execute_swap` returns **estimated** output, not actual. For swap 1 in test-arb, we NEED actual USDC received to feed into swap 2.
-
-Current code:
-```rust
-let sell_result = execute_swap(
-    ...
-    true,  // Skip balance check - RETURNS ESTIMATE, NOT ACTUAL
-).await?;
+For BUY direction with 0.026725 USDC, the expected WMON output is calculated as:
+```
+expected_out = amount_in / expected_price = 0.026725 / 0.026880 = 0.9942 WMON
 ```
 
-Then `sell_result.amount_out_human` is used to calculate swap 2 input, but it's wrong.
-
-### Fix
-In `run_test_arb`, change swap 1 to NOT skip balance check:
-
-```rust
-let t_swap1 = std::time::Instant::now();
-let sell_result = execute_swap(
-    &provider,
-    &provider_with_signer,
-    signer_address,
-    sell_params,
-    gas_price,
-    false,  // CHANGED: Must get actual USDC received for swap 2
-).await?;
-println!("  [TIMING] Swap 1 execution: {:?}", t_swap1.elapsed());
+But this expects to get ~1 WMON from ~0.027 USDC, which means the slippage-adjusted minimum is:
+```
+min_out = 0.9942 * 0.97 = 0.964 WMON
 ```
 
-Keep swap 2 with `skip_balance_check = true` (we only care about final P/L from on-chain state).
+**This minimum is unrealistic!** The pool cannot give 0.964 WMON for 0.027 USDC with any reasonable slippage.
+
+### Root Cause
+The price `0.026880` means "0.026880 USDC per WMON". So for BUY:
+- You spend USDC
+- You receive WMON
+- Expected WMON = USDC_amount / price = 0.027 / 0.027 ≈ 1 WMON
+
+Wait - this IS correct if WMON costs $0.027!
+
+But the **amountOutMinimum might be too high** due to price impact on small trades.
+
+### Fix - Set amountOutMinimum to 0 for Testing
+
+In `src/execution/swap.rs`, temporarily set min output to 0 to test:
+
+```rust
+// Calculate minimum output based on expected price and slippage
+let expected_out = match params.direction {
+    SwapDirection::Sell => params.amount_in * params.expected_price,
+    SwapDirection::Buy => params.amount_in / params.expected_price,
+};
+
+let slippage_multiplier = 1.0 - (params.slippage_bps as f64 / 10000.0);
+let min_out = expected_out * slippage_multiplier;
+
+// TEMPORARY DEBUG: Set to 0 to see if swap works without slippage protection
+let amount_out_min = U256::ZERO;  // CHANGE THIS BACK AFTER TESTING!
+// let amount_out_min = to_wei(min_out, decimals_out);
+
+println!("  [DEBUG] expected_out: {}", expected_out);
+println!("  [DEBUG] min_out (before zero): {}", min_out);
+println!("  [DEBUG] amount_out_min: {}", amount_out_min);
+```
 
 ---
 
-## Fix Priority
+## Immediate Debugging Steps
 
-1. **BUG #1** - Silent overflow corrupts amounts
-2. **BUG #4** - Swap 2 uses wrong USDC input  
-3. **BUG #3** - Stale balance reads
-
----
-
-## Test After Fixes
+1. **Add debug logging** to see exact calldata being sent
+2. **Set amountOutMinimum to 0** temporarily to isolate slippage vs encoding issues
+3. **Test BUY direction with test-swap** first (not test-arb):
 
 ```bash
-cargo run -- test-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 1.0 --slippage 150
+# Test BUY direction directly on each DEX
+cargo run -- test-swap --dex pancakeswap1 --amount 0.03 --direction buy --slippage 500
+cargo run -- test-swap --dex lfj --amount 0.03 --direction buy --slippage 500
+cargo run -- test-swap --dex uniswap --amount 0.03 --direction buy --slippage 500
 ```
+
+If test-swap BUY fails on all DEXes, the issue is in `execute_swap` or router encoding.
+If test-swap BUY works but test-arb fails, the issue is in test-arb's amount calculation.
+
+---
+
+## Most Likely Root Cause
+
+After deeper analysis, the most likely issue is:
+
+**The `amountOutMinimum` is too high relative to what the pool can actually provide.**
+
+For a swap of 0.027 USDC expecting 0.96 WMON minimum, the pool needs extreme liquidity. With low liquidity, even 3% slippage isn't enough.
+
+### Quick Fix
+Increase slippage dramatically for testing:
+
+```bash
+cargo run -- test-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 1.0 --slippage 1000
+```
+
+If this works with 10% slippage, the issue is slippage tolerance, not encoding.
+
+---
+
+## Gas Limits are NOT the Issue
+
+The current gas limits (280k for V3, 420k for LFJ) are fine. The error is "Transaction reverted" not "out of gas". The contract is rejecting the swap parameters.
