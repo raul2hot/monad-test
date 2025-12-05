@@ -64,7 +64,7 @@ pub fn get_lfj_pool() -> PoolConfig {
         name: "LFJ",
         address: alloy::primitives::address!("5e60bc3f7a7303bc4dfe4dc2220bdc90bc04fe22"),
         pool_type: PoolType::LiquidityBook,
-        fee_bps: 15, // LFJ typically has variable fees, using 0.15% as estimate
+        fee_bps: 10, // Bin step 10 = ~0.10% base fee (verified from pool contract)
     }
 }
 
@@ -140,7 +140,7 @@ pub fn get_routers() -> Vec<RouterConfig> {
             address: LFJ_LB_ROUTER,
             router_type: RouterType::LfjLB,
             pool_address: alloy::primitives::address!("5e60bc3f7a7303bc4dfe4dc2220bdc90bc04fe22"),
-            pool_fee: 15,  // 0.15% (stored as bps for LFJ)
+            pool_fee: 10,  // Bin step (verified from pool contract)
         },
         RouterConfig {
             name: "MondayTrade",
