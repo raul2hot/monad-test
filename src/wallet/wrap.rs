@@ -7,6 +7,7 @@ use alloy::sol_types::SolCall;
 use eyre::{eyre, Result};
 
 use crate::config::{WMON_ADDRESS, WMON_DECIMALS};
+use crate::nonce::next_nonce;
 
 // WMON interface (same as WETH)
 sol! {
@@ -77,13 +78,14 @@ pub async fn wrap_mon<P: Provider>(
     let result = provider.call(balance_tx.clone()).await?;
     let wmon_before = U256::from_be_slice(&result);
 
-    // Build deposit transaction
+    // Build deposit transaction with local nonce
     let deposit_call = depositCall {};
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(WMON_ADDRESS)
         .value(amount_wei)
         .input(alloy::rpc::types::TransactionInput::new(Bytes::from(deposit_call.abi_encode())))
-        .gas_limit(60_000);  // Wrap is cheap
+        .gas_limit(60_000)
+        .nonce(next_nonce());
 
     // Create provider with signer
     let url: reqwest::Url = rpc_url.parse()?;
@@ -163,12 +165,13 @@ pub async fn unwrap_wmon<P: Provider>(
     // Get MON balance before
     let mon_before = provider.get_balance(wallet_address).await?;
 
-    // Build withdraw transaction
+    // Build withdraw transaction with local nonce
     let withdraw_call = withdrawCall { amount: amount_wei };
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(WMON_ADDRESS)
         .input(alloy::rpc::types::TransactionInput::new(Bytes::from(withdraw_call.abi_encode())))
-        .gas_limit(60_000);  // Unwrap is cheap
+        .gas_limit(60_000)
+        .nonce(next_nonce());
 
     // Create provider with signer
     let url: reqwest::Url = rpc_url.parse()?;
