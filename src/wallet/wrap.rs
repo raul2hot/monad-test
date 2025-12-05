@@ -1,4 +1,4 @@
-use alloy::network::EthereumWallet;
+use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
@@ -8,6 +8,9 @@ use eyre::{eyre, Result};
 
 use crate::config::{WMON_ADDRESS, WMON_DECIMALS};
 use crate::nonce::next_nonce;
+
+// Monad mainnet chain ID
+const MONAD_CHAIN_ID: u64 = 143;
 
 // WMON interface (same as WETH)
 sol! {
@@ -78,14 +81,21 @@ pub async fn wrap_mon<P: Provider>(
     let result = provider.call(balance_tx.clone()).await?;
     let wmon_before = U256::from_be_slice(&result);
 
-    // Build deposit transaction with local nonce
+    // Fetch gas price once
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+
+    // Build deposit transaction with ALL fields set to prevent filler RPC calls
     let deposit_call = depositCall {};
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(WMON_ADDRESS)
+        .from(wallet_address)
         .value(amount_wei)
         .input(alloy::rpc::types::TransactionInput::new(Bytes::from(deposit_call.abi_encode())))
         .gas_limit(60_000)
-        .nonce(next_nonce());
+        .nonce(next_nonce())
+        .max_fee_per_gas(gas_price + (gas_price / 10))
+        .max_priority_fee_per_gas(gas_price / 10)
+        .with_chain_id(MONAD_CHAIN_ID);
 
     // Create provider with signer
     let url: reqwest::Url = rpc_url.parse()?;
@@ -165,13 +175,20 @@ pub async fn unwrap_wmon<P: Provider>(
     // Get MON balance before
     let mon_before = provider.get_balance(wallet_address).await?;
 
-    // Build withdraw transaction with local nonce
+    // Fetch gas price once
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+
+    // Build withdraw transaction with ALL fields set to prevent filler RPC calls
     let withdraw_call = withdrawCall { amount: amount_wei };
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(WMON_ADDRESS)
+        .from(wallet_address)
         .input(alloy::rpc::types::TransactionInput::new(Bytes::from(withdraw_call.abi_encode())))
         .gas_limit(60_000)
-        .nonce(next_nonce());
+        .nonce(next_nonce())
+        .max_fee_per_gas(gas_price + (gas_price / 10))
+        .max_priority_fee_per_gas(gas_price / 10)
+        .with_chain_id(MONAD_CHAIN_ID);
 
     // Create provider with signer
     let url: reqwest::Url = rpc_url.parse()?;
