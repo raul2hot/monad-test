@@ -77,6 +77,12 @@ pub fn build_swap_with_bin_step(
     deadline: u64,
     bin_step: u64,
 ) -> Result<Bytes> {
+    println!("  [LFJ DEBUG] token_in: {:?}", token_in);
+    println!("  [LFJ DEBUG] token_out: {:?}", token_out);
+    println!("  [LFJ DEBUG] amount_in: {}", amount_in);
+    println!("  [LFJ DEBUG] amount_out_min: {}", amount_out_min);
+    println!("  [LFJ DEBUG] bin_step: {}", bin_step);
+
     // For LFJ, we need to specify the path with proper version and bin step
     // Version 3 = V2_2 (Liquidity Book V2.2 - current version)
     let path = Path {

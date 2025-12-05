@@ -197,7 +197,14 @@ pub async fn execute_swap<P: Provider, S: Provider>(
 
     let slippage_multiplier = 1.0 - (params.slippage_bps as f64 / 10000.0);
     let min_out = expected_out * slippage_multiplier;
-    let amount_out_min = to_wei(min_out, decimals_out);
+
+    // TEMPORARY DEBUG: Set to 0 to see if swap works without slippage protection
+    let amount_out_min = U256::ZERO;  // CHANGE THIS BACK AFTER TESTING!
+    // let amount_out_min = to_wei(min_out, decimals_out);
+
+    println!("  [DEBUG] expected_out: {}", expected_out);
+    println!("  [DEBUG] min_out (before zero): {}", min_out);
+    println!("  [DEBUG] amount_out_min: {}", amount_out_min);
 
     println!("\n  Swap Details:");
     println!("    Amount In:  {} {}", params.amount_in, if params.direction == SwapDirection::Sell { "WMON" } else { "USDC" });
