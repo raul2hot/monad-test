@@ -258,7 +258,12 @@ pub async fn execute_swap<P: Provider, S: Provider>(
 
     // Use pre-built provider with signer (passed in to avoid rebuilding per swap)
     let start = std::time::Instant::now();
-    let send_result = provider_with_signer.send_transaction(tx).await;
+
+    // Add timeout to transaction send (prevents infinite hang)
+    let send_result = match timeout(Duration::from_secs(15), provider_with_signer.send_transaction(tx)).await {
+        Ok(result) => result,
+        Err(_) => return Err(eyre!("Transaction send timed out after 15s")),
+    };
 
     match send_result {
         Ok(pending) => {
