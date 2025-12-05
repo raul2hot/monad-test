@@ -1,10 +1,12 @@
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::TransactionReceipt;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::{eyre, Result};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::{interval, timeout};
 
 use crate::config::{RouterConfig, RouterType, WMON_ADDRESS, USDC_ADDRESS, WMON_DECIMALS, USDC_DECIMALS};
 use crate::nonce::next_nonce;
@@ -83,6 +85,27 @@ fn get_gas_limit_for_router(router_type: RouterType) -> u64 {
         RouterType::LfjLB => 420_000,
         RouterType::MondayTrade => 280_000,
     }
+}
+
+/// Wait for transaction receipt with fast polling (100ms interval)
+/// Times out after 30 seconds
+async fn wait_for_receipt_fast<P: Provider>(
+    provider: &P,
+    tx_hash: TxHash,
+) -> Result<TransactionReceipt> {
+    let mut poll_interval = interval(Duration::from_millis(100));
+    let deadline = Duration::from_secs(30);
+
+    timeout(deadline, async {
+        loop {
+            poll_interval.tick().await;
+            if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+                return Ok::<_, eyre::Report>(receipt);
+            }
+        }
+    })
+    .await
+    .map_err(|_| eyre::eyre!("Transaction confirmation timeout after 30s"))?
 }
 
 /// Check that router has sufficient approval. Does NOT send approval TX.
@@ -217,7 +240,10 @@ pub async fn execute_swap<P: Provider, S: Provider>(
 
     match send_result {
         Ok(pending) => {
-            let receipt = pending.get_receipt().await?;
+            let tx_hash = *pending.tx_hash();
+
+            // CRITICAL: Use fast 100ms polling instead of default 7-second interval!
+            let receipt = wait_for_receipt_fast(provider, tx_hash).await?;
             let elapsed = start.elapsed();
 
             // Check balance after (skip if skip_balance_check is true - use expected output)
