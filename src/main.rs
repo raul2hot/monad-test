@@ -830,13 +830,17 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     let usdc_for_swap2 = match query_usdc_balance(&provider, signer_address).await {
         Ok(actual_balance) => {
             let usdc_received = actual_balance - usdc_before;
+            // Round DOWN to 6 decimals and apply 0.1% safety buffer
+            // This ensures we never try to spend more than we have due to rounding
+            let usdc_received = (usdc_received * 1_000_000.0).floor() / 1_000_000.0;
+            let usdc_safe = usdc_received * 0.999; // 0.1% safety buffer
             let diff_pct = ((usdc_received - usdc_estimated) / usdc_estimated * 100.0).abs();
             if diff_pct > 1.0 {
                 println!("  ⚠ Estimate vs Actual: {:.6} vs {:.6} ({:+.2}%)",
                     usdc_estimated, usdc_received, (usdc_received - usdc_estimated) / usdc_estimated * 100.0);
             }
-            println!("  ✓ Actual USDC received: {:.6}", usdc_received);
-            usdc_received
+            println!("  ✓ Actual USDC received: {:.6} (using {:.6} with safety buffer)", usdc_received, usdc_safe);
+            usdc_safe
         }
         Err(e) => {
             println!("  ⚠ Balance query failed ({}), using estimate with 0.5% buffer", e);
