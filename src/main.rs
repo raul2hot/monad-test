@@ -806,24 +806,17 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     println!("  ✓ Estimated received: {:.6} USDC", usdc_estimated);
 
     // ═══════════════════════════════════════════════════════════════════
-    // MONAD STATE COMMITMENT + ACTUAL BALANCE QUERY (PARALLEL)
-    // Query actual USDC balance while waiting for block confirmation.
-    // This ensures we use the real balance for swap 2, not an estimate.
-    // Running in parallel adds ZERO latency.
+    // MONAD STATE COMMITMENT - Wait for block FIRST, then query balance
+    // Monad uses asynchronous execution with delayed state commitment.
+    // We MUST wait for the block before querying balance, otherwise we
+    // get the pre-swap balance (state not yet committed).
     // ═══════════════════════════════════════════════════════════════════
     let ws_url = std::env::var("MONAD_WS_URL")
         .unwrap_or_else(|_| rpc_url.replace("https://", "wss://").replace("http://", "ws://"));
-    println!("  ⏳ Waiting for block + querying actual USDC balance (parallel)...");
+    println!("  ⏳ Waiting for block confirmation (Monad state commitment)...");
     let t_block = std::time::Instant::now();
 
-    // Run block wait and balance query in parallel
-    let block_future = wait_for_next_block(&ws_url);
-    let balance_future = query_usdc_balance(&provider, signer_address);
-
-    let (block_result, balance_result) = tokio::join!(block_future, balance_future);
-
-    // Handle block wait result
-    match block_result {
+    match wait_for_next_block(&ws_url).await {
         Ok(block_num) => {
             println!("  ✓ Block {} confirmed in {:?}", block_num, t_block.elapsed());
         }
@@ -833,20 +826,21 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         }
     }
 
-    // Get actual USDC received from swap 1 (current balance - balance before swap 1)
-    let usdc_for_swap2 = match balance_result {
+    // NOW query actual USDC balance (after state is committed)
+    let usdc_for_swap2 = match query_usdc_balance(&provider, signer_address).await {
         Ok(actual_balance) => {
             let usdc_received = actual_balance - usdc_before;
-            if (usdc_received - usdc_estimated).abs() > 0.000001 {
-                println!("  ⚠ Estimate vs Actual received: {:.6} vs {:.6} (diff: {:+.6})",
-                    usdc_estimated, usdc_received, usdc_received - usdc_estimated);
+            let diff_pct = ((usdc_received - usdc_estimated) / usdc_estimated * 100.0).abs();
+            if diff_pct > 1.0 {
+                println!("  ⚠ Estimate vs Actual: {:.6} vs {:.6} ({:+.2}%)",
+                    usdc_estimated, usdc_received, (usdc_received - usdc_estimated) / usdc_estimated * 100.0);
             }
-            println!("  ✓ Actual USDC received from swap 1: {:.6}", usdc_received);
+            println!("  ✓ Actual USDC received: {:.6}", usdc_received);
             usdc_received
         }
         Err(e) => {
             println!("  ⚠ Balance query failed ({}), using estimate with 0.5% buffer", e);
-            usdc_estimated * 0.995  // Safety buffer if query fails
+            usdc_estimated * 0.995
         }
     };
 
