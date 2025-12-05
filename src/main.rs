@@ -12,15 +12,22 @@ mod config;
 mod display;
 mod execution;
 mod multicall;
+mod nonce;
 mod pools;
 mod price;
 mod wallet;
 
-use config::{get_all_pools, get_lfj_pool, get_monday_trade_pool, get_v3_pools, get_router_by_name, POLL_INTERVAL_MS};
+use config::{
+    get_all_pools, get_lfj_pool, get_monday_trade_pool, get_v3_pools, get_router_by_name,
+    POLL_INTERVAL_MS, WMON_ADDRESS, USDC_ADDRESS, WMON_DECIMALS, USDC_DECIMALS,
+    UNISWAP_SWAP_ROUTER, PANCAKE_SMART_ROUTER, LFJ_LB_ROUTER, MONDAY_SWAP_ROUTER,
+    RouterConfig,
+};
 use display::{display_prices, init_arb_log};
-use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report};
+use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata};
 use execution::report::print_comparison_report;
 use multicall::fetch_prices_batched;
+use nonce::init_nonce;
 use pools::{create_lfj_active_id_call, create_lfj_bin_step_call, create_slot0_call, PriceCall, PoolPrice};
 use wallet::{get_balances, print_balances, wrap_mon, unwrap_wmon, print_wrap_result};
 
@@ -146,6 +153,9 @@ enum Commands {
         #[arg(long, default_value = "150")]
         slippage: u32,
     },
+
+    /// Prepare wallet for arbitrage by approving all routers (one-time setup)
+    PrepareArb,
 }
 
 async fn get_current_prices<P: alloy::providers::Provider>(provider: &P) -> Result<Vec<PoolPrice>> {
@@ -221,6 +231,7 @@ async fn run_test_swap(dex: &str, amount: f64, direction: &str, slippage: u32) -
     let provider = ProviderBuilder::new().connect_http(url);
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
+    init_nonce(&provider, signer.address()).await?;
     println!("Wallet: {:?}", signer.address());
 
     // Get router config
@@ -269,6 +280,7 @@ async fn run_test_all(amount: f64, direction: &str, slippage: u32) -> Result<()>
     let provider = ProviderBuilder::new().connect_http(url);
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
+    init_nonce(&provider, signer.address()).await?;
     println!("Wallet: {:?}", signer.address());
 
     let prices = get_current_prices(&provider).await?;
@@ -357,6 +369,7 @@ async fn run_wrap(amount: f64) -> Result<()> {
     let provider = ProviderBuilder::new().connect_http(url);
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
+    init_nonce(&provider, signer.address()).await?;
     println!("Wallet: {:?}", signer.address());
 
     println!("\n══════════════════════════════════════════════════════════════");
@@ -382,6 +395,7 @@ async fn run_unwrap(amount: f64) -> Result<()> {
     let provider = ProviderBuilder::new().connect_http(url);
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
+    init_nonce(&provider, signer.address()).await?;
     println!("Wallet: {:?}", signer.address());
 
     println!("\n══════════════════════════════════════════════════════════════");
@@ -407,6 +421,7 @@ async fn run_buy_mon(amount: f64, dex: &str, slippage: u32, keep_wrapped: bool) 
     let provider = ProviderBuilder::new().connect_http(url);
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
+    init_nonce(&provider, signer.address()).await?;
     println!("Wallet: {:?}", signer.address());
 
     // Get router config
@@ -468,6 +483,7 @@ async fn run_sell_mon(amount: f64, dex: &str, slippage: u32, use_wmon: bool) -> 
     let provider = ProviderBuilder::new().connect_http(url);
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
+    init_nonce(&provider, signer.address()).await?;
     println!("Wallet: {:?}", signer.address());
 
     // Get router config
@@ -523,6 +539,45 @@ async fn run_sell_mon(amount: f64, dex: &str, slippage: u32, use_wmon: bool) -> 
     Ok(())
 }
 
+/// Helper function to convert human amount to U256 with proper decimals
+fn to_wei(amount: f64, decimals: u8) -> alloy::primitives::U256 {
+    let multiplier = 10u64.pow(decimals as u32);
+    let wei_amount = (amount * multiplier as f64) as u64;
+    alloy::primitives::U256::from(wei_amount)
+}
+
+/// Helper function to pre-build swap calldata without executing
+fn build_swap_calldata_only(
+    router: &RouterConfig,
+    direction: SwapDirection,
+    amount_in: alloy::primitives::U256,
+    amount_out_min: alloy::primitives::U256,
+    recipient: alloy::primitives::Address,
+) -> Result<alloy::primitives::Bytes> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (token_in, token_out) = match direction {
+        SwapDirection::Sell => (WMON_ADDRESS, USDC_ADDRESS),
+        SwapDirection::Buy => (USDC_ADDRESS, WMON_ADDRESS),
+    };
+
+    let deadline = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() + 300;
+
+    build_swap_calldata(
+        router.router_type,
+        token_in,
+        token_out,
+        amount_in,
+        amount_out_min,
+        recipient,
+        router.pool_fee,
+        deadline,
+    )
+}
+
 async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32) -> Result<()> {
     let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
@@ -531,6 +586,7 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     let provider = ProviderBuilder::new().connect_http(url);
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
+    init_nonce(&provider, signer.address()).await?;
     println!("Wallet: {:?}", signer.address());
 
     // Get routers
@@ -562,9 +618,32 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         println!("  Consider swapping: --sell-dex {} --buy-dex {}", buy_dex, sell_dex);
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // PRE-CALCULATE SWAP 2 PARAMETERS (optimization: ready before swap 1)
+    // ═══════════════════════════════════════════════════════════════════
+    let expected_usdc = amount * sell_price.price;
+    let expected_usdc_wei = to_wei(expected_usdc, USDC_DECIMALS);
+
+    // Pre-calculate expected WMON output from swap 2 (for slippage)
+    let expected_wmon_back = expected_usdc / buy_price.price;
+    let slippage_multiplier = 1.0 - (slippage as f64 / 10000.0);
+    let min_wmon_out = expected_wmon_back * slippage_multiplier;
+    let min_wmon_out_wei = to_wei(min_wmon_out, WMON_DECIMALS);
+
+    // Pre-build swap 2 calldata (will be ready when swap 1 completes)
+    let _swap2_calldata_prebuilt = build_swap_calldata_only(
+        &buy_router,
+        SwapDirection::Buy,
+        expected_usdc_wei,  // Will use actual USDC if differs significantly
+        min_wmon_out_wei,
+        signer.address(),
+    )?;
+
+    println!("\n  Pre-built swap 2 calldata (expected USDC: {:.6})", expected_usdc);
+
     // Get initial WMON balance
     let balances_before = get_balances(&provider, signer.address()).await?;
-    println!("\n  Starting WMON balance: {:.6}", balances_before.wmon_human);
+    println!("  Starting WMON balance: {:.6}", balances_before.wmon_human);
 
     println!("\n══════════════════════════════════════════════════════════════");
     println!("  DEX-TO-DEX ARBITRAGE TEST");
@@ -597,9 +676,6 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
 
     let usdc_received = sell_result.amount_out_human;
     println!("  ✓ Received: {:.6} USDC", usdc_received);
-
-    // Small delay to ensure state is updated
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 2: Buy WMON with USDC on buy_dex
@@ -686,6 +762,100 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     Ok(())
 }
 
+async fn run_prepare_arb() -> Result<()> {
+    use alloy::network::EthereumWallet;
+    use alloy::primitives::{Bytes, U256};
+    use alloy::providers::Provider;
+    use alloy::sol;
+    use alloy::sol_types::SolCall;
+
+    // ERC20 approve interface
+    sol! {
+        #[derive(Debug)]
+        function approve(address spender, uint256 amount) external returns (bool);
+    }
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    init_nonce(&provider, signer.address()).await?;
+
+    let wallet = EthereumWallet::from(signer.clone());
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  PREPARING WALLET FOR ARBITRAGE");
+    println!("══════════════════════════════════════════════════════════════");
+    println!("Wallet: {:?}", signer.address());
+
+    // Router addresses and names
+    let routers = [
+        (UNISWAP_SWAP_ROUTER, "Uniswap SwapRouter"),
+        (PANCAKE_SMART_ROUTER, "PancakeSwap SmartRouter"),
+        (LFJ_LB_ROUTER, "LFJ LBRouter"),
+        (MONDAY_SWAP_ROUTER, "Monday SwapRouter"),
+    ];
+
+    // Tokens to approve
+    let tokens = [
+        (WMON_ADDRESS, "WMON"),
+        (USDC_ADDRESS, "USDC"),
+    ];
+
+    let mut success_count = 0;
+    let total_count = routers.len() * tokens.len();
+
+    for (token, token_name) in &tokens {
+        println!("\nApproving routers for {}...", token_name);
+
+        for (router, router_name) in &routers {
+            let approve_call = approveCall {
+                spender: *router,
+                amount: U256::MAX,
+            };
+
+            let tx = alloy::rpc::types::TransactionRequest::default()
+                .to(*token)
+                .input(alloy::rpc::types::TransactionInput::new(Bytes::from(approve_call.abi_encode())))
+                .gas_limit(100_000)
+                .nonce(nonce::next_nonce());
+
+            match provider_with_signer.send_transaction(tx).await {
+                Ok(pending) => {
+                    match pending.get_receipt().await {
+                        Ok(receipt) => {
+                            if receipt.status() {
+                                println!("  ✓ {} approved (tx: {:?})", router_name, receipt.transaction_hash);
+                                success_count += 1;
+                            } else {
+                                println!("  ✗ {} approval reverted", router_name);
+                            }
+                        }
+                        Err(e) => {
+                            println!("  ✗ {} failed to get receipt: {}", router_name, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  ✗ {} failed to send tx: {}", router_name, e);
+                }
+            }
+        }
+    }
+
+    println!("\n══════════════════════════════════════════════════════════════");
+    println!("  PREPARATION COMPLETE - {}/{} approvals successful", success_count, total_count);
+    println!("══════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -726,6 +896,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::TestArb { sell_dex, buy_dex, amount, slippage }) => {
             run_test_arb(&sell_dex, &buy_dex, amount, slippage).await
+        }
+        Some(Commands::PrepareArb) => {
+            run_prepare_arb().await
         }
     }
 }

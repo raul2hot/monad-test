@@ -8,6 +8,7 @@ use eyre::{eyre, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{RouterConfig, WMON_ADDRESS, USDC_ADDRESS, WMON_DECIMALS, USDC_DECIMALS};
+use crate::nonce::next_nonce;
 use super::routers::build_swap_calldata;
 
 // ERC20 interface for approvals and balance checks
@@ -72,18 +73,15 @@ fn from_wei(amount: U256, decimals: u8) -> f64 {
     amount_u128 as f64 / divisor
 }
 
-/// Ensure router has approval to spend tokens
-pub async fn ensure_approval<P: Provider>(
+/// Check that router has sufficient approval. Does NOT send approval TX.
+/// If approval is missing, returns error instructing user to run prepare-arb.
+pub async fn check_approval<P: Provider>(
     provider: &P,
-    signer: &PrivateKeySigner,
+    wallet_address: Address,
     token: Address,
     spender: Address,
     amount: U256,
-    rpc_url: &str,
 ) -> Result<()> {
-    let wallet_address = signer.address();
-
-    // Check current allowance
     let allowance_call = allowanceCall {
         owner: wallet_address,
         spender,
@@ -97,40 +95,13 @@ pub async fn ensure_approval<P: Provider>(
     let current_allowance = U256::from_be_slice(&result);
 
     if current_allowance >= amount {
-        println!("  ✓ Sufficient allowance already exists");
         return Ok(());
     }
 
-    println!("  → Approving router to spend tokens...");
-
-    // Need to approve - use max uint256 for convenience
-    let approve_call = approveCall {
-        spender,
-        amount: U256::MAX,
-    };
-
-    let wallet = EthereumWallet::from(signer.clone());
-
-    let tx = alloy::rpc::types::TransactionRequest::default()
-        .to(token)
-        .input(alloy::rpc::types::TransactionInput::new(Bytes::from(approve_call.abi_encode())))
-        .gas_limit(100_000);  // Approvals are cheap
-
-    // Create provider with signer
-    let url: reqwest::Url = rpc_url.parse()?;
-    let provider_with_signer = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(url);
-
-    let pending = provider_with_signer.send_transaction(tx).await?;
-    let receipt = pending.get_receipt().await?;
-
-    if receipt.status() {
-        println!("  ✓ Approval successful: {:?}", receipt.transaction_hash);
-        Ok(())
-    } else {
-        Err(eyre!("Approval transaction failed"))
-    }
+    Err(eyre!(
+        "Insufficient allowance for router {:?}. Run 'cargo run -- prepare-arb' first.",
+        spender
+    ))
 }
 
 /// Execute a swap on the specified DEX
@@ -167,8 +138,8 @@ pub async fn execute_swap<P: Provider>(
     println!("    Expected Out: {:.6} {}", expected_out, if params.direction == SwapDirection::Sell { "USDC" } else { "WMON" });
     println!("    Min Out ({:.2}% slip): {:.6}", params.slippage_bps as f64 / 100.0, min_out);
 
-    // Ensure approval
-    ensure_approval(provider, signer, token_in, params.router.address, amount_in, rpc_url).await?;
+    // Check approval (does NOT send TX - run prepare-arb first)
+    check_approval(provider, wallet_address, token_in, params.router.address, amount_in).await?;
 
     // Get deadline (5 minutes from now)
     let deadline = SystemTime::now()
@@ -209,11 +180,12 @@ pub async fn execute_swap<P: Provider>(
 
     println!("    Gas Estimate: {} (using limit: {})", gas_estimate, gas_limit);
 
-    // Build and send transaction
+    // Build and send transaction with local nonce
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(params.router.address)
         .input(alloy::rpc::types::TransactionInput::new(calldata))
-        .gas_limit(gas_limit);
+        .gas_limit(gas_limit)
+        .nonce(next_nonce());
 
     // Create provider with signer
     let url: reqwest::Url = rpc_url.parse()?;
