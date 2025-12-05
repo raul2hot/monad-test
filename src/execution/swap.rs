@@ -264,8 +264,9 @@ pub async fn execute_swap<P: Provider, S: Provider>(
         Ok(pending) => {
             let tx_hash = *pending.tx_hash();
 
-            // CRITICAL: Use fast 100ms polling instead of default 7-second interval!
-            let receipt = wait_for_receipt_fast(provider, tx_hash).await?;
+            // CRITICAL: Use fast 100ms polling on the SAME provider that sent the tx!
+            // Using a different provider can hit different RPC nodes with inconsistent state.
+            let receipt = wait_for_receipt_fast(provider_with_signer, tx_hash).await?;
             let elapsed = start.elapsed();
 
             // Check balance after (skip if skip_balance_check is true - use expected output)
