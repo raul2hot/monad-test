@@ -3,8 +3,17 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
 
-// PancakeSwap V3 SmartRouter - same interface as Uniswap V3
+// PancakeSwap V3 SmartRouter Interface
+// IMPORTANT: PancakeSwap SmartRouter uses IV3SwapRouter which has deadline OUTSIDE the struct
+// but wrapped in a multicall with deadline. For direct calls, we need to use the
+// exactInputSingle that matches their deployed bytecode.
+//
+// After checking PancakeSwap's SmartRouter, it actually uses the SAME interface as SwapRouter02
+// BUT the function selector might be different, OR we need to go through multicall.
+//
+// Alternative: Use the V3Pool directly or use exactInputSingleHop
 sol! {
+    // Standard exactInputSingle (SwapRouter02 style - no deadline in struct)
     #[derive(Debug)]
     struct ExactInputSingleParams {
         address tokenIn;
