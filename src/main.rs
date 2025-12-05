@@ -623,6 +623,28 @@ fn to_wei(amount: f64, decimals: u8) -> alloy::primitives::U256 {
     alloy::primitives::U256::from(wei_amount)
 }
 
+/// Query actual USDC balance for a wallet
+async fn query_usdc_balance<P: Provider>(provider: &P, wallet_address: alloy::primitives::Address) -> Result<f64> {
+    use alloy::sol;
+    use alloy::sol_types::SolCall;
+
+    sol! {
+        #[derive(Debug)]
+        function balanceOf(address account) external view returns (uint256);
+    }
+
+    let balance_call = balanceOfCall { account: wallet_address };
+    let balance_tx = alloy::rpc::types::TransactionRequest::default()
+        .to(USDC_ADDRESS)
+        .input(alloy::rpc::types::TransactionInput::new(
+            alloy::primitives::Bytes::from(balance_call.abi_encode())
+        ));
+    let result = provider.call(balance_tx).await?;
+    let balance_wei = alloy::primitives::U256::from_be_slice(&result);
+    let balance_human = (balance_wei.to::<u128>() as f64) / 1_000_000.0; // USDC has 6 decimals
+    Ok(balance_human)
+}
+
 /// Helper function to pre-build swap calldata without executing
 fn build_swap_calldata_only(
     router: &RouterConfig,
@@ -778,20 +800,28 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         return Err(eyre::eyre!("Step 1 failed: Sell swap failed"));
     }
 
-    let usdc_received = sell_result.amount_out_human;
-    println!("  ✓ Received: {:.6} USDC", usdc_received);
+    let usdc_estimated = sell_result.amount_out_human;
+    println!("  ✓ Estimated received: {:.6} USDC", usdc_estimated);
 
     // ═══════════════════════════════════════════════════════════════════
-    // MONAD STATE COMMITMENT - WebSocket block subscription
-    // Monad uses asynchronous execution with delayed state commitment.
-    // Wait for next block to ensure swap 1's state is committed.
-    // This is event-driven (no polling) - proper async pattern!
+    // MONAD STATE COMMITMENT + ACTUAL BALANCE QUERY (PARALLEL)
+    // Query actual USDC balance while waiting for block confirmation.
+    // This ensures we use the real balance for swap 2, not an estimate.
+    // Running in parallel adds ZERO latency.
     // ═══════════════════════════════════════════════════════════════════
     let ws_url = std::env::var("MONAD_WS_URL")
         .unwrap_or_else(|_| rpc_url.replace("https://", "wss://").replace("http://", "ws://"));
-    println!("  ⏳ Waiting for next block (WebSocket subscription)...");
+    println!("  ⏳ Waiting for block + querying actual USDC balance (parallel)...");
     let t_block = std::time::Instant::now();
-    match wait_for_next_block(&ws_url).await {
+
+    // Run block wait and balance query in parallel
+    let block_future = wait_for_next_block(&ws_url);
+    let balance_future = query_usdc_balance(&provider, signer_address);
+
+    let (block_result, balance_result) = tokio::join!(block_future, balance_future);
+
+    // Handle block wait result
+    match block_result {
         Ok(block_num) => {
             println!("  ✓ Block {} confirmed in {:?}", block_num, t_block.elapsed());
         }
@@ -801,8 +831,25 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         }
     }
 
-    // Use the USDC received from swap 1 (not entire wallet balance!)
-    let usdc_for_swap2 = usdc_received;
+    // Get actual USDC balance for swap 2
+    let usdc_for_swap2 = match balance_result {
+        Ok(actual_balance) => {
+            if (actual_balance - usdc_estimated).abs() > 0.000001 {
+                println!("  ⚠ Estimate vs Actual: {:.6} vs {:.6} (diff: {:+.6})",
+                    usdc_estimated, actual_balance, actual_balance - usdc_estimated);
+            }
+            println!("  ✓ Using actual USDC balance: {:.6}", actual_balance);
+            actual_balance
+        }
+        Err(e) => {
+            println!("  ⚠ Balance query failed ({}), using estimate with 0.5% buffer", e);
+            usdc_estimated * 0.995  // Safety buffer if query fails
+        }
+    };
+
+    if usdc_for_swap2 < 0.000001 {
+        return Err(eyre::eyre!("No USDC balance available for swap 2. Swap 1 may have failed silently."));
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 2: Buy WMON with USDC on buy_dex
@@ -862,7 +909,7 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     println!("    WMON In:         {:>12.6} WMON", amount);
     println!();
     println!("  INTERMEDIATE:");
-    println!("    USDC Received:   {:>12.6} USDC", usdc_received);
+    println!("    USDC Received:   {:>12.6} USDC", usdc_for_swap2);
     println!();
     println!("  OUTPUT:");
     println!("    WMON Out:        {:>12.6} WMON", wmon_received);
