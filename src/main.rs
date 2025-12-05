@@ -801,28 +801,8 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // DEBUG: Verify actual USDC balance before swap 2
-    // ═══════════════════════════════════════════════════════════════════
-    let actual_usdc_balance = {
-        use alloy::sol;
-        use alloy::sol_types::SolCall;
-        sol! {
-            function balanceOf(address account) external view returns (uint256);
-        }
-        let balance_call = balanceOfCall { account: signer_address };
-        let tx = alloy::rpc::types::TransactionRequest::default()
-            .to(USDC_ADDRESS)
-            .input(alloy::rpc::types::TransactionInput::new(alloy::primitives::Bytes::from(balance_call.abi_encode())));
-        let result = provider.call(tx).await?;
-        let balance = alloy::primitives::U256::from_be_slice(&result);
-        let balance_human = balance.to::<u128>() as f64 / 1_000_000.0;  // USDC has 6 decimals
-        println!("  📊 DEBUG: Actual USDC balance: {:.6} (expected: {:.6})", balance_human, usdc_received);
-        balance_human
-    };
-
-    // Use ACTUAL balance instead of estimated
-    let usdc_for_swap2 = actual_usdc_balance;
+    // Use the USDC received from swap 1 (not entire wallet balance!)
+    let usdc_for_swap2 = usdc_received;
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 2: Buy WMON with USDC on buy_dex
