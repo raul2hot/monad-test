@@ -782,6 +782,15 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     println!("  ✓ Received: {:.6} USDC", usdc_received);
 
     // ═══════════════════════════════════════════════════════════════════
+    // MONAD STATE COMMITMENT DELAY
+    // Monad uses asynchronous execution with delayed state commitment.
+    // Wait briefly to ensure swap 1's state (USDC balance) is committed
+    // before swap 2 tries to spend it.
+    // ═══════════════════════════════════════════════════════════════════
+    println!("  ⏳ Waiting for Monad state commitment (500ms)...");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // ═══════════════════════════════════════════════════════════════════
     // STEP 2: Buy WMON with USDC on buy_dex
     // ═══════════════════════════════════════════════════════════════════
     println!("\n┌─────────────────────────────────────────────────────────────┐");
