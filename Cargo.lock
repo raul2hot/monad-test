@@ -2601,6 +2601,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "eyre",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

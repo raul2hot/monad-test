@@ -108,6 +108,28 @@ async fn wait_for_receipt_fast<P: Provider>(
     .map_err(|_| eyre::eyre!("Transaction confirmation timeout after 30s"))?
 }
 
+/// Wait for the next block using WebSocket subscription (for Monad state commitment)
+/// This is the proper event-driven approach - no polling!
+/// Subscribes to newHeads and waits for one block, then returns.
+pub async fn wait_for_next_block(ws_url: &str) -> Result<u64> {
+    use alloy::providers::{ProviderBuilder, WsConnect};
+    use futures_util::StreamExt;
+
+    let ws = WsConnect::new(ws_url);
+    let ws_provider = ProviderBuilder::new().connect_ws(ws).await?;
+
+    // Subscribe to new block headers
+    let subscription = ws_provider.subscribe_blocks().await?;
+    let mut stream = subscription.into_stream();
+
+    // Wait for the next block (just one)
+    if let Some(block) = stream.next().await {
+        return Ok(block.number);
+    }
+
+    Err(eyre::eyre!("WebSocket stream ended unexpectedly"))
+}
+
 /// Check that router has sufficient approval. Does NOT send approval TX.
 /// If approval is missing, returns error instructing user to run prepare-arb.
 pub async fn check_approval<P: Provider>(
