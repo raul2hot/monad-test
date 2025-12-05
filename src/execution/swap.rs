@@ -80,10 +80,10 @@ fn from_wei(amount: U256, decimals: u8) -> f64 {
 /// Get hardcoded gas limit for a router type (eliminates gas estimation RPC calls)
 fn get_gas_limit_for_router(router_type: RouterType) -> u64 {
     match router_type {
-        RouterType::UniswapV3 => 280_000,
-        RouterType::PancakeV3 => 280_000,
-        RouterType::LfjLB => 420_000,
-        RouterType::MondayTrade => 280_000,
+        RouterType::UniswapV3 => 400_000,     // Was 280k
+        RouterType::PancakeV3 => 800_000,     // Was 280k - BUY needs A LOT!
+        RouterType::LfjLB => 800_000,         // Was 420k
+        RouterType::MondayTrade => 800_000,   // Was 280k
     }
 }
 
