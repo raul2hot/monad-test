@@ -1,4 +1,5 @@
-use alloy::providers::ProviderBuilder;
+use alloy::network::EthereumWallet;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use clap::{Parser, Subcommand};
 use eyre::Result;
@@ -228,11 +229,22 @@ async fn run_test_swap(dex: &str, amount: f64, direction: &str, slippage: u32) -
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
 
     let url: reqwest::Url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url);
+    let provider = ProviderBuilder::new().connect_http(url.clone());
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
-    init_nonce(&provider, signer.address()).await?;
-    println!("Wallet: {:?}", signer.address());
+    let signer_address = signer.address();
+    init_nonce(&provider, signer_address).await?;
+    println!("Wallet: {:?}", signer_address);
+
+    // Create provider with signer ONCE (optimization: avoid rebuilding per swap)
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Fetch gas price ONCE (optimization: avoid RPC call per swap)
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+    println!("  [TIMING] Gas price: {} gwei", gas_price / 1_000_000_000);
 
     // Get router config
     let router = get_router_by_name(dex)
@@ -240,7 +252,9 @@ async fn run_test_swap(dex: &str, amount: f64, direction: &str, slippage: u32) -
 
     // Get current prices
     println!("Fetching current prices...");
+    let t0 = std::time::Instant::now();
     let prices = get_current_prices(&provider).await?;
+    println!("  [TIMING] Price fetch: {:?}", t0.elapsed());
 
     let price = prices.iter()
         .find(|p| p.pool_name.to_lowercase() == dex.to_lowercase())
@@ -266,7 +280,16 @@ async fn run_test_swap(dex: &str, amount: f64, direction: &str, slippage: u32) -
     println!("  EXECUTING TEST SWAP ON {}", dex.to_uppercase());
     println!("══════════════════════════════════════════════════════════════");
 
-    let result = execute_swap(&provider, &signer, params, &rpc_url).await?;
+    let t1 = std::time::Instant::now();
+    let result = execute_swap(
+        &provider,
+        &provider_with_signer,
+        signer_address,
+        params,
+        gas_price,
+        false,  // Don't skip balance check for test swaps
+    ).await?;
+    println!("  [TIMING] Swap execution: {:?}", t1.elapsed());
     print_swap_report(&result);
 
     Ok(())
@@ -277,11 +300,22 @@ async fn run_test_all(amount: f64, direction: &str, slippage: u32) -> Result<()>
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
 
     let url: reqwest::Url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url);
+    let provider = ProviderBuilder::new().connect_http(url.clone());
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
-    init_nonce(&provider, signer.address()).await?;
-    println!("Wallet: {:?}", signer.address());
+    let signer_address = signer.address();
+    init_nonce(&provider, signer_address).await?;
+    println!("Wallet: {:?}", signer_address);
+
+    // Create provider with signer ONCE (optimization: avoid rebuilding per swap)
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Fetch gas price ONCE (optimization: avoid RPC call per swap)
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+    println!("  [TIMING] Gas price: {} gwei", gas_price / 1_000_000_000);
 
     let prices = get_current_prices(&provider).await?;
 
@@ -323,8 +357,17 @@ async fn run_test_all(amount: f64, direction: &str, slippage: u32) -> Result<()>
             expected_price: price,
         };
 
-        match execute_swap(&provider, &signer, params, &rpc_url).await {
+        let t0 = std::time::Instant::now();
+        match execute_swap(
+            &provider,
+            &provider_with_signer,
+            signer_address,
+            params,
+            gas_price,
+            false,  // Don't skip balance check for test swaps
+        ).await {
             Ok(result) => {
+                println!("  [TIMING] Swap execution: {:?}", t0.elapsed());
                 print_swap_report(&result);
                 results.push(result);
             }
@@ -418,11 +461,21 @@ async fn run_buy_mon(amount: f64, dex: &str, slippage: u32, keep_wrapped: bool) 
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
 
     let url: reqwest::Url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url);
+    let provider = ProviderBuilder::new().connect_http(url.clone());
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
-    init_nonce(&provider, signer.address()).await?;
-    println!("Wallet: {:?}", signer.address());
+    let signer_address = signer.address();
+    init_nonce(&provider, signer_address).await?;
+    println!("Wallet: {:?}", signer_address);
+
+    // Create provider with signer ONCE (optimization: avoid rebuilding per swap)
+    let wallet = EthereumWallet::from(signer.clone());
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Fetch gas price ONCE (optimization: avoid RPC call per swap)
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
 
     // Get router config
     let router = get_router_by_name(dex)
@@ -451,7 +504,14 @@ async fn run_buy_mon(amount: f64, dex: &str, slippage: u32, keep_wrapped: bool) 
         expected_price: price.price,
     };
 
-    let swap_result = execute_swap(&provider, &signer, params, &rpc_url).await?;
+    let swap_result = execute_swap(
+        &provider,
+        &provider_with_signer,
+        signer_address,
+        params,
+        gas_price,
+        false,  // Don't skip balance check
+    ).await?;
     print_swap_report(&swap_result);
 
     if !swap_result.success {
@@ -480,11 +540,21 @@ async fn run_sell_mon(amount: f64, dex: &str, slippage: u32, use_wmon: bool) -> 
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
 
     let url: reqwest::Url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url);
+    let provider = ProviderBuilder::new().connect_http(url.clone());
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
-    init_nonce(&provider, signer.address()).await?;
-    println!("Wallet: {:?}", signer.address());
+    let signer_address = signer.address();
+    init_nonce(&provider, signer_address).await?;
+    println!("Wallet: {:?}", signer_address);
+
+    // Create provider with signer ONCE (optimization: avoid rebuilding per swap)
+    let wallet = EthereumWallet::from(signer.clone());
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Fetch gas price ONCE (optimization: avoid RPC call per swap)
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
 
     // Get router config
     let router = get_router_by_name(dex)
@@ -528,12 +598,19 @@ async fn run_sell_mon(amount: f64, dex: &str, slippage: u32, use_wmon: bool) -> 
         expected_price: price.price,
     };
 
-    let swap_result = execute_swap(&provider, &signer, params, &rpc_url).await?;
+    let swap_result = execute_swap(
+        &provider,
+        &provider_with_signer,
+        signer_address,
+        params,
+        gas_price,
+        false,  // Don't skip balance check
+    ).await?;
     print_swap_report(&swap_result);
 
     // Show updated balances
     println!("\nFinal balances:");
-    let balances = get_balances(&provider, signer.address()).await?;
+    let balances = get_balances(&provider, signer_address).await?;
     print_balances(&balances);
 
     Ok(())
@@ -579,15 +656,31 @@ fn build_swap_calldata_only(
 }
 
 async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32) -> Result<()> {
+    let arb_start = std::time::Instant::now();
+
     let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
 
     let url: reqwest::Url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url);
+    let provider = ProviderBuilder::new().connect_http(url.clone());
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
-    init_nonce(&provider, signer.address()).await?;
-    println!("Wallet: {:?}", signer.address());
+    let signer_address = signer.address();
+    init_nonce(&provider, signer_address).await?;
+    println!("Wallet: {:?}", signer_address);
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PHASE 4B OPTIMIZATIONS: Create provider_with_signer and fetch gas_price ONCE
+    // ═══════════════════════════════════════════════════════════════════
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Fetch gas price ONCE (saves ~100-300ms per swap)
+    let t_gas = std::time::Instant::now();
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+    println!("  [TIMING] Gas price fetch: {:?} ({} gwei)", t_gas.elapsed(), gas_price / 1_000_000_000);
 
     // Get routers
     let sell_router = get_router_by_name(sell_dex)
@@ -597,7 +690,9 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
 
     // Get current prices
     println!("\nFetching current prices...");
+    let t_price = std::time::Instant::now();
     let prices = get_current_prices(&provider).await?;
+    println!("  [TIMING] Price fetch: {:?}", t_price.elapsed());
 
     let sell_price = prices.iter()
         .find(|p| p.pool_name.to_lowercase() == sell_dex.to_lowercase())
@@ -636,13 +731,13 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         SwapDirection::Buy,
         expected_usdc_wei,  // Will use actual USDC if differs significantly
         min_wmon_out_wei,
-        signer.address(),
+        signer_address,
     )?;
 
     println!("\n  Pre-built swap 2 calldata (expected USDC: {:.6})", expected_usdc);
 
     // Get initial WMON balance
-    let balances_before = get_balances(&provider, signer.address()).await?;
+    let balances_before = get_balances(&provider, signer_address).await?;
     println!("  Starting WMON balance: {:.6}", balances_before.wmon_human);
 
     println!("\n══════════════════════════════════════════════════════════════");
@@ -667,7 +762,16 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         expected_price: sell_price.price,
     };
 
-    let sell_result = execute_swap(&provider, &signer, sell_params, &rpc_url).await?;
+    let t_swap1 = std::time::Instant::now();
+    let sell_result = execute_swap(
+        &provider,
+        &provider_with_signer,
+        signer_address,
+        sell_params,
+        gas_price,
+        true,  // Skip balance check for arb (optimization: saves ~400ms)
+    ).await?;
+    println!("  [TIMING] Swap 1 execution: {:?}", t_swap1.elapsed());
     print_swap_report(&sell_result);
 
     if !sell_result.success {
@@ -684,12 +788,9 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     println!("│ STEP 2: Buy WMON with {:.6} USDC on {}", usdc_received, buy_dex);
     println!("└─────────────────────────────────────────────────────────────┘");
 
-    // Refresh prices for step 2 (prices may have moved)
-    let prices = get_current_prices(&provider).await?;
-    let buy_price_updated = prices.iter()
-        .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
-        .map(|p| p.price)
-        .unwrap_or(buy_price.price);
+    // Skip price refresh for speed - use original price (optimization: saves ~200ms)
+    // For production, you might want to use actual USDC received to recalculate
+    let buy_price_updated = buy_price.price;
 
     let buy_params = SwapParams {
         router: buy_router,
@@ -699,7 +800,16 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         expected_price: buy_price_updated,
     };
 
-    let buy_result = execute_swap(&provider, &signer, buy_params, &rpc_url).await?;
+    let t_swap2 = std::time::Instant::now();
+    let buy_result = execute_swap(
+        &provider,
+        &provider_with_signer,
+        signer_address,
+        buy_params,
+        gas_price,
+        true,  // Skip balance check for arb (optimization: saves ~400ms)
+    ).await?;
+    println!("  [TIMING] Swap 2 execution: {:?}", t_swap2.elapsed());
     print_swap_report(&buy_result);
 
     if !buy_result.success {
@@ -711,7 +821,7 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     // ═══════════════════════════════════════════════════════════════════
     // FINAL REPORT
     // ═══════════════════════════════════════════════════════════════════
-    let balances_after = get_balances(&provider, signer.address()).await?;
+    let balances_after = get_balances(&provider, signer_address).await?;
 
     let total_gas_cost = sell_result.gas_cost_wei.to::<u128>() as f64 / 1e18
                        + buy_result.gas_cost_wei.to::<u128>() as f64 / 1e18;
@@ -757,6 +867,8 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         println!("  ❌ ARBITRAGE UNPROFITABLE");
     }
 
+    println!();
+    println!("  [TIMING] TOTAL ARB EXECUTION: {:?}", arb_start.elapsed());
     println!("═══════════════════════════════════════════════════════════════");
 
     Ok(())
