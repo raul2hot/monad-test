@@ -763,11 +763,14 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
 }
 
 async fn run_prepare_arb() -> Result<()> {
-    use alloy::network::EthereumWallet;
+    use alloy::network::{EthereumWallet, TransactionBuilder};
     use alloy::primitives::{Bytes, U256};
     use alloy::providers::Provider;
     use alloy::sol;
     use alloy::sol_types::SolCall;
+
+    // Monad mainnet chain ID
+    const MONAD_CHAIN_ID: u64 = 143;
 
     // ERC20 approve interface
     sol! {
@@ -782,7 +785,11 @@ async fn run_prepare_arb() -> Result<()> {
     let provider = ProviderBuilder::new().connect_http(url.clone());
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
-    init_nonce(&provider, signer.address()).await?;
+    let wallet_address = signer.address();
+    init_nonce(&provider, wallet_address).await?;
+
+    // Fetch gas price once
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
 
     let wallet = EthereumWallet::from(signer.clone());
     let provider_with_signer = ProviderBuilder::new()
@@ -792,7 +799,7 @@ async fn run_prepare_arb() -> Result<()> {
     println!("══════════════════════════════════════════════════════════════");
     println!("  PREPARING WALLET FOR ARBITRAGE");
     println!("══════════════════════════════════════════════════════════════");
-    println!("Wallet: {:?}", signer.address());
+    println!("Wallet: {:?}", wallet_address);
 
     // Router addresses and names
     let routers = [
@@ -820,11 +827,16 @@ async fn run_prepare_arb() -> Result<()> {
                 amount: U256::MAX,
             };
 
+            // Build transaction with ALL fields set to prevent filler RPC calls
             let tx = alloy::rpc::types::TransactionRequest::default()
                 .to(*token)
+                .from(wallet_address)
                 .input(alloy::rpc::types::TransactionInput::new(Bytes::from(approve_call.abi_encode())))
                 .gas_limit(100_000)
-                .nonce(nonce::next_nonce());
+                .nonce(nonce::next_nonce())
+                .max_fee_per_gas(gas_price + (gas_price / 10))
+                .max_priority_fee_per_gas(gas_price / 10)
+                .with_chain_id(MONAD_CHAIN_ID);
 
             match provider_with_signer.send_transaction(tx).await {
                 Ok(pending) => {

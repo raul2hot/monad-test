@@ -1,4 +1,4 @@
-use alloy::network::EthereumWallet;
+use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
@@ -10,6 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::{RouterConfig, WMON_ADDRESS, USDC_ADDRESS, WMON_DECIMALS, USDC_DECIMALS};
 use crate::nonce::next_nonce;
 use super::routers::build_swap_calldata;
+
+// Monad mainnet chain ID
+const MONAD_CHAIN_ID: u64 = 143;
 
 // ERC20 interface for approvals and balance checks
 sol! {
@@ -178,16 +181,24 @@ pub async fn execute_swap<P: Provider>(
     let gas_estimate = provider.estimate_gas(estimate_tx).await.unwrap_or(250_000);
     let gas_limit = gas_estimate + (gas_estimate / 10);  // Add 10% buffer
 
-    println!("    Gas Estimate: {} (using limit: {})", gas_estimate, gas_limit);
+    // Fetch gas price once to avoid filler RPC calls
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000); // 100 gwei default
 
-    // Build and send transaction with local nonce
+    println!("    Gas Estimate: {} (using limit: {}, gas_price: {} gwei)",
+             gas_estimate, gas_limit, gas_price / 1_000_000_000);
+
+    // Build transaction with ALL fields set to prevent filler RPC calls
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(params.router.address)
+        .from(wallet_address)
         .input(alloy::rpc::types::TransactionInput::new(calldata))
         .gas_limit(gas_limit)
-        .nonce(next_nonce());
+        .nonce(next_nonce())
+        .max_fee_per_gas(gas_price + (gas_price / 10))  // Add 10% buffer
+        .max_priority_fee_per_gas(gas_price / 10)       // 10% tip
+        .with_chain_id(MONAD_CHAIN_ID);
 
-    // Create provider with signer
+    // Create provider with signer - disable fillers since we set all fields
     let url: reqwest::Url = rpc_url.parse()?;
     let provider_with_signer = ProviderBuilder::new()
         .wallet(wallet)
