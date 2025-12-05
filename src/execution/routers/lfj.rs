@@ -62,8 +62,9 @@ pub fn build_swap_exact_tokens_for_tokens(
     amount_out_min: U256,
     recipient: Address,
     deadline: u64,
+    bin_step: u32,  // Bin step from pool config (e.g., 15 for WMON/USDC)
 ) -> Result<Bytes> {
-    build_swap_with_bin_step(token_in, token_out, amount_in, amount_out_min, recipient, deadline, DEFAULT_BIN_STEP)
+    build_swap_with_bin_step(token_in, token_out, amount_in, amount_out_min, recipient, deadline, bin_step as u64)
 }
 
 /// Build swap calldata with custom bin step

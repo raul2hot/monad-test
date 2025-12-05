@@ -32,7 +32,8 @@ pub fn build_swap_calldata(
         }
         RouterType::LfjLB => {
             lfj::build_swap_exact_tokens_for_tokens(
-                token_in, token_out, amount_in, amount_out_min, recipient, deadline
+                token_in, token_out, amount_in, amount_out_min, recipient, deadline,
+                pool_fee,  // Pass pool_fee as bin_step for LFJ
             )
         }
         RouterType::MondayTrade => {
