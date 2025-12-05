@@ -74,7 +74,7 @@ pub fn get_monday_trade_pool() -> PoolConfig {
         name: "MondayTrade",
         address: alloy::primitives::address!("8f889ba499c0a176fb8f233d9d35b1c132eb868c"),
         pool_type: PoolType::MondayTrade,
-        fee_bps: 30, // Assuming 0.30% fee, adjust as needed
+        fee_bps: 5, // 0.05% fee (NOT 30!)
     }
 }
 
@@ -147,7 +147,7 @@ pub fn get_routers() -> Vec<RouterConfig> {
             address: MONDAY_SWAP_ROUTER,
             router_type: RouterType::MondayTrade,
             pool_address: alloy::primitives::address!("8f889ba499c0a176fb8f233d9d35b1c132eb868c"),
-            pool_fee: 3000,  // 0.30%
+            pool_fee: 500,  // 0.05% fee tier (NOT 3000!)
         },
     ]
 }
