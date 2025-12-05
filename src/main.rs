@@ -25,7 +25,7 @@ use config::{
     RouterConfig,
 };
 use display::{display_prices, init_arb_log};
-use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata};
+use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata, wait_for_next_block};
 use execution::report::print_comparison_report;
 use multicall::fetch_prices_batched;
 use nonce::init_nonce;
@@ -782,13 +782,24 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     println!("  ✓ Received: {:.6} USDC", usdc_received);
 
     // ═══════════════════════════════════════════════════════════════════
-    // MONAD STATE COMMITMENT DELAY
+    // MONAD STATE COMMITMENT - WebSocket block subscription
     // Monad uses asynchronous execution with delayed state commitment.
-    // Wait briefly to ensure swap 1's state (USDC balance) is committed
-    // before swap 2 tries to spend it.
+    // Wait for next block to ensure swap 1's state is committed.
+    // This is event-driven (no polling) - proper async pattern!
     // ═══════════════════════════════════════════════════════════════════
-    println!("  ⏳ Waiting for Monad state commitment (500ms)...");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let ws_url = std::env::var("MONAD_WS_URL")
+        .unwrap_or_else(|_| rpc_url.replace("https://", "wss://").replace("http://", "ws://"));
+    println!("  ⏳ Waiting for next block (WebSocket subscription)...");
+    let t_block = std::time::Instant::now();
+    match wait_for_next_block(&ws_url).await {
+        Ok(block_num) => {
+            println!("  ✓ Block {} confirmed in {:?}", block_num, t_block.elapsed());
+        }
+        Err(e) => {
+            println!("  ⚠ WebSocket failed ({}), falling back to 500ms delay", e);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 2: Buy WMON with USDC on buy_dex
