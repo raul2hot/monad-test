@@ -38,9 +38,9 @@ pub struct WrapResult {
 
 /// Convert human amount to U256 with proper decimals
 fn to_wei(amount: f64, decimals: u8) -> U256 {
-    let multiplier = 10u64.pow(decimals as u32);
-    let wei_amount = (amount * multiplier as f64) as u64;
-    U256::from(wei_amount)
+    let multiplier = U256::from(10u64).pow(U256::from(decimals));
+    let amount_scaled = (amount * 1e18) as u128;
+    U256::from(amount_scaled) * multiplier / U256::from(10u64).pow(U256::from(18u8))
 }
 
 /// Convert U256 to human-readable with proper decimals

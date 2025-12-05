@@ -618,9 +618,9 @@ async fn run_sell_mon(amount: f64, dex: &str, slippage: u32, use_wmon: bool) -> 
 
 /// Helper function to convert human amount to U256 with proper decimals
 fn to_wei(amount: f64, decimals: u8) -> alloy::primitives::U256 {
-    let multiplier = 10u64.pow(decimals as u32);
-    let wei_amount = (amount * multiplier as f64) as u64;
-    alloy::primitives::U256::from(wei_amount)
+    let multiplier = alloy::primitives::U256::from(10u64).pow(alloy::primitives::U256::from(decimals));
+    let amount_scaled = (amount * 1e18) as u128;
+    alloy::primitives::U256::from(amount_scaled) * multiplier / alloy::primitives::U256::from(10u64).pow(alloy::primitives::U256::from(18u8))
 }
 
 /// Query actual USDC balance for a wallet
@@ -793,7 +793,7 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         signer_address,
         sell_params,
         gas_price,
-        true,  // Skip balance check for arb (optimization: saves ~400ms)
+        false,  // CHANGED: Must get actual USDC received for swap 2
     ).await?;
     println!("  [TIMING] Swap 1 execution: {:?}", t_swap1.elapsed());
     print_swap_report(&sell_result);
@@ -805,15 +805,10 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     let usdc_estimated = sell_result.amount_out_human;
     println!("  ✓ Estimated received: {:.6} USDC", usdc_estimated);
 
-    // ═══════════════════════════════════════════════════════════════════
-    // MONAD STATE COMMITMENT - Wait for block FIRST, then query balance
-    // Monad uses asynchronous execution with delayed state commitment.
-    // We MUST wait for the block before querying balance, otherwise we
-    // get the pre-swap balance (state not yet committed).
-    // ═══════════════════════════════════════════════════════════════════
+    // MONAD STATE COMMITMENT - Wait for block then retry balance query
     let ws_url = std::env::var("MONAD_WS_URL")
         .unwrap_or_else(|_| rpc_url.replace("https://", "wss://").replace("http://", "ws://"));
-    println!("  ⏳ Waiting for block confirmation (Monad state commitment)...");
+    println!("  ⏳ Waiting for Monad state commitment...");
     let t_block = std::time::Instant::now();
 
     match wait_for_next_block(&ws_url).await {
@@ -821,35 +816,35 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
             println!("  ✓ Block {} confirmed in {:?}", block_num, t_block.elapsed());
         }
         Err(e) => {
-            println!("  ⚠ WebSocket failed ({}), falling back to 500ms delay", e);
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            println!("  ⚠ WebSocket failed ({}), using 1s delay", e);
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         }
     }
 
-    // NOW query actual USDC balance (after state is committed)
-    let usdc_for_swap2 = match query_usdc_balance(&provider, signer_address).await {
-        Ok(actual_balance) => {
-            let usdc_received = actual_balance - usdc_before;
-            // Round DOWN to 6 decimals and apply 0.1% safety buffer
-            // This ensures we never try to spend more than we have due to rounding
-            let usdc_received = (usdc_received * 1_000_000.0).floor() / 1_000_000.0;
-            let usdc_safe = usdc_received * 0.999; // 0.1% safety buffer
-            let diff_pct = ((usdc_received - usdc_estimated) / usdc_estimated * 100.0).abs();
-            if diff_pct > 1.0 {
-                println!("  ⚠ Estimate vs Actual: {:.6} vs {:.6} ({:+.2}%)",
-                    usdc_estimated, usdc_received, (usdc_received - usdc_estimated) / usdc_estimated * 100.0);
+    // Retry balance query up to 3 times with 200ms gaps
+    let mut usdc_for_swap2 = 0.0;
+    for attempt in 1..=3 {
+        match query_usdc_balance(&provider, signer_address).await {
+            Ok(actual_balance) => {
+                let usdc_received = actual_balance - usdc_before;
+                if usdc_received > 0.0001 {
+                    let usdc_received = (usdc_received * 1_000_000.0).floor() / 1_000_000.0;
+                    let usdc_safe = usdc_received * 0.998;
+                    println!("  ✓ USDC received: {:.6} (using {:.6})", usdc_received, usdc_safe);
+                    usdc_for_swap2 = usdc_safe;
+                    break;
+                }
             }
-            println!("  ✓ Actual USDC received: {:.6} (using {:.6} with safety buffer)", usdc_received, usdc_safe);
-            usdc_safe
+            Err(_) => {}
         }
-        Err(e) => {
-            println!("  ⚠ Balance query failed ({}), using estimate with 0.5% buffer", e);
-            usdc_estimated * 0.995
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-    };
+    }
 
     if usdc_for_swap2 < 0.000001 {
-        return Err(eyre::eyre!("No USDC received from swap 1. Swap may have failed silently."));
+        usdc_for_swap2 = usdc_estimated * 0.99;
+        println!("  ⚠ Using estimated USDC: {:.6}", usdc_for_swap2);
     }
 
     // ═══════════════════════════════════════════════════════════════════
