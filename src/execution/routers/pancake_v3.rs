@@ -3,17 +3,8 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
 
-// PancakeSwap V3 SmartRouter Interface
-// IMPORTANT: PancakeSwap SmartRouter uses IV3SwapRouter which has deadline OUTSIDE the struct
-// but wrapped in a multicall with deadline. For direct calls, we need to use the
-// exactInputSingle that matches their deployed bytecode.
-//
-// After checking PancakeSwap's SmartRouter, it actually uses the SAME interface as SwapRouter02
-// BUT the function selector might be different, OR we need to go through multicall.
-//
-// Alternative: Use the V3Pool directly or use exactInputSingleHop
 sol! {
-    // Standard exactInputSingle (SwapRouter02 style - no deadline in struct)
+    // Inner swap params (no deadline in struct - SwapRouter02 style)
     #[derive(Debug)]
     struct ExactInputSingleParams {
         address tokenIn;
@@ -30,6 +21,13 @@ sol! {
         external
         payable
         returns (uint256 amountOut);
+
+    // REQUIRED: Multicall wrapper with deadline
+    #[derive(Debug)]
+    function multicall(uint256 deadline, bytes[] calldata data)
+        external
+        payable
+        returns (bytes[] memory results);
 }
 
 pub fn build_exact_input_single(
@@ -39,6 +37,7 @@ pub fn build_exact_input_single(
     recipient: Address,
     amount_in: U256,
     amount_out_min: U256,
+    deadline: u64,  // ADD this parameter
 ) -> Result<Bytes> {
     let fee_uint24: Uint<24, 1> = Uint::from(fee);
 
@@ -52,6 +51,14 @@ pub fn build_exact_input_single(
         sqrtPriceLimitX96: U160::ZERO,
     };
 
-    let calldata = exactInputSingleCall { params }.abi_encode();
+    // Encode inner exactInputSingle call
+    let inner_calldata = exactInputSingleCall { params }.abi_encode();
+    
+    // WRAP in multicall with deadline - THIS IS REQUIRED!
+    let calldata = multicallCall {
+        deadline: U256::from(deadline),
+        data: vec![Bytes::from(inner_calldata)],
+    }.abi_encode();
+
     Ok(Bytes::from(calldata))
 }

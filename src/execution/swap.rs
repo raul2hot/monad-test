@@ -220,6 +220,17 @@ pub async fn execute_swap<P: Provider, S: Provider>(
         .unwrap()
         .as_secs() + 300;
 
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  CALLDATA DEBUG - EXACT VALUES TO ROUTER");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  token_in:       {:?}", token_in);
+    println!("  token_out:      {:?}", token_out);
+    println!("  amount_in:      {} (raw U256)", amount_in);
+    println!("  amount_out_min: {} (raw U256)", amount_out_min);
+    println!("  pool_fee:       {}", params.router.pool_fee);
+    println!("  recipient:      {:?}", wallet_address);
+    println!("═══════════════════════════════════════════════════════════════");
+
     // Build swap calldata
     let calldata = build_swap_calldata(
         params.router.router_type,

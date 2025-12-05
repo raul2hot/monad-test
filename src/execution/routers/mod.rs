@@ -27,7 +27,7 @@ pub fn build_swap_calldata(
         }
         RouterType::PancakeV3 => {
             pancake_v3::build_exact_input_single(
-                token_in, token_out, pool_fee, recipient, amount_in, amount_out_min
+                token_in, token_out, pool_fee, recipient, amount_in, amount_out_min, deadline
             )
         }
         RouterType::LfjLB => {
