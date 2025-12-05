@@ -1,240 +1,219 @@
-# Phase 4B: CRITICAL FIX - Alloy Receipt Polling Interval
+# Fix: DEX-to-DEX Arbitrage Second Leg Revert Bug
 
-## Root Cause Identified
+## Problem Summary
+The second swap in `run_test_arb` consistently fails with "Transaction reverted" because it tries to spend an **estimated** USDC amount rather than the **actual** USDC received from swap 1.
 
-The **7-second delay** is caused by **alloy's default receipt polling interval** for HTTP providers.
+## Root Cause
 
-When you call:
+### Location: `src/execution/swap.rs` lines 209-218
+
+When `skip_balance_check=true`, the `execute_swap` function returns an **estimated** output amount based on `expected_price`, not the actual tokens received:
+
 ```rust
-let receipt = pending.get_receipt().await?;
+let amount_out = if skip_balance_check {
+    // Estimate output based on expected price (no RPC call)
+    let expected_out = match params.direction {
+        SwapDirection::Sell => params.amount_in * params.expected_price,
+        SwapDirection::Buy => params.amount_in / params.expected_price,
+    };
+    to_wei(expected_out, decimals_out)
+} // ...
 ```
 
-Alloy uses a default polling interval of **7 seconds** to check if the transaction has been mined. This is why each swap takes exactly ~7 seconds regardless of other optimizations.
+### Impact in `src/main.rs` `run_test_arb` function:
+
+```rust
+// Swap 1 is called with skip_balance_check=true
+let sell_result = execute_swap(..., true).await?;  // skip_balance_check=true
+
+let usdc_received = sell_result.amount_out_human;  // ← THIS IS AN ESTIMATE, NOT ACTUAL!
+
+// Later...
+let usdc_for_swap2 = usdc_received;  // Uses estimate, not actual balance!
+```
+
+If the actual USDC received differs from the estimate by even 1 wei (due to price movement, slippage, or rounding), swap 2 reverts with insufficient balance.
 
 ---
 
-## FIX 1: Custom Fast Receipt Polling (CRITICAL)
+## The Fix
 
-**File:** `src/execution/swap.rs`
+Query the actual USDC balance **in parallel** with the block wait. This adds **zero additional latency** since both operations run concurrently.
 
-### Step 1: Add Required Imports
+---
 
-At the top of the file, add:
-```rust
-use std::time::Duration;
-use tokio::time::{interval, timeout};
-use alloy::primitives::TxHash;
-use alloy::rpc::types::TransactionReceipt;
-```
+## Step 1: Add Helper Function
 
-### Step 2: Add Fast Polling Helper Function
-
-Add this function before `execute_swap()`:
+Add this function in `src/main.rs` (place it near the other helper functions like `to_wei` and `build_swap_calldata_only`, around line 540):
 
 ```rust
-/// Wait for transaction receipt with fast polling (100ms interval)
-/// Times out after 30 seconds
-async fn wait_for_receipt_fast<P: Provider>(
-    provider: &P,
-    tx_hash: TxHash,
-) -> Result<TransactionReceipt> {
-    let mut poll_interval = interval(Duration::from_millis(100));
-    let deadline = Duration::from_secs(30);
+/// Query actual USDC balance for a wallet
+async fn query_usdc_balance<P: Provider>(provider: &P, wallet_address: Address) -> Result<f64> {
+    use alloy::sol;
+    use alloy::sol_types::SolCall;
     
-    timeout(deadline, async {
-        loop {
-            poll_interval.tick().await;
-            if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
-                return Ok::<_, eyre::Report>(receipt);
-            }
-        }
-    })
-    .await
-    .map_err(|_| eyre::eyre!("Transaction confirmation timeout after 30s"))?
-}
-```
-
-### Step 3: Replace Receipt Waiting in `execute_swap()`
-
-Find this code (around line 200-210):
-```rust
-let send_result = provider_with_signer.send_transaction(tx).await;
-
-match send_result {
-    Ok(pending) => {
-        let receipt = pending.get_receipt().await?;
-        let elapsed = start.elapsed();
-```
-
-**Replace with:**
-```rust
-let send_result = provider_with_signer.send_transaction(tx).await;
-
-match send_result {
-    Ok(pending) => {
-        let tx_hash = *pending.tx_hash();
-        
-        // CRITICAL: Use fast 100ms polling instead of default 7-second interval!
-        let receipt = wait_for_receipt_fast(provider, tx_hash).await?;
-        let elapsed = start.elapsed();
-```
-
----
-
-## FIX 2: LFJ Swap Reverting
-
-The LFJ swap is reverting separately from the timing issue. There are several possible causes:
-
-### Cause 2A: Wrong Bin Step
-
-**File:** `src/config.rs`, line ~86
-
-Current config:
-```rust
-pub fn get_lfj_pool() -> PoolConfig {
-    PoolConfig {
-        name: "LFJ",
-        address: alloy::primitives::address!("5e60bc3f7a7303bc4dfe4dc2220bdc90bc04fe22"),
-        pool_type: PoolType::LiquidityBook,
-        fee_bps: 10,  // <-- This is used as bin_step!
+    sol! {
+        #[derive(Debug)]
+        function balanceOf(address account) external view returns (uint256);
     }
+    
+    let balance_call = balanceOfCall { account: wallet_address };
+    let balance_tx = alloy::rpc::types::TransactionRequest::default()
+        .to(USDC_ADDRESS)
+        .input(alloy::rpc::types::TransactionInput::new(
+            alloy::primitives::Bytes::from(balance_call.abi_encode())
+        ));
+    let result = provider.call(balance_tx).await?;
+    let balance_wei = alloy::primitives::U256::from_be_slice(&result);
+    let balance_human = (balance_wei.to::<u128>() as f64) / 1_000_000.0; // USDC has 6 decimals
+    Ok(balance_human)
 }
 ```
 
-And in `get_routers()`:
+---
+
+## Step 2: Modify `run_test_arb` Function
+
+Find this section in `run_test_arb` (around lines 600-635) - the block after swap 1 succeeds:
+
 ```rust
-RouterConfig {
-    name: "LFJ",
-    address: LFJ_LB_ROUTER,
-    router_type: RouterType::LfjLB,
-    pool_address: alloy::primitives::address!("5e60bc3f7a7303bc4dfe4dc2220bdc90bc04fe22"),
-    pool_fee: 10,  // <-- Used as bin_step in LFJ router
-},
+    let usdc_received = sell_result.amount_out_human;
+    println!("  ✓ Received: {:.6} USDC", usdc_received);
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MONAD STATE COMMITMENT - WebSocket block subscription
+    // ...
+    // ═══════════════════════════════════════════════════════════════════
+    let ws_url = std::env::var("MONAD_WS_URL")
+        .unwrap_or_else(|_| rpc_url.replace("https://", "wss://").replace("http://", "ws://"));
+    println!("  ⏳ Waiting for next block (WebSocket subscription)...");
+    let t_block = std::time::Instant::now();
+    match wait_for_next_block(&ws_url).await {
+        Ok(block_num) => {
+            println!("  ✓ Block {} confirmed in {:?}", block_num, t_block.elapsed());
+        }
+        Err(e) => {
+            println!("  ⚠ WebSocket failed ({}), falling back to 500ms delay", e);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    // Use the USDC received from swap 1 (not entire wallet balance!)
+    let usdc_for_swap2 = usdc_received;
 ```
 
-**Verification needed:** Call the pool contract to verify actual bin step:
-- Pool address: `0x5e60bc3f7a7303bc4dfe4dc2220bdc90bc04fe22`
-- Call `getBinStep()` - should return the actual bin step
+**Replace the entire section above with:**
 
-**The bin step might be 15, 20, or 25 instead of 10!**
-
-### Cause 2B: Wrong LFJ Version
-
-**File:** `src/execution/routers/lfj.rs`, line ~82
-
-Current code uses version 3:
 ```rust
-let path = Path {
-    pairBinSteps: vec![U256::from(bin_step)],
-    versions: vec![3],  // V2_2 = 3
-    tokenPath: vec![token_in, token_out],
-};
+    let usdc_estimated = sell_result.amount_out_human;
+    println!("  ✓ Estimated received: {:.6} USDC", usdc_estimated);
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MONAD STATE COMMITMENT + ACTUAL BALANCE QUERY (PARALLEL)
+    // Query actual USDC balance while waiting for block confirmation.
+    // This ensures we use the real balance for swap 2, not an estimate.
+    // Running in parallel adds ZERO latency.
+    // ═══════════════════════════════════════════════════════════════════
+    let ws_url = std::env::var("MONAD_WS_URL")
+        .unwrap_or_else(|_| rpc_url.replace("https://", "wss://").replace("http://", "ws://"));
+    println!("  ⏳ Waiting for block + querying actual USDC balance (parallel)...");
+    let t_block = std::time::Instant::now();
+    
+    // Run block wait and balance query in parallel
+    let block_future = wait_for_next_block(&ws_url);
+    let balance_future = query_usdc_balance(&provider, signer_address);
+    
+    let (block_result, balance_result) = tokio::join!(block_future, balance_future);
+    
+    // Handle block wait result
+    match block_result {
+        Ok(block_num) => {
+            println!("  ✓ Block {} confirmed in {:?}", block_num, t_block.elapsed());
+        }
+        Err(e) => {
+            println!("  ⚠ WebSocket failed ({}), falling back to 500ms delay", e);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    
+    // Get actual USDC balance for swap 2
+    let usdc_for_swap2 = match balance_result {
+        Ok(actual_balance) => {
+            if (actual_balance - usdc_estimated).abs() > 0.000001 {
+                println!("  ⚠ Estimate vs Actual: {:.6} vs {:.6} (diff: {:+.6})",
+                    usdc_estimated, actual_balance, actual_balance - usdc_estimated);
+            }
+            println!("  ✓ Using actual USDC balance: {:.6}", actual_balance);
+            actual_balance
+        }
+        Err(e) => {
+            println!("  ⚠ Balance query failed ({}), using estimate with 0.5% buffer", e);
+            usdc_estimated * 0.995  // Safety buffer if query fails
+        }
+    };
+    
+    if usdc_for_swap2 < 0.000001 {
+        return Err(eyre::eyre!("No USDC balance available for swap 2. Swap 1 may have failed silently."));
+    }
 ```
-
-Verify that the pool is actually V2_2 (version 3). If it's V2_1, use version 2.
-
-### Cause 2C: Insufficient USDC Approval
-
-Even though `prepare-arb` ran, verify USDC is approved for LFJ router.
-
-Add debug output before the swap:
-```rust
-// In run_test_arb() before swap 2
-println!("DEBUG: Checking USDC approval for LFJ...");
-let allowance_call = allowanceCall {
-    owner: signer.address(),
-    spender: LFJ_LB_ROUTER,
-};
-let tx = alloy::rpc::types::TransactionRequest::default()
-    .to(USDC_ADDRESS)
-    .input(alloy::rpc::types::TransactionInput::new(Bytes::from(allowance_call.abi_encode())));
-let result = provider.call(tx).await?;
-let allowance = U256::from_be_slice(&result);
-println!("DEBUG: USDC allowance for LFJ: {}", allowance);
-```
-
-### Cause 2D: Token Order Issue
-
-**File:** `src/execution/routers/lfj.rs`
-
-For LFJ's `swapExactTokensForTokens`, the `tokenPath` must be in correct order.
-
-For USDC → WMON (buy direction):
-```rust
-tokenPath: vec![USDC_ADDRESS, WMON_ADDRESS]  // token_in, token_out
-```
-
-Verify this is happening correctly in `build_swap_exact_tokens_for_tokens()`.
 
 ---
 
-## Quick Test Commands
+## Step 3: Add Required Import
 
-### Test 1: Verify the fix works with a different DEX pair (no LFJ)
+At the top of `src/main.rs`, ensure `tokio::join!` is available. Add this import if not present:
+
+```rust
+use tokio::join;
+```
+
+Or use the fully qualified `tokio::join!` macro as shown in the code above (which doesn't require an import).
+
+---
+
+## Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/main.rs` | Add `query_usdc_balance` helper function around line 540 |
+| `src/main.rs` | Replace block wait section in `run_test_arb` with parallel version (lines 600-635) |
+
+---
+
+## Testing
+
+After applying the fix, run:
+
 ```bash
-cargo run -- test-arb --sell-dex pancakeswap1 --buy-dex uniswap --amount 1.0 --slippage 150
+cargo run -- test-arb --sell-dex pancakeswap1 --buy-dex pancakeswap2 --amount 1.0 --slippage 300
 ```
 
-If this completes in ~2-4 seconds instead of 15s, the polling fix worked!
-
-### Test 2: Test LFJ alone
-```bash
-cargo run -- test-swap --dex lfj --amount 1.0 --direction buy
+Expected output:
+```
+  ✓ Estimated received: 0.026516 USDC
+  ⏳ Waiting for block + querying actual USDC balance (parallel)...
+  ✓ Block 40049253 confirmed in 662.1234ms
+  ✓ Using actual USDC balance: 0.026516
+  
+  ...
+  
+  ✓ Swap completed in 769.483ms
 ```
 
-This will help isolate if LFJ is the specific problem.
-
-### Test 3: Check actual bin step
-Add this to your code to query the bin step:
-```rust
-// In run_test_arb() or a new debug command
-let bin_step_call = getBinStepCall {};
-let tx = alloy::rpc::types::TransactionRequest::default()
-    .to(alloy::primitives::address!("5e60bc3f7a7303bc4dfe4dc2220bdc90bc04fe22"))
-    .input(alloy::rpc::types::TransactionInput::new(Bytes::from(bin_step_call.abi_encode())));
-let result = provider.call(tx).await?;
-let bin_step = u16::from_be_bytes([result[30], result[31]]);
-println!("Actual LFJ bin step: {}", bin_step);
-```
+Both swaps should now succeed.
 
 ---
 
-## Expected Results After Fix
+## Performance Impact
 
-### Timing:
+**Zero additional latency.** The balance query runs concurrently with the block wait:
+
 ```
-[TIMING] Gas price fetch: ~60ms
-[TIMING] Price fetch: ~60ms  
-[TIMING] Swap 1 execution: ~1-2s  (was 7.4s!)
-[TIMING] Swap 2 execution: ~1-2s  (was 7.2s!)
-[TIMING] Total: ~2-4s  (was 15s!)
+BEFORE (broken):
+  Swap 1 (1.4s) → Block Wait (662ms) → Swap 2 (850ms) = ~3s total, FAILS
+
+AFTER (fixed):  
+  Swap 1 (1.4s) → [Block Wait + Balance Query] (662ms) → Swap 2 (850ms) = ~3s total, WORKS
 ```
 
-### Success criteria:
-- ✅ Each swap completes in 1-2 seconds (not 7 seconds)
-- ✅ Total arb execution under 5 seconds
-- ✅ LFJ swaps don't revert (after bin step fix)
-
----
-
-## Summary
-
-| Issue | Root Cause | Fix |
-|-------|------------|-----|
-| **7s per swap** | Alloy's default 7s polling interval in `get_receipt()` | Use custom `wait_for_receipt_fast()` with 100ms polling |
-| **LFJ revert** | Wrong bin step (10 vs actual), or approval issue | Verify bin step from contract, check approvals |
-
-**The 7-second delay has NOTHING to do with gas estimation, provider creation, or nonce management** - it's purely alloy's default HTTP polling interval for transaction receipts!
-
----
-
-## Code Changes Checklist
-
-- [ ] Add `use std::time::Duration;` to swap.rs imports
-- [ ] Add `use tokio::time::{interval, timeout};` to swap.rs imports  
-- [ ] Add `wait_for_receipt_fast()` helper function
-- [ ] Replace `pending.get_receipt().await` with `wait_for_receipt_fast(provider, tx_hash).await`
-- [ ] Test with non-LFJ pair first to verify timing fix
-- [ ] Query actual LFJ bin step from contract
-- [ ] Update config if bin step is wrong
-- [ ] Test LFJ swaps after config fix
+The balance query (~100ms) completes well before the block wait (~662ms), so it's effectively free.
