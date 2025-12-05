@@ -758,9 +758,11 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
 
     println!("\n  Pre-built swap 2 calldata (expected USDC: {:.6})", expected_usdc);
 
-    // Get initial WMON balance
+    // Get initial balances (WMON and USDC)
     let balances_before = get_balances(&provider, signer_address).await?;
+    let usdc_before = balances_before.usdc_human;
     println!("  Starting WMON balance: {:.6}", balances_before.wmon_human);
+    println!("  Starting USDC balance: {:.6}", usdc_before);
 
     println!("\n══════════════════════════════════════════════════════════════");
     println!("  DEX-TO-DEX ARBITRAGE TEST");
@@ -831,15 +833,16 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
         }
     }
 
-    // Get actual USDC balance for swap 2
+    // Get actual USDC received from swap 1 (current balance - balance before swap 1)
     let usdc_for_swap2 = match balance_result {
         Ok(actual_balance) => {
-            if (actual_balance - usdc_estimated).abs() > 0.000001 {
-                println!("  ⚠ Estimate vs Actual: {:.6} vs {:.6} (diff: {:+.6})",
-                    usdc_estimated, actual_balance, actual_balance - usdc_estimated);
+            let usdc_received = actual_balance - usdc_before;
+            if (usdc_received - usdc_estimated).abs() > 0.000001 {
+                println!("  ⚠ Estimate vs Actual received: {:.6} vs {:.6} (diff: {:+.6})",
+                    usdc_estimated, usdc_received, usdc_received - usdc_estimated);
             }
-            println!("  ✓ Using actual USDC balance: {:.6}", actual_balance);
-            actual_balance
+            println!("  ✓ Actual USDC received from swap 1: {:.6}", usdc_received);
+            usdc_received
         }
         Err(e) => {
             println!("  ⚠ Balance query failed ({}), using estimate with 0.5% buffer", e);
@@ -848,7 +851,7 @@ async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     };
 
     if usdc_for_swap2 < 0.000001 {
-        return Err(eyre::eyre!("No USDC balance available for swap 2. Swap 1 may have failed silently."));
+        return Err(eyre::eyre!("No USDC received from swap 1. Swap may have failed silently."));
     }
 
     // ═══════════════════════════════════════════════════════════════════
