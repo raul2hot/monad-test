@@ -127,6 +127,25 @@ enum Commands {
         #[arg(long, default_value = "false")]
         use_wmon: bool,
     },
+
+    /// Test DEX-to-DEX arbitrage (sell on one DEX, buy on another)
+    TestArb {
+        /// DEX to sell WMON on (higher price)
+        #[arg(long)]
+        sell_dex: String,
+
+        /// DEX to buy WMON on (lower price)
+        #[arg(long)]
+        buy_dex: String,
+
+        /// Amount of WMON to start with
+        #[arg(long, default_value = "1.0")]
+        amount: f64,
+
+        /// Slippage tolerance in bps (e.g., 150 = 1.5%)
+        #[arg(long, default_value = "150")]
+        slippage: u32,
+    },
 }
 
 async fn get_current_prices<P: alloy::providers::Provider>(provider: &P) -> Result<Vec<PoolPrice>> {
@@ -504,6 +523,169 @@ async fn run_sell_mon(amount: f64, dex: &str, slippage: u32, use_wmon: bool) -> 
     Ok(())
 }
 
+async fn run_test_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32) -> Result<()> {
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    println!("Wallet: {:?}", signer.address());
+
+    // Get routers
+    let sell_router = get_router_by_name(sell_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
+    let buy_router = get_router_by_name(buy_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
+
+    // Get current prices
+    println!("\nFetching current prices...");
+    let prices = get_current_prices(&provider).await?;
+
+    let sell_price = prices.iter()
+        .find(|p| p.pool_name.to_lowercase() == sell_dex.to_lowercase())
+        .ok_or_else(|| eyre::eyre!("Could not get price for {}", sell_dex))?;
+
+    let buy_price = prices.iter()
+        .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
+        .ok_or_else(|| eyre::eyre!("Could not get price for {}", buy_dex))?;
+
+    println!("  {} price: {:.6} USDC/WMON", sell_dex, sell_price.price);
+    println!("  {} price: {:.6} USDC/WMON", buy_dex, buy_price.price);
+
+    let spread_bps = ((sell_price.price - buy_price.price) / buy_price.price * 10000.0) as i32;
+    println!("  Spread: {} bps ({:.4}%)", spread_bps, spread_bps as f64 / 100.0);
+
+    if spread_bps <= 0 {
+        println!("\n⚠️  WARNING: Negative spread! sell_dex should have HIGHER price than buy_dex");
+        println!("  Consider swapping: --sell-dex {} --buy-dex {}", buy_dex, sell_dex);
+    }
+
+    // Get initial WMON balance
+    let balances_before = get_balances(&provider, signer.address()).await?;
+    println!("\n  Starting WMON balance: {:.6}", balances_before.wmon_human);
+
+    println!("\n══════════════════════════════════════════════════════════════");
+    println!("  DEX-TO-DEX ARBITRAGE TEST");
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  Route: WMON --({})-> USDC --({})-> WMON", sell_dex, buy_dex);
+    println!("  Amount: {} WMON", amount);
+    println!("══════════════════════════════════════════════════════════════\n");
+
+    // ═══════════════════════════════════════════════════════════════════
+    // STEP 1: Sell WMON for USDC on sell_dex
+    // ═══════════════════════════════════════════════════════════════════
+    println!("┌─────────────────────────────────────────────────────────────┐");
+    println!("│ STEP 1: Sell {} WMON on {} for USDC", amount, sell_dex);
+    println!("└─────────────────────────────────────────────────────────────┘");
+
+    let sell_params = SwapParams {
+        router: sell_router,
+        direction: SwapDirection::Sell,  // WMON -> USDC
+        amount_in: amount,
+        slippage_bps: slippage,
+        expected_price: sell_price.price,
+    };
+
+    let sell_result = execute_swap(&provider, &signer, sell_params, &rpc_url).await?;
+    print_swap_report(&sell_result);
+
+    if !sell_result.success {
+        return Err(eyre::eyre!("Step 1 failed: Sell swap failed"));
+    }
+
+    let usdc_received = sell_result.amount_out_human;
+    println!("  ✓ Received: {:.6} USDC", usdc_received);
+
+    // Small delay to ensure state is updated
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // STEP 2: Buy WMON with USDC on buy_dex
+    // ═══════════════════════════════════════════════════════════════════
+    println!("\n┌─────────────────────────────────────────────────────────────┐");
+    println!("│ STEP 2: Buy WMON with {:.6} USDC on {}", usdc_received, buy_dex);
+    println!("└─────────────────────────────────────────────────────────────┘");
+
+    // Refresh prices for step 2 (prices may have moved)
+    let prices = get_current_prices(&provider).await?;
+    let buy_price_updated = prices.iter()
+        .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
+        .map(|p| p.price)
+        .unwrap_or(buy_price.price);
+
+    let buy_params = SwapParams {
+        router: buy_router,
+        direction: SwapDirection::Buy,  // USDC -> WMON
+        amount_in: usdc_received,
+        slippage_bps: slippage,
+        expected_price: buy_price_updated,
+    };
+
+    let buy_result = execute_swap(&provider, &signer, buy_params, &rpc_url).await?;
+    print_swap_report(&buy_result);
+
+    if !buy_result.success {
+        return Err(eyre::eyre!("Step 2 failed: Buy swap failed"));
+    }
+
+    let wmon_received = buy_result.amount_out_human;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // FINAL REPORT
+    // ═══════════════════════════════════════════════════════════════════
+    let balances_after = get_balances(&provider, signer.address()).await?;
+
+    let total_gas_cost = sell_result.gas_cost_wei.to::<u128>() as f64 / 1e18
+                       + buy_result.gas_cost_wei.to::<u128>() as f64 / 1e18;
+
+    let gross_profit = wmon_received - amount;
+    let profit_bps = (gross_profit / amount * 10000.0) as i32;
+
+    println!("\n═══════════════════════════════════════════════════════════════");
+    println!("  DEX-TO-DEX ARBITRAGE RESULT");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!();
+    println!("  Route: WMON --({})-> USDC --({})-> WMON", sell_dex, buy_dex);
+    println!();
+    println!("  INPUT:");
+    println!("    WMON In:         {:>12.6} WMON", amount);
+    println!();
+    println!("  INTERMEDIATE:");
+    println!("    USDC Received:   {:>12.6} USDC", usdc_received);
+    println!();
+    println!("  OUTPUT:");
+    println!("    WMON Out:        {:>12.6} WMON", wmon_received);
+    println!();
+    println!("  PROFIT/LOSS:");
+    let profit_color = if gross_profit >= 0.0 { "32" } else { "31" };
+    println!("    Gross P/L:       \x1b[1;{}m{:>+12.6} WMON ({:+}bps)\x1b[0m",
+        profit_color, gross_profit, profit_bps);
+    println!("    Gas Cost:        {:>12.6} MON", total_gas_cost);
+    println!();
+    println!("  BALANCES:");
+    println!("    WMON Before:     {:>12.6}", balances_before.wmon_human);
+    println!("    WMON After:      {:>12.6}", balances_after.wmon_human);
+    println!("    MON Before:      {:>12.6}", balances_before.mon_human);
+    println!("    MON After:       {:>12.6}", balances_after.mon_human);
+    println!();
+    println!("  TRANSACTIONS:");
+    println!("    Sell TX: {}", sell_result.tx_hash);
+    println!("    Buy TX:  {}", buy_result.tx_hash);
+    println!();
+
+    if gross_profit > 0.0 {
+        println!("  ✅ ARBITRAGE PROFITABLE (before gas)");
+    } else {
+        println!("  ❌ ARBITRAGE UNPROFITABLE");
+    }
+
+    println!("═══════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -541,6 +723,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::SellMon { amount, dex, slippage, use_wmon }) => {
             run_sell_mon(amount, &dex, slippage, use_wmon).await
+        }
+        Some(Commands::TestArb { sell_dex, buy_dex, amount, slippage }) => {
+            run_test_arb(&sell_dex, &buy_dex, amount, slippage).await
         }
     }
 }
