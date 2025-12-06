@@ -234,6 +234,10 @@ enum Commands {
         /// Dry run mode (detect but don't execute)
         #[arg(long, default_value = "false")]
         dry_run: bool,
+
+        /// Force execution even if unprofitable (for testing)
+        #[arg(long, default_value = "false")]
+        force: bool,
     },
 
     /// Production arbitrage bot with safety checks
@@ -1318,6 +1322,7 @@ async fn run_auto_arb(
     max_executions: u32,
     cooldown_secs: u64,
     dry_run: bool,
+    force: bool,
 ) -> Result<()> {
     use chrono::Local;
 
@@ -1503,7 +1508,7 @@ async fn run_auto_arb(
                         slippage,
                         0, // min_profit_bps = 0 (any profit)
                         gas_price,
-                        false, // force = false (monitor checks profitability)
+                        force, // force execution even if unprofitable
                     ).await {
                         Ok(result) => {
                             print_atomic_arb_result(&result);
@@ -2208,8 +2213,9 @@ async fn main() -> Result<()> {
             max_executions,
             cooldown_secs,
             dry_run,
+            force,
         }) => {
-            run_auto_arb(min_spread_bps, amount, slippage, max_executions, cooldown_secs, dry_run).await
+            run_auto_arb(min_spread_bps, amount, slippage, max_executions, cooldown_secs, dry_run, force).await
         }
         Some(Commands::ProdArb {
             min_spread_bps,
