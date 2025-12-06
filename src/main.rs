@@ -1433,13 +1433,13 @@ async fn run_auto_arb(
                     }
                 };
 
-                // Get current balances (pre-execution)
-                let balances_before = get_balances(&provider, signer_address).await?;
+                // Get current contract balances (pre-execution)
+                let (contract_wmon_before, contract_usdc_before) = query_contract_balances(&provider).await?;
 
-                // Check if we have enough WMON
-                if balances_before.wmon_human < amount {
-                    println!("  Insufficient WMON. Have: {:.6}, Need: {:.6}",
-                        balances_before.wmon_human, amount);
+                // Check if contract has enough WMON
+                if contract_wmon_before < amount {
+                    println!("  Insufficient contract WMON. Have: {:.6}, Need: {:.6}",
+                        contract_wmon_before, amount);
                     continue;
                 }
 
@@ -1447,12 +1447,12 @@ async fn run_auto_arb(
                 let expected_usdc = amount * spread.sell_price;
                 let expected_wmon_back = expected_usdc / spread.buy_price;
 
-                // Create pre-execution snapshot
+                // Create pre-execution snapshot (using contract balances)
                 let pre_snapshot = PreExecutionSnapshot {
                     timestamp: Local::now().to_rfc3339(),
-                    wmon_balance: balances_before.wmon_human,
-                    usdc_balance: balances_before.usdc_human,
-                    mon_balance: balances_before.mon_human,
+                    wmon_balance: contract_wmon_before,
+                    usdc_balance: contract_usdc_before,
+                    mon_balance: 0.0, // Contract doesn't hold native MON
                     sell_dex: spread.sell_pool.clone(),
                     sell_price: spread.sell_price,
                     buy_dex: spread.buy_pool.clone(),
@@ -1568,15 +1568,15 @@ async fn run_auto_arb(
 
                 let exec_time = exec_start.elapsed().as_millis();
 
-                // Get post-execution balances
-                let balances_after = get_balances(&provider, signer_address).await?;
+                // Get post-execution contract balances
+                let (contract_wmon_after, contract_usdc_after) = query_contract_balances(&provider).await?;
 
-                // Create post-execution snapshot
+                // Create post-execution snapshot (using contract balances)
                 let post_snapshot = match &arb_result {
                     Ok(result) => {
-                        let wmon_delta = balances_after.wmon_human - balances_before.wmon_human;
-                        let usdc_delta = balances_after.usdc_human - balances_before.usdc_human;
-                        let mon_delta = balances_after.mon_human - balances_before.mon_human;
+                        let wmon_delta = contract_wmon_after - contract_wmon_before;
+                        let usdc_delta = contract_usdc_after - contract_usdc_before;
+                        let mon_delta = 0.0; // Contract doesn't hold native MON
                         let net_profit_bps = if amount > 0.0 {
                             (wmon_delta / amount * 10000.0) as i32
                         } else {
@@ -1585,9 +1585,9 @@ async fn run_auto_arb(
 
                         PostExecutionSnapshot {
                             timestamp: Local::now().to_rfc3339(),
-                            wmon_balance: balances_after.wmon_human,
-                            usdc_balance: balances_after.usdc_human,
-                            mon_balance: balances_after.mon_human,
+                            wmon_balance: contract_wmon_after,
+                            usdc_balance: contract_usdc_after,
+                            mon_balance: 0.0, // Contract doesn't hold native MON
                             swap1_success: result.swap1_success,
                             swap1_tx_hash: result.swap1_tx_hash.clone(),
                             swap1_gas_used: result.swap1_gas_used,
@@ -1611,9 +1611,9 @@ async fn run_auto_arb(
                         // Failed execution - still record balances
                         PostExecutionSnapshot {
                             timestamp: Local::now().to_rfc3339(),
-                            wmon_balance: balances_after.wmon_human,
-                            usdc_balance: balances_after.usdc_human,
-                            mon_balance: balances_after.mon_human,
+                            wmon_balance: contract_wmon_after,
+                            usdc_balance: contract_usdc_after,
+                            mon_balance: 0.0, // Contract doesn't hold native MON
                             swap1_success: false,
                             swap1_tx_hash: String::new(),
                             swap1_gas_used: 0,
@@ -1624,9 +1624,9 @@ async fn run_auto_arb(
                             swap2_gas_estimated: 0,
                             actual_usdc_received: 0.0,
                             actual_wmon_back: 0.0,
-                            wmon_delta: balances_after.wmon_human - balances_before.wmon_human,
-                            usdc_delta: balances_after.usdc_human - balances_before.usdc_human,
-                            mon_delta: balances_after.mon_human - balances_before.mon_human,
+                            wmon_delta: contract_wmon_after - contract_wmon_before,
+                            usdc_delta: contract_usdc_after - contract_usdc_before,
+                            mon_delta: 0.0, // Contract doesn't hold native MON
                             total_gas_cost_mon: 0.0,
                             net_profit_wmon: 0.0,
                             net_profit_bps: 0,
@@ -1822,13 +1822,13 @@ async fn run_prod_arb(
                     }
                 };
 
-                // Get current balances (pre-execution)
-                let balances_before = get_balances(&provider, signer_address).await?;
+                // Get current contract balances (pre-execution)
+                let (contract_wmon_before, contract_usdc_before) = query_contract_balances(&provider).await?;
 
-                // Check if we have enough WMON
-                if balances_before.wmon_human < amount {
-                    println!("  Insufficient WMON. Have: {:.6}, Need: {:.6}",
-                        balances_before.wmon_human, amount);
+                // Check if contract has enough WMON
+                if contract_wmon_before < amount {
+                    println!("  Insufficient contract WMON. Have: {:.6}, Need: {:.6}",
+                        contract_wmon_before, amount);
                     continue;
                 }
 
@@ -1836,12 +1836,12 @@ async fn run_prod_arb(
                 let expected_usdc = amount * spread.sell_price;
                 let expected_wmon_back = expected_usdc / spread.buy_price;
 
-                // Create pre-execution snapshot
+                // Create pre-execution snapshot (using contract balances)
                 let pre_snapshot = PreExecutionSnapshot {
                     timestamp: Local::now().to_rfc3339(),
-                    wmon_balance: balances_before.wmon_human,
-                    usdc_balance: balances_before.usdc_human,
-                    mon_balance: balances_before.mon_human,
+                    wmon_balance: contract_wmon_before,
+                    usdc_balance: contract_usdc_before,
+                    mon_balance: 0.0, // Contract doesn't hold native MON
                     sell_dex: spread.sell_pool.clone(),
                     sell_price: spread.sell_price,
                     buy_dex: spread.buy_pool.clone(),
@@ -1877,16 +1877,16 @@ async fn run_prod_arb(
 
                 let exec_time = exec_start.elapsed().as_millis();
 
-                // Get post-execution balances
-                let balances_after = get_balances(&provider, signer_address).await?;
+                // Get post-execution contract balances
+                let (contract_wmon_after, contract_usdc_after) = query_contract_balances(&provider).await?;
 
-                let wmon_delta = balances_after.wmon_human - balances_before.wmon_human;
+                let wmon_delta = contract_wmon_after - contract_wmon_before;
 
-                // Create post-execution snapshot
+                // Create post-execution snapshot (using contract balances)
                 let post_snapshot = match &arb_result {
                     Ok(result) => {
-                        let usdc_delta = balances_after.usdc_human - balances_before.usdc_human;
-                        let mon_delta = balances_after.mon_human - balances_before.mon_human;
+                        let usdc_delta = contract_usdc_after - contract_usdc_before;
+                        let mon_delta = 0.0; // Contract doesn't hold native MON
                         let net_profit_bps = if amount > 0.0 {
                             (wmon_delta / amount * 10000.0) as i32
                         } else {
@@ -1895,9 +1895,9 @@ async fn run_prod_arb(
 
                         PostExecutionSnapshot {
                             timestamp: Local::now().to_rfc3339(),
-                            wmon_balance: balances_after.wmon_human,
-                            usdc_balance: balances_after.usdc_human,
-                            mon_balance: balances_after.mon_human,
+                            wmon_balance: contract_wmon_after,
+                            usdc_balance: contract_usdc_after,
+                            mon_balance: 0.0, // Contract doesn't hold native MON
                             swap1_success: result.swap1_success,
                             swap1_tx_hash: result.swap1_tx_hash.clone(),
                             swap1_gas_used: result.swap1_gas_used,
@@ -1920,9 +1920,9 @@ async fn run_prod_arb(
                     Err(_e) => {
                         PostExecutionSnapshot {
                             timestamp: Local::now().to_rfc3339(),
-                            wmon_balance: balances_after.wmon_human,
-                            usdc_balance: balances_after.usdc_human,
-                            mon_balance: balances_after.mon_human,
+                            wmon_balance: contract_wmon_after,
+                            usdc_balance: contract_usdc_after,
+                            mon_balance: 0.0, // Contract doesn't hold native MON
                             swap1_success: false,
                             swap1_tx_hash: String::new(),
                             swap1_gas_used: 0,
@@ -1934,8 +1934,8 @@ async fn run_prod_arb(
                             actual_usdc_received: 0.0,
                             actual_wmon_back: 0.0,
                             wmon_delta,
-                            usdc_delta: balances_after.usdc_human - balances_before.usdc_human,
-                            mon_delta: balances_after.mon_human - balances_before.mon_human,
+                            usdc_delta: contract_usdc_after - contract_usdc_before,
+                            mon_delta: 0.0, // Contract doesn't hold native MON
                             total_gas_cost_mon: 0.0,
                             net_profit_wmon: 0.0,
                             net_profit_bps: 0,
