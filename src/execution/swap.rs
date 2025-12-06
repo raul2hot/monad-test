@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, timeout};
 
 use crate::config::{RouterConfig, RouterType, WMON_ADDRESS, USDC_ADDRESS, WMON_DECIMALS, USDC_DECIMALS};
+use crate::node_config::NodeConfig;
 use crate::nonce::next_nonce;
 use super::routers::build_swap_calldata;
 
@@ -147,6 +148,36 @@ async fn wait_for_receipt_fast<P: Provider>(
     })
     .await
     .map_err(|_| eyre::eyre!("Transaction confirmation timeout after 30s"))?
+}
+
+/// Wait for transaction receipt with node-aware polling interval
+/// Uses NodeConfig settings for optimal polling based on local vs remote node
+///
+/// Local node: 5ms polling, 200 max attempts (1 second total)
+/// Remote node: 100ms polling, 300 max attempts (30 seconds total)
+pub async fn wait_for_receipt_optimized<P: Provider>(
+    provider: &P,
+    tx_hash: TxHash,
+    config: &NodeConfig,
+) -> Result<TransactionReceipt> {
+    let max_attempts = if config.is_local { 200 } else { 300 };
+    let poll_interval = config.receipt_poll_interval;
+    let timeout_secs = if config.is_local { 5 } else { 30 };
+
+    let deadline = Duration::from_secs(timeout_secs);
+
+    timeout(deadline, async {
+        let mut interval_timer = interval(poll_interval);
+        for _ in 0..max_attempts {
+            interval_timer.tick().await;
+            if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+                return Ok::<_, eyre::Report>(receipt);
+            }
+        }
+        Err(eyre::eyre!("Max polling attempts ({}) reached", max_attempts))
+    })
+    .await
+    .map_err(|_| eyre::eyre!("Transaction confirmation timeout after {}s", timeout_secs))?
 }
 
 /// Wait for the next block using WebSocket subscription (for Monad state commitment)
