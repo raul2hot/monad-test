@@ -38,6 +38,18 @@ pub fn next_nonce() -> u64 {
         .fetch_add(1, Ordering::SeqCst)
 }
 
+/// Reserve multiple nonces atomically (Issue 8: Batch nonce reservation)
+/// Returns a vector of nonces for use in parallel transaction building.
+#[allow(dead_code)]
+pub fn reserve_nonces(count: u64) -> Vec<u64> {
+    let start = NONCE
+        .get()
+        .expect("Nonce manager not initialized. Call init_nonce() first.")
+        .fetch_add(count, Ordering::SeqCst);
+
+    (0..count).map(|i| start + i).collect()
+}
+
 /// Get current nonce without incrementing (for debugging/display).
 #[allow(dead_code)]
 pub fn current_nonce() -> u64 {

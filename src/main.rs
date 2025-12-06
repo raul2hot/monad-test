@@ -3,11 +3,28 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use clap::{Parser, Subcommand};
 use eyre::Result;
+use reqwest::Client;
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
+
+// Global HTTP client for connection reuse (Issue 7)
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+#[allow(dead_code)]
+fn get_http_client() -> &'static Client {
+    HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(60))
+            .build()
+            .expect("Failed to create HTTP client")
+    })
+}
 
 mod config;
 mod display;
@@ -1102,6 +1119,26 @@ async fn run_fast_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     let buy_price = prices.iter()
         .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
         .ok_or_else(|| eyre::eyre!("No price for {}", buy_dex))?.price;
+
+    // Pre-validate profitability before execution
+    let spread_bps = ((sell_price - buy_price) / buy_price * 10000.0) as i32;
+    let total_fee_bps = (sell_router.pool_fee / 100 + buy_router.pool_fee / 100) as i32;
+    let net_spread_bps = spread_bps - total_fee_bps;
+
+    println!("  Spread: {} bps | Fees: {} bps | Net: {} bps",
+             spread_bps, total_fee_bps, net_spread_bps);
+
+    if net_spread_bps < 0 {
+        println!("\n  ⚠️  Negative net spread. Arb will be unprofitable.");
+        println!("  Continue anyway? [y/N]");
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("  Aborted.");
+            return Ok(());
+        }
+    }
 
     println!("\n══════════════════════════════════════════════════════════════");
     println!("  FAST ARB | {} -> {}", sell_dex, buy_dex);
