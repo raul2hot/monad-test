@@ -1,0 +1,14 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.24"
+optimizer = true
+optimizer_runs = 1000000
+via_ir = false
+
+[rpc_endpoints]
+monad = "${MONAD_RPC_URL}"
+
+[etherscan]
+monad = { key = "${MONAD_EXPLORER_API_KEY}", chain = 143, url = "https://api.monadexplorer.com/api" }
