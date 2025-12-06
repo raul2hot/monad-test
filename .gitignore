@@ -25,3 +25,5 @@ logs/
 
 # Cargo lock (optional - remove this line if you want to commit Cargo.lock)
 # Cargo.lock
+
+arb_stats_*.jsonl
