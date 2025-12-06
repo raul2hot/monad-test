@@ -1,163 +1,284 @@
-# Fast Arbitrage Integration Instructions
+# Fast Arb Improvement Instructions
 
-## Goal
-Reduce `test-arb` execution from ~4s to <1.5s by adding optimized `fast-arb` command.
-
----
-
-## Files to Add
-
-### 1. Create `src/execution/fast_arb.rs`
-Copy the complete `fast_arb.rs` file from the outputs folder. This contains:
-- `execute_fast_arb()` - Main optimized arb function
-- `FastArbResult` - Result struct
-- `print_fast_arb_result()` - Display function
-- `build_fast_swap_tx()` - Pre-build swap calldata
-
-### 2. Update `src/execution/mod.rs`
-```rust
-pub mod routers;
-pub mod swap;
-pub mod report;
-pub mod fast_arb;  // ADD THIS
-
-pub use swap::{SwapParams, SwapResult, SwapDirection, execute_swap, wait_for_next_block};
-pub use report::print_swap_report;
-pub use routers::build_swap_calldata;
-pub use fast_arb::{execute_fast_arb, FastArbResult, print_fast_arb_result};  // ADD THIS
-```
+## Current Performance: 1.7s
+## Target Performance: <1.2s (before own node)
 
 ---
 
-## Changes to `src/main.rs`
+## Issue 1: Gas Display Shows Limit, Not Actual Usage
 
-### 1. Add Import
+**Problem:** Output shows `Gas Used: 800000` which is the hardcoded limit, not actual consumption.
+
+**File:** `src/execution/fast_arb.rs`
+
+**Find this code in `execute_fast_arb()`:**
 ```rust
-use execution::{execute_fast_arb, print_fast_arb_result};
+println!("    Swap 1 confirmed: {} (gas: {})", 
+         if receipt1.status() { "SUCCESS" } else { "FAILED" },
+         swap1.gas_limit);  // WRONG: shows limit
 ```
 
-### 2. Add Command to `Commands` enum
+**Replace with:**
 ```rust
-/// Fast DEX-to-DEX arbitrage (optimized <1.5s execution)
-FastArb {
-    #[arg(long)]
-    sell_dex: String,
-    #[arg(long)]
-    buy_dex: String,
-    #[arg(long, default_value = "1.0")]
-    amount: f64,
-    #[arg(long, default_value = "200")]
-    slippage: u32,
-},
+println!("    Swap 1 confirmed: {} (gas: {})", 
+         if receipt1.status() { "SUCCESS" } else { "FAILED" },
+         receipt1.gas_used);  // CORRECT: shows actual
 ```
 
-### 3. Add Match Arm
+**Do the same for swap 2.**
+
+---
+
+## Issue 2: Dynamic Safety Buffer Based on Slippage
+
+**Problem:** Fixed 99% buffer is too conservative for tight slippage, too loose for wide slippage.
+
+**File:** `src/execution/fast_arb.rs`
+
+**Find:**
 ```rust
-Some(Commands::FastArb { sell_dex, buy_dex, amount, slippage }) => {
-    run_fast_arb(&sell_dex, &buy_dex, amount, slippage).await
+let usdc_for_buy = expected_usdc * 0.99;
+```
+
+**Replace with:**
+```rust
+// Dynamic buffer: slippage 200bps → 99%, slippage 100bps → 99.5%, slippage 50bps → 99.75%
+let safety_factor = 1.0 - (slippage_bps as f64 / 20000.0);
+let usdc_for_buy = expected_usdc * safety_factor;
+```
+
+---
+
+## Issue 3: Reduce Receipt Polling Interval
+
+**Problem:** 50ms polling may be too slow for Monad's fast blocks.
+
+**File:** `src/execution/fast_arb.rs`
+
+**Find:**
+```rust
+let mut poll_interval = interval(Duration::from_millis(50));
+```
+
+**Replace with:**
+```rust
+let mut poll_interval = interval(Duration::from_millis(20));  // 20ms polling
+```
+
+**Expected savings:** ~50-100ms
+
+---
+
+## Issue 4: Add Timeout to Parallel Receipt Wait
+
+**Problem:** If one receipt hangs, both hang forever.
+
+**File:** `src/execution/fast_arb.rs`
+
+**Find:**
+```rust
+let (receipt1, receipt2) = tokio::join!(
+    wait_for_receipt_fast(provider_with_signer, tx1_hash),
+    wait_for_receipt_fast(provider_with_signer, tx2_hash)
+);
+```
+
+**Replace with:**
+```rust
+let receipt_timeout = Duration::from_secs(15);
+let (receipt1, receipt2) = tokio::join!(
+    timeout(receipt_timeout, wait_for_receipt_fast(provider_with_signer, tx1_hash)),
+    timeout(receipt_timeout, wait_for_receipt_fast(provider_with_signer, tx2_hash))
+);
+
+let receipt1 = receipt1.map_err(|_| eyre!("Swap 1 receipt timeout"))??;
+let receipt2 = receipt2.map_err(|_| eyre!("Swap 2 receipt timeout"))??;
+```
+
+---
+
+## Issue 5: Pre-validate Profitability Before Execution
+
+**Problem:** Arb executes even when spread is negative (wastes gas).
+
+**File:** `src/main.rs` in `run_fast_arb()`
+
+**Add after getting prices:**
+```rust
+let spread_bps = ((sell_price - buy_price) / buy_price * 10000.0) as i32;
+let total_fee_bps = (sell_router.pool_fee / 100 + buy_router.pool_fee / 100) as i32;
+let net_spread_bps = spread_bps - total_fee_bps;
+
+println!("  Spread: {} bps | Fees: {} bps | Net: {} bps", 
+         spread_bps, total_fee_bps, net_spread_bps);
+
+if net_spread_bps < 0 {
+    println!("\n  ⚠️  Negative net spread. Arb will be unprofitable.");
+    println!("  Continue anyway? [y/N]");
+    
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if !input.trim().eq_ignore_ascii_case("y") {
+        println!("  Aborted.");
+        return Ok(());
+    }
 }
 ```
 
-### 4. Add Handler Function
+---
+
+## Issue 6: Track Actual vs Estimated Amounts
+
+**Problem:** Can't verify if estimates are accurate without checking final balances.
+
+**File:** `src/execution/fast_arb.rs`
+
+**Add to `FastArbResult`:**
 ```rust
-async fn run_fast_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32) -> Result<()> {
-    let total_start = std::time::Instant::now();
-    
-    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
-    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+pub struct FastArbResult {
+    // ... existing fields ...
+    pub wmon_out_actual: Option<f64>,  // NEW: filled after balance check
+    pub estimation_error_bps: Option<i32>,  // NEW: (actual - estimated) / estimated
+}
+```
 
-    let url: reqwest::Url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url.clone());
-
-    let signer = PrivateKeySigner::from_str(&private_key)?;
-    let signer_address = signer.address();
-    
-    // PARALLEL INIT: gas + nonce + prices
-    let (gas_result, nonce_result, prices_result) = tokio::join!(
-        provider.get_gas_price(),
-        init_nonce(&provider, signer_address),
-        get_current_prices(&provider)
-    );
-    
-    let gas_price = gas_result.unwrap_or(100_000_000_000);
-    nonce_result?;
-    let prices = prices_result?;
-    
-    println!("  [TIMING] Parallel init: {:?}", total_start.elapsed());
-    
-    // Create provider with signer
-    let wallet = EthereumWallet::from(signer);
-    let provider_with_signer = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(url);
-
-    // Get routers
-    let sell_router = get_router_by_name(sell_dex)
-        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
-    let buy_router = get_router_by_name(buy_dex)
-        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
-
-    // Get prices
-    let sell_price = prices.iter()
-        .find(|p| p.pool_name.to_lowercase() == sell_dex.to_lowercase())
-        .ok_or_else(|| eyre::eyre!("No price for {}", sell_dex))?.price;
-    let buy_price = prices.iter()
-        .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
-        .ok_or_else(|| eyre::eyre!("No price for {}", buy_dex))?.price;
-
-    println!("\n══════════════════════════════════════════════════════════════");
-    println!("  FAST ARB | {} -> {}", sell_dex, buy_dex);
-    println!("══════════════════════════════════════════════════════════════");
-    
-    let result = execute_fast_arb(
-        &provider_with_signer,
-        signer_address,
-        &sell_router,
-        &buy_router,
-        amount,
-        sell_price,
-        buy_price,
-        slippage,
-        gas_price,
-    ).await?;
-    
-    print_fast_arb_result(&result, sell_dex, buy_dex);
-    println!("  [TIMING] TOTAL: {:?}", total_start.elapsed());
-    
-    Ok(())
+**Add optional balance check at end of `execute_fast_arb()`:**
+```rust
+// Optional: verify actual output (adds ~200ms but useful for debugging)
+#[cfg(debug_assertions)]
+{
+    use crate::wallet::get_balances;
+    let final_balances = get_balances(provider_with_signer, wallet_address).await?;
+    // Compare with starting balance to get actual WMON received
 }
 ```
 
 ---
 
-## Key Optimizations Applied
+## Issue 7: Connection Reuse for HTTP Provider
 
-| Optimization | Time Saved |
-|--------------|------------|
-| Parallel init (gas + nonce + prices) | ~300ms |
-| Skip `wait_for_next_block` | ~1000ms |
-| Send both TXs back-to-back | ~800ms |
-| Parallel receipt wait | ~400ms |
-| Skip approval/balance checks | ~400ms |
-| 50ms polling (vs 100ms) | ~200ms |
+**Problem:** Each RPC call may open new TCP connection.
+
+**File:** `src/main.rs`
+
+**Add at top of file:**
+```rust
+use reqwest::Client;
+use std::sync::OnceLock;
+
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+fn get_http_client() -> &'static Client {
+    HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(60))
+            .build()
+            .expect("Failed to create HTTP client")
+    })
+}
+```
+
+**Note:** This requires modifying how alloy provider is created. Check if alloy supports custom reqwest client.
 
 ---
 
-## Usage
+## Issue 8: Batch Nonce Reservation
+
+**Problem:** `next_nonce()` called twice sequentially.
+
+**File:** `src/nonce.rs`
+
+**Add new function:**
+```rust
+/// Reserve multiple nonces atomically
+pub fn reserve_nonces(count: u64) -> Vec<u64> {
+    let start = NONCE
+        .get()
+        .expect("Nonce manager not initialized")
+        .fetch_add(count, Ordering::SeqCst);
+    
+    (0..count).map(|i| start + i).collect()
+}
+```
+
+**Usage in fast_arb.rs:**
+```rust
+let nonces = crate::nonce::reserve_nonces(2);
+let nonce1 = nonces[0];
+let nonce2 = nonces[1];
+```
+
+---
+
+## Issue 9: Log Arb Opportunities to File
+
+**Problem:** No persistent record of executed arbs for analysis.
+
+**File:** `src/execution/fast_arb.rs`
+
+**Add at end of `execute_fast_arb()`:**
+```rust
+// Log to arb execution history
+use std::fs::OpenOptions;
+use std::io::Write;
+
+let log_line = format!(
+    "{},{},{},{},{},{},{},{},{}\n",
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+    sell_dex,
+    buy_dex,
+    result.wmon_in,
+    result.usdc_intermediate,
+    result.wmon_out,
+    result.total_gas_used,
+    result.execution_time_ms,
+    if result.error.is_some() { "FAILED" } else { "SUCCESS" }
+);
+
+if let Ok(mut file) = OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open("arb_executions.csv") 
+{
+    let _ = file.write_all(log_line.as_bytes());
+}
+```
+
+---
+
+## Priority Order
+
+1. **Issue 1** - Fix gas display (quick win, better debugging)
+2. **Issue 3** - 20ms polling (easy, saves ~50-100ms)
+3. **Issue 5** - Profitability check (prevents wasted gas)
+4. **Issue 2** - Dynamic buffer (better capital efficiency)
+5. **Issue 4** - Receipt timeout (prevents hangs)
+6. **Issue 8** - Batch nonces (cleaner code)
+7. **Issue 9** - Execution logging (analytics)
+8. **Issue 6** - Actual amount tracking (debugging)
+9. **Issue 7** - Connection reuse (may require alloy changes)
+
+---
+
+## Testing Commands
 
 ```bash
-# Ensure approvals exist first
-cargo run -- prepare-arb
+# Test with small amount first
+cargo run -- fast-arb --sell-dex pancakeswap2 --buy-dex mondaytrade --amount 0.01 --slippage 200
 
-# Run fast arbitrage
-cargo run -- fast-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 1.0 --slippage 200
+# Compare old vs new timing
+cargo run -- test-arb --sell-dex pancakeswap2 --buy-dex mondaytrade --amount 0.01 --slippage 200
 ```
 
 ---
 
-## Important Notes
+## Expected Results After All Fixes
 
-1. **Run `prepare-arb` first** - Fast arb skips approval checks
-2. **Uses estimated amounts** - Swap 2 uses 99% of expected USDC from swap 1
-3. **Higher slippage recommended** - Default 200bps (2%) for safety
-4. **Both TXs sent immediately** - If swap 1 fails, swap 2 also fails (by design)
+| Metric | Before | After |
+|--------|--------|-------|
+| Total time | 1.7s | ~1.4s |
+| Gas display | Limit (800k) | Actual (~250k) |
+| Failed arbs | Possible | Warned |
+| Execution log | None | CSV file |
