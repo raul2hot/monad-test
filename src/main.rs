@@ -1363,9 +1363,12 @@ async fn run_auto_arb(
     println!("═══════════════════════════════════════════════════════════════");
     println!();
 
-    // Show initial balances
-    let initial_balances = get_balances(&provider, signer_address).await?;
-    print_balances(&initial_balances);
+    // Show initial contract balances
+    let (initial_wmon, initial_usdc) = query_contract_balances(&provider).await?;
+    println!("  Contract Balances:");
+    println!("    WMON: {:>18.6}", initial_wmon);
+    println!("    USDC: {:>18.6}", initial_usdc);
+    println!();
 
     let mut execution_count = 0u32;
     let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
@@ -1673,14 +1676,10 @@ async fn run_auto_arb(
     println!("  Total executions: {}", execution_count);
     println!("  Stats saved to:   {}", stats_file);
 
-    let final_balances = get_balances(&provider, signer_address).await?;
-    println!("\n  Final Balances:");
-    println!("    MON:  {:>18.6} (Delta {:>+.6})", final_balances.mon_human,
-        final_balances.mon_human - initial_balances.mon_human);
-    println!("    WMON: {:>18.6} (Delta {:>+.6})", final_balances.wmon_human,
-        final_balances.wmon_human - initial_balances.wmon_human);
-    println!("    USDC: {:>18.6} (Delta {:>+.6})", final_balances.usdc_human,
-        final_balances.usdc_human - initial_balances.usdc_human);
+    let (final_wmon, final_usdc) = query_contract_balances(&provider).await?;
+    println!("\n  Final Contract Balances:");
+    println!("    WMON: {:>18.6} (Delta {:>+.6})", final_wmon, final_wmon - initial_wmon);
+    println!("    USDC: {:>18.6} (Delta {:>+.6})", final_usdc, final_usdc - initial_usdc);
     println!("═══════════════════════════════════════════════════════════════");
 
     Ok(())
@@ -1740,9 +1739,12 @@ async fn run_prod_arb(
     println!("═══════════════════════════════════════════════════════════════");
     println!();
 
-    // Show initial balances
-    let initial_balances = get_balances(&provider, signer_address).await?;
-    print_balances(&initial_balances);
+    // Show initial contract balances
+    let (initial_wmon, initial_usdc) = query_contract_balances(&provider).await?;
+    println!("  Contract Balances:");
+    println!("    WMON: {:>18.6}", initial_wmon);
+    println!("    USDC: {:>18.6}", initial_usdc);
+    println!();
 
     let mut execution_count = 0u32;
     let mut successful_arbs = 0u32;
@@ -2004,14 +2006,10 @@ async fn run_prod_arb(
     println!("  Cumulative P&L:    {:+.6} WMON", cumulative_pnl);
     println!("  Stats saved to:    {}", stats_file);
 
-    let final_balances = get_balances(&provider, signer_address).await?;
-    println!("\n  Final Balances:");
-    println!("    MON:  {:>18.6} (Delta {:>+.6})", final_balances.mon_human,
-        final_balances.mon_human - initial_balances.mon_human);
-    println!("    WMON: {:>18.6} (Delta {:>+.6})", final_balances.wmon_human,
-        final_balances.wmon_human - initial_balances.wmon_human);
-    println!("    USDC: {:>18.6} (Delta {:>+.6})", final_balances.usdc_human,
-        final_balances.usdc_human - initial_balances.usdc_human);
+    let (final_wmon, final_usdc) = query_contract_balances(&provider).await?;
+    println!("\n  Final Contract Balances:");
+    println!("    WMON: {:>18.6} (Delta {:>+.6})", final_wmon, final_wmon - initial_wmon);
+    println!("    USDC: {:>18.6} (Delta {:>+.6})", final_usdc, final_usdc - initial_usdc);
     println!("═══════════════════════════════════════════════════════════════");
 
     Ok(())
