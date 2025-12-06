@@ -40,14 +40,14 @@ use config::{
     get_all_pools, get_lfj_pool, get_monday_trade_pool, get_v3_pools, get_router_by_name,
     POLL_INTERVAL_MS, WMON_ADDRESS, USDC_ADDRESS, WMON_DECIMALS, USDC_DECIMALS,
     UNISWAP_SWAP_ROUTER, PANCAKE_SMART_ROUTER, LFJ_LB_ROUTER, MONDAY_SWAP_ROUTER,
-    RouterConfig,
+    RouterConfig, ATOMIC_ARB_CONTRACT,
 };
 use display::{display_prices, init_arb_log, calculate_spreads};
 use stats::{
     StatsLogger, ArbExecutionRecord, PreExecutionSnapshot, PostExecutionSnapshot,
     print_pre_execution, print_post_execution,
 };
-use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata, wait_for_next_block, execute_fast_arb, print_fast_arb_result};
+use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata, wait_for_next_block, execute_fast_arb, print_fast_arb_result, execute_atomic_arb, print_atomic_arb_result, query_contract_balances};
 use execution::report::print_comparison_report;
 use multicall::fetch_prices_batched;
 use nonce::init_nonce;
@@ -192,6 +192,20 @@ enum Commands {
         slippage: u32,
     },
 
+    /// Atomic arbitrage via smart contract (single TX, MEV-resistant)
+    AtomicArb {
+        #[arg(long)]
+        sell_dex: String,
+        #[arg(long)]
+        buy_dex: String,
+        #[arg(long, default_value = "1.0")]
+        amount: f64,
+        #[arg(long, default_value = "150")]
+        slippage: u32,
+        #[arg(long, default_value = "0")]
+        min_profit_bps: i32,
+    },
+
     /// Automated arbitrage: monitors prices and executes when opportunity found
     AutoArb {
         /// Minimum net spread in bps to trigger execution (e.g., -50 for testing, 10 for production)
@@ -241,6 +255,21 @@ enum Commands {
         #[arg(long, default_value = "3")]
         max_failures: u32,
     },
+
+    /// Fund the atomic arb contract with WMON
+    FundContract {
+        #[arg(long)]
+        amount: f64,
+    },
+
+    /// Withdraw WMON from atomic arb contract
+    WithdrawContract {
+        #[arg(long, default_value = "0")]
+        amount: f64,  // 0 = withdraw all
+    },
+
+    /// Check atomic arb contract balances
+    ContractBalance,
 }
 
 async fn get_current_prices<P: alloy::providers::Provider>(provider: &P) -> Result<Vec<PoolPrice>> {
@@ -1209,6 +1238,74 @@ async fn run_fast_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     Ok(())
 }
 
+async fn run_atomic_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32, min_profit_bps: i32) -> Result<()> {
+    let total_start = std::time::Instant::now();
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+
+    // Parallel init
+    let (gas_result, nonce_result, prices_result) = tokio::join!(
+        provider.get_gas_price(),
+        init_nonce(&provider, signer_address),
+        get_current_prices(&provider)
+    );
+
+    let gas_price = gas_result.unwrap_or(100_000_000_000);
+    nonce_result?;
+    let prices = prices_result?;
+
+    println!("  [TIMING] Init: {:?}", total_start.elapsed());
+
+    // Create provider with signer
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Get routers
+    let sell_router = get_router_by_name(sell_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
+    let buy_router = get_router_by_name(buy_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
+
+    // Get prices
+    let sell_price = prices.iter()
+        .find(|p| p.pool_name.to_lowercase() == sell_dex.to_lowercase())
+        .ok_or_else(|| eyre::eyre!("No price for {}", sell_dex))?.price;
+    let buy_price = prices.iter()
+        .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
+        .ok_or_else(|| eyre::eyre!("No price for {}", buy_dex))?.price;
+
+    println!("\n==============================================================");
+    println!("  ATOMIC ARB | {} -> {} (single TX)", sell_dex, buy_dex);
+    println!("==============================================================");
+
+    let result = execute_atomic_arb(
+        &provider_with_signer,
+        signer_address,
+        &sell_router,
+        &buy_router,
+        amount,
+        sell_price,
+        buy_price,
+        slippage,
+        min_profit_bps,
+        gas_price,
+    ).await?;
+
+    print_atomic_arb_result(&result);
+    println!("  [TIMING] TOTAL: {:?}", total_start.elapsed());
+
+    Ok(())
+}
+
 /// Automated arbitrage: monitors and executes when spread opportunity detected
 async fn run_auto_arb(
     min_spread_bps: i32,
@@ -1382,21 +1479,82 @@ async fn run_auto_arb(
                 // Fetch gas price
                 let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
 
-                // Execute fast arb
+                // Execute arb - use atomic if contract is deployed, otherwise fast_arb
                 println!("\n  EXECUTING ARB...");
                 let exec_start = std::time::Instant::now();
 
-                let arb_result = execute_fast_arb(
-                    &provider_with_signer,
-                    signer_address,
-                    &sell_router,
-                    &buy_router,
-                    amount,
-                    spread.sell_price,
-                    spread.buy_price,
-                    slippage,
-                    gas_price,
-                ).await;
+                // Use atomic arb if contract is deployed, otherwise fall back to fast_arb
+                let use_atomic = ATOMIC_ARB_CONTRACT != alloy::primitives::Address::ZERO;
+
+                let arb_result: Result<execution::FastArbResult, eyre::Report> = if use_atomic {
+                    println!("  Using ATOMIC execution (single TX)...");
+                    match execute_atomic_arb(
+                        &provider_with_signer,
+                        signer_address,
+                        &sell_router,
+                        &buy_router,
+                        amount,
+                        spread.sell_price,
+                        spread.buy_price,
+                        slippage,
+                        0, // min_profit_bps = 0 (any profit)
+                        gas_price,
+                    ).await {
+                        Ok(result) => {
+                            print_atomic_arb_result(&result);
+                            // Convert AtomicArbResult to FastArbResult for stats compatibility
+                            Ok(execution::FastArbResult {
+                                success: result.success,
+                                swap1_success: result.success,
+                                swap1_tx_hash: result.tx_hash.clone(),
+                                swap1_gas_used: result.gas_used,
+                                swap1_gas_estimated: result.gas_limit,
+                                swap2_success: result.success,
+                                swap2_tx_hash: String::new(), // Atomic has single TX
+                                swap2_gas_used: 0,
+                                swap2_gas_estimated: 0,
+                                wmon_in: result.wmon_in,
+                                usdc_intermediate: 0.0,
+                                wmon_out: result.wmon_in + result.profit_wmon,
+                                usdc_before: 0.0,
+                                usdc_after_swap1: 0.0,
+                                wmon_before: result.wmon_in,
+                                wmon_after_swap2: result.wmon_in + result.profit_wmon,
+                                actual_usdc_received: 0.0,
+                                actual_wmon_received: result.profit_wmon,
+                                swap1_slippage_bps: 0,
+                                swap2_slippage_bps: 0,
+                                wmon_out_actual: Some(result.wmon_in + result.profit_wmon),
+                                estimation_error_bps: None,
+                                gross_profit_wmon: result.profit_wmon,
+                                profit_bps: result.profit_bps,
+                                total_gas_cost_wei: alloy::primitives::U256::ZERO,
+                                total_gas_cost_mon: result.gas_cost_mon,
+                                total_gas_used: result.gas_used,
+                                total_gas_estimated: result.gas_limit,
+                                total_time_ms: result.execution_time_ms,
+                                swap1_time_ms: result.execution_time_ms,
+                                swap2_time_ms: 0,
+                                execution_time_ms: result.execution_time_ms,
+                                error: result.error,
+                            })
+                        }
+                        Err(e) => Err(e)
+                    }
+                } else {
+                    println!("  Using FAST execution (2 TXs) - deploy atomic contract for better results!");
+                    execute_fast_arb(
+                        &provider_with_signer,
+                        signer_address,
+                        &sell_router,
+                        &buy_router,
+                        amount,
+                        spread.sell_price,
+                        spread.buy_price,
+                        slippage,
+                        gas_price,
+                    ).await
+                };
 
                 let exec_time = exec_start.elapsed().as_millis();
 
@@ -1849,6 +2007,145 @@ async fn run_prod_arb(
     Ok(())
 }
 
+async fn run_fund_contract(amount: f64) -> Result<()> {
+    use alloy::sol;
+    use alloy::sol_types::SolCall;
+    use alloy::network::TransactionBuilder;
+
+    sol! {
+        function transfer(address to, uint256 amount) external returns (bool);
+    }
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+    init_nonce(&provider, signer_address).await?;
+
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    let amount_wei = to_wei(amount, WMON_DECIMALS);
+
+    let transfer_call = transferCall {
+        to: ATOMIC_ARB_CONTRACT,
+        amount: amount_wei,
+    };
+
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(WMON_ADDRESS)
+        .from(signer_address)
+        .input(alloy::rpc::types::TransactionInput::new(
+            alloy::primitives::Bytes::from(transfer_call.abi_encode())
+        ))
+        .gas_limit(100_000)
+        .nonce(nonce::next_nonce())
+        .max_fee_per_gas(gas_price + (gas_price / 10))
+        .max_priority_fee_per_gas(gas_price / 10)
+        .with_chain_id(143);
+
+    println!("Funding contract with {} WMON...", amount);
+
+    let pending = provider_with_signer.send_transaction(tx).await?;
+    let receipt = pending.get_receipt().await?;
+
+    if receipt.status() {
+        println!("  Funded contract with {} WMON", amount);
+        println!("  TX: {:?}", receipt.transaction_hash);
+    } else {
+        println!("  Transfer failed");
+    }
+
+    Ok(())
+}
+
+async fn run_withdraw_contract(amount: f64) -> Result<()> {
+    use alloy::sol;
+    use alloy::sol_types::SolCall;
+    use alloy::network::TransactionBuilder;
+
+    sol! {
+        function withdrawToken(address token, uint256 amount) external;
+        function withdrawAllToken(address token) external;
+    }
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+    init_nonce(&provider, signer_address).await?;
+
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+
+    let calldata = if amount == 0.0 {
+        println!("Withdrawing ALL WMON from contract...");
+        withdrawAllTokenCall { token: WMON_ADDRESS }.abi_encode()
+    } else {
+        println!("Withdrawing {} WMON from contract...", amount);
+        let amount_wei = to_wei(amount, WMON_DECIMALS);
+        withdrawTokenCall { token: WMON_ADDRESS, amount: amount_wei }.abi_encode()
+    };
+
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(ATOMIC_ARB_CONTRACT)
+        .from(signer_address)
+        .input(alloy::rpc::types::TransactionInput::new(
+            alloy::primitives::Bytes::from(calldata)
+        ))
+        .gas_limit(100_000)
+        .nonce(nonce::next_nonce())
+        .max_fee_per_gas(gas_price + (gas_price / 10))
+        .max_priority_fee_per_gas(gas_price / 10)
+        .with_chain_id(143);
+
+    let pending = provider_with_signer.send_transaction(tx).await?;
+    let receipt = pending.get_receipt().await?;
+
+    if receipt.status() {
+        println!("  Withdrawal successful");
+        println!("  TX: {:?}", receipt.transaction_hash);
+    } else {
+        println!("  Withdrawal failed");
+    }
+
+    Ok(())
+}
+
+async fn run_contract_balance() -> Result<()> {
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+
+    let (wmon, usdc) = query_contract_balances(&provider).await?;
+
+    println!("\n==============================================================");
+    println!("  ATOMIC ARB CONTRACT BALANCES");
+    println!("==============================================================");
+    println!("  Contract: {:?}", ATOMIC_ARB_CONTRACT);
+    println!("  WMON: {:>18.6}", wmon);
+    println!("  USDC: {:>18.6}", usdc);
+    println!("==============================================================");
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -1896,6 +2193,9 @@ async fn main() -> Result<()> {
         Some(Commands::FastArb { sell_dex, buy_dex, amount, slippage }) => {
             run_fast_arb(&sell_dex, &buy_dex, amount, slippage).await
         }
+        Some(Commands::AtomicArb { sell_dex, buy_dex, amount, slippage, min_profit_bps }) => {
+            run_atomic_arb(&sell_dex, &buy_dex, amount, slippage, min_profit_bps).await
+        }
         Some(Commands::AutoArb {
             min_spread_bps,
             amount,
@@ -1914,6 +2214,15 @@ async fn main() -> Result<()> {
             max_failures,
         }) => {
             run_prod_arb(min_spread_bps, amount, slippage, max_daily_loss, max_failures).await
+        }
+        Some(Commands::FundContract { amount }) => {
+            run_fund_contract(amount).await
+        }
+        Some(Commands::WithdrawContract { amount }) => {
+            run_withdraw_contract(amount).await
+        }
+        Some(Commands::ContractBalance) => {
+            run_contract_balance().await
         }
     }
 }
