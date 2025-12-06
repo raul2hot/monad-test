@@ -1340,12 +1340,17 @@ async fn run_auto_arb(
 ) -> Result<()> {
     use chrono::Local;
 
-    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
-    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+    // Load node configuration (auto-detects local vs remote)
+    let node_config = NodeConfig::from_env();
+    node_config.log_config();
 
-    let url: reqwest::Url = rpc_url.parse()?;
+    let url: reqwest::Url = node_config.rpc_url.parse()?;
     let provider = ProviderBuilder::new().connect_http(url.clone());
 
+    // Verify node health before starting
+    verify_node_ready(&provider).await?;
+
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
     let signer = PrivateKeySigner::from_str(&private_key)?;
     let signer_address = signer.address();
 
@@ -1363,6 +1368,9 @@ async fn run_auto_arb(
     let stats_file = format!("arb_stats_{}.jsonl", timestamp);
     let mut stats_logger = StatsLogger::new(&stats_file);
 
+    // Get polling interval from node config (50ms local, 1000ms remote)
+    let poll_interval_ms = node_config.poll_interval.as_millis() as u64;
+
     println!("═══════════════════════════════════════════════════════════════");
     println!("  AUTO-ARB BOT STARTED");
     println!("═══════════════════════════════════════════════════════════════");
@@ -1372,6 +1380,8 @@ async fn run_auto_arb(
     println!("  Slippage:        {} bps", slippage);
     println!("  Max executions:  {}", if max_executions == 0 { "unlimited".to_string() } else { max_executions.to_string() });
     println!("  Cooldown:        {} seconds", cooldown_secs);
+    println!("  Poll interval:   {} ms {}", poll_interval_ms, if node_config.is_local { "(local node optimized)" } else { "" });
+    println!("  Receipt poll:    {} ms", node_config.receipt_poll_interval.as_millis());
     println!("  Dry run:         {}", dry_run);
     println!("  Stats file:      {}", stats_file);
     println!("═══════════════════════════════════════════════════════════════");
@@ -1386,7 +1396,7 @@ async fn run_auto_arb(
 
     let mut execution_count = 0u32;
     let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
-    let mut poll_interval = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
     loop {
         poll_interval.tick().await;
