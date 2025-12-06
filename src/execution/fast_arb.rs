@@ -32,7 +32,7 @@ use super::SwapDirection;
 const MONAD_CHAIN_ID: u64 = 143;
 
 // Gas estimation buffer (10% for Monad - keep tight to minimize costs!)
-const GAS_BUFFER_PERCENT: u64 = 10;
+const GAS_BUFFER_PERCENT: u64 = 15;
 
 // Fallback gas limits (only used if estimation fails)
 const FALLBACK_GAS_LIMIT_SIMPLE: u64 = 250_000;
