@@ -70,7 +70,7 @@ impl NodeConfig {
             is_local: true,
             rpc_url,
             ws_url,
-            poll_interval: Duration::from_millis(50),        // 20x faster than remote (50ms)
+            poll_interval: Duration::from_millis(20),        // 20x faster than remote (50ms)
             receipt_poll_interval: Duration::from_millis(2), // Ultra-fast 2ms polling
             gas_buffer: 1.10,                                // 10% (tighter, saves cost)
             skip_block_wait: true,                           // State is consistent locally
