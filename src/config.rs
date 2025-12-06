@@ -1,5 +1,10 @@
 use alloy::primitives::Address;
 
+// ============== MONAD MAINNET CONFIGURATION ==============
+// Chain ID: 143
+// RPC Port: 8080 (NOT 8545!)
+// WS Port: 8081 (NOT 8546!)
+
 // Core Token Addresses (Monad Mainnet - Chain ID 143)
 pub const WMON_ADDRESS: Address = alloy::primitives::address!("3bd359C1119dA7Da1D913D1C4D2B7c461115433A");
 pub const USDC_ADDRESS: Address = alloy::primitives::address!("754704Bc059F8C67012fEd69BC8A327a5aafb603");
@@ -13,7 +18,8 @@ pub const ATOMIC_ARB_CONTRACT: Address = alloy::primitives::address!("A6270c7C30
 pub const WMON_DECIMALS: u8 = 18;
 pub const USDC_DECIMALS: u8 = 6;
 
-// Polling interval in milliseconds
+// Default polling interval in milliseconds
+// NOTE: For local node, use NodeConfig.poll_interval instead (100ms)
 pub const POLL_INTERVAL_MS: u64 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
