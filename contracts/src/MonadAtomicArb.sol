@@ -59,7 +59,7 @@ contract MonadAtomicArb {
         IERC20(USDC).approve(LFJ_ROUTER, type(uint256).max);
     }
 
-    /// @notice Execute atomic arbitrage: WMON -> USDC -> WMON
+    /// @notice Execute atomic arbitrage: WMON -> USDC -> WMON (with profit check)
     /// @param sellRouter Router to sell WMON for USDC (higher price)
     /// @param sellRouterData Pre-encoded calldata for sell swap
     /// @param buyRouter Router to buy WMON with USDC (lower price)
@@ -94,6 +94,40 @@ contract MonadAtomicArb {
         if (wmonAfter < wmonBefore + minProfit) {
             revert Unprofitable(wmonBefore, wmonAfter);
         }
+
+        emit ArbExecuted(
+            uint8(sellRouter),
+            uint8(buyRouter),
+            wmonBefore,
+            wmonAfter,
+            profit
+        );
+    }
+
+    /// @notice Execute atomic arbitrage WITHOUT profit check (for testing)
+    /// @dev Only ensures both swaps succeed atomically. Monitor should check profitability.
+    function executeArbUnchecked(
+        Router sellRouter,
+        bytes calldata sellRouterData,
+        Router buyRouter,
+        bytes calldata buyRouterData
+    ) external onlyOwner returns (int256 profit) {
+        uint256 wmonBefore = IERC20(WMON).balanceOf(address(this));
+
+        // Swap 1: WMON -> USDC on sellRouter
+        address sellAddr = _getRouterAddress(sellRouter);
+        (bool success1,) = sellAddr.call(sellRouterData);
+        if (!success1) revert SwapFailed(1);
+
+        // Swap 2: USDC -> WMON on buyRouter
+        address buyAddr = _getRouterAddress(buyRouter);
+        (bool success2,) = buyAddr.call(buyRouterData);
+        if (!success2) revert SwapFailed(2);
+
+        uint256 wmonAfter = IERC20(WMON).balanceOf(address(this));
+
+        // Calculate profit (can be negative) - NO REVERT on loss
+        profit = int256(wmonAfter) - int256(wmonBefore);
 
         emit ArbExecuted(
             uint8(sellRouter),
