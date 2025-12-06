@@ -1129,15 +1129,7 @@ async fn run_fast_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
              spread_bps, total_fee_bps, net_spread_bps);
 
     if net_spread_bps < 0 {
-        println!("\n  ⚠️  Negative net spread. Arb will be unprofitable.");
-        println!("  Continue anyway? [y/N]");
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("  Aborted.");
-            return Ok(());
-        }
+        println!("\n  ⚠️  Warning: Negative net spread. Arb may be unprofitable.");
     }
 
     println!("\n══════════════════════════════════════════════════════════════");
