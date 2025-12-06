@@ -195,7 +195,7 @@ enum Commands {
     /// Automated arbitrage: monitors prices and executes when opportunity found
     AutoArb {
         /// Minimum net spread in bps to trigger execution (e.g., -50 for testing, 10 for production)
-        #[arg(long, default_value = "-100")]
+        #[arg(long, default_value = "-100", allow_hyphen_values = true)]
         min_spread_bps: i32,
 
         /// Amount of WMON per arb execution
