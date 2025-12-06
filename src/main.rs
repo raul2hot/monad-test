@@ -25,7 +25,7 @@ use config::{
     RouterConfig,
 };
 use display::{display_prices, init_arb_log};
-use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata, wait_for_next_block};
+use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata, wait_for_next_block, execute_fast_arb, print_fast_arb_result};
 use execution::report::print_comparison_report;
 use multicall::fetch_prices_batched;
 use nonce::init_nonce;
@@ -157,6 +157,18 @@ enum Commands {
 
     /// Prepare wallet for arbitrage by approving all routers (one-time setup)
     PrepareArb,
+
+    /// Fast DEX-to-DEX arbitrage (optimized <1.5s execution)
+    FastArb {
+        #[arg(long)]
+        sell_dex: String,
+        #[arg(long)]
+        buy_dex: String,
+        #[arg(long, default_value = "1.0")]
+        amount: f64,
+        #[arg(long, default_value = "200")]
+        slippage: u32,
+    },
 }
 
 async fn get_current_prices<P: alloy::providers::Provider>(provider: &P) -> Result<Vec<PoolPrice>> {
@@ -1046,6 +1058,73 @@ async fn run_prepare_arb() -> Result<()> {
     Ok(())
 }
 
+async fn run_fast_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32) -> Result<()> {
+    let total_start = std::time::Instant::now();
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+
+    // PARALLEL INIT: gas + nonce + prices
+    let (gas_result, nonce_result, prices_result) = tokio::join!(
+        provider.get_gas_price(),
+        init_nonce(&provider, signer_address),
+        get_current_prices(&provider)
+    );
+
+    let gas_price = gas_result.unwrap_or(100_000_000_000);
+    nonce_result?;
+    let prices = prices_result?;
+
+    println!("  [TIMING] Parallel init: {:?}", total_start.elapsed());
+
+    // Create provider with signer
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Get routers
+    let sell_router = get_router_by_name(sell_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
+    let buy_router = get_router_by_name(buy_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
+
+    // Get prices
+    let sell_price = prices.iter()
+        .find(|p| p.pool_name.to_lowercase() == sell_dex.to_lowercase())
+        .ok_or_else(|| eyre::eyre!("No price for {}", sell_dex))?.price;
+    let buy_price = prices.iter()
+        .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
+        .ok_or_else(|| eyre::eyre!("No price for {}", buy_dex))?.price;
+
+    println!("\n══════════════════════════════════════════════════════════════");
+    println!("  FAST ARB | {} -> {}", sell_dex, buy_dex);
+    println!("══════════════════════════════════════════════════════════════");
+
+    let result = execute_fast_arb(
+        &provider_with_signer,
+        signer_address,
+        &sell_router,
+        &buy_router,
+        amount,
+        sell_price,
+        buy_price,
+        slippage,
+        gas_price,
+    ).await?;
+
+    print_fast_arb_result(&result, sell_dex, buy_dex);
+    println!("  [TIMING] TOTAL: {:?}", total_start.elapsed());
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -1089,6 +1168,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::PrepareArb) => {
             run_prepare_arb().await
+        }
+        Some(Commands::FastArb { sell_dex, buy_dex, amount, slippage }) => {
+            run_fast_arb(&sell_dex, &buy_dex, amount, slippage).await
         }
     }
 }
