@@ -33,6 +33,7 @@ mod multicall;
 mod nonce;
 mod pools;
 mod price;
+mod stats;
 mod wallet;
 
 use config::{
@@ -41,7 +42,11 @@ use config::{
     UNISWAP_SWAP_ROUTER, PANCAKE_SMART_ROUTER, LFJ_LB_ROUTER, MONDAY_SWAP_ROUTER,
     RouterConfig,
 };
-use display::{display_prices, init_arb_log};
+use display::{display_prices, init_arb_log, calculate_spreads};
+use stats::{
+    StatsLogger, ArbExecutionRecord, PreExecutionSnapshot, PostExecutionSnapshot,
+    print_pre_execution, print_post_execution,
+};
 use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata, wait_for_next_block, execute_fast_arb, print_fast_arb_result};
 use execution::report::print_comparison_report;
 use multicall::fetch_prices_batched;
@@ -185,6 +190,56 @@ enum Commands {
         amount: f64,
         #[arg(long, default_value = "200")]
         slippage: u32,
+    },
+
+    /// Automated arbitrage: monitors prices and executes when opportunity found
+    AutoArb {
+        /// Minimum net spread in bps to trigger execution (e.g., -50 for testing, 10 for production)
+        #[arg(long, default_value = "-100")]
+        min_spread_bps: i32,
+
+        /// Amount of WMON per arb execution
+        #[arg(long, default_value = "0.1")]
+        amount: f64,
+
+        /// Slippage tolerance in bps
+        #[arg(long, default_value = "200")]
+        slippage: u32,
+
+        /// Maximum executions (0 = unlimited)
+        #[arg(long, default_value = "1")]
+        max_executions: u32,
+
+        /// Cooldown between executions in seconds
+        #[arg(long, default_value = "10")]
+        cooldown_secs: u64,
+
+        /// Dry run mode (detect but don't execute)
+        #[arg(long, default_value = "false")]
+        dry_run: bool,
+    },
+
+    /// Production arbitrage bot with safety checks
+    ProdArb {
+        /// Minimum net spread in bps (must be positive for production)
+        #[arg(long, default_value = "20")]
+        min_spread_bps: i32,
+
+        /// Amount of WMON per arb
+        #[arg(long, default_value = "1.0")]
+        amount: f64,
+
+        /// Slippage tolerance in bps
+        #[arg(long, default_value = "100")]
+        slippage: u32,
+
+        /// Max daily loss in WMON (stops bot if exceeded)
+        #[arg(long, default_value = "0.5")]
+        max_daily_loss: f64,
+
+        /// Max consecutive failures before pause
+        #[arg(long, default_value = "3")]
+        max_failures: u32,
     },
 }
 
@@ -1154,6 +1209,646 @@ async fn run_fast_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     Ok(())
 }
 
+/// Automated arbitrage: monitors and executes when spread opportunity detected
+async fn run_auto_arb(
+    min_spread_bps: i32,
+    amount: f64,
+    slippage: u32,
+    max_executions: u32,
+    cooldown_secs: u64,
+    dry_run: bool,
+) -> Result<()> {
+    use chrono::Local;
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+
+    // Initialize nonce
+    init_nonce(&provider, signer_address).await?;
+
+    // Create provider with signer (reused for all executions)
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Initialize stats logger
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let stats_file = format!("arb_stats_{}.jsonl", timestamp);
+    let mut stats_logger = StatsLogger::new(&stats_file);
+
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  AUTO-ARB BOT STARTED");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  Wallet:          {:?}", signer_address);
+    println!("  Min Spread:      {} bps", min_spread_bps);
+    println!("  Amount per arb:  {} WMON", amount);
+    println!("  Slippage:        {} bps", slippage);
+    println!("  Max executions:  {}", if max_executions == 0 { "unlimited".to_string() } else { max_executions.to_string() });
+    println!("  Cooldown:        {} seconds", cooldown_secs);
+    println!("  Dry run:         {}", dry_run);
+    println!("  Stats file:      {}", stats_file);
+    println!("═══════════════════════════════════════════════════════════════");
+    println!();
+
+    // Show initial balances
+    let initial_balances = get_balances(&provider, signer_address).await?;
+    print_balances(&initial_balances);
+
+    let mut execution_count = 0u32;
+    let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
+
+    loop {
+        poll_interval.tick().await;
+
+        // Check if we've hit max executions
+        if max_executions > 0 && execution_count >= max_executions {
+            println!("\n  Reached max executions ({}). Stopping.", max_executions);
+            break;
+        }
+
+        // Fetch current prices
+        let prices = match get_current_prices(&provider).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  Price fetch error: {}", e);
+                continue;
+            }
+        };
+
+        // Calculate spreads
+        let spreads = calculate_spreads(&prices);
+
+        // Find best opportunity (first one is best due to sorting)
+        let best_spread = spreads.first();
+
+        if let Some(spread) = best_spread {
+            // Display current best opportunity
+            let now = Local::now().format("%H:%M:%S");
+            print!("\r[{}] Best: {} -> {} | Net: {:+.2}% ({:+} bps)    ",
+                now,
+                spread.buy_pool,
+                spread.sell_pool,
+                spread.net_spread_pct,
+                (spread.net_spread_pct * 100.0) as i32
+            );
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+            let net_spread_bps = (spread.net_spread_pct * 100.0) as i32;
+
+            // Check if spread meets threshold and cooldown has passed
+            let cooldown_elapsed = last_execution.elapsed().as_secs() >= cooldown_secs;
+
+            if net_spread_bps >= min_spread_bps && cooldown_elapsed {
+                println!();  // New line after the \r print
+                println!("\n  OPPORTUNITY DETECTED! Net spread: {} bps (threshold: {} bps)",
+                    net_spread_bps, min_spread_bps);
+
+                // Get routers for the opportunity
+                let sell_router = match get_router_by_name(&spread.sell_pool) {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("  Router not found for {}", spread.sell_pool);
+                        continue;
+                    }
+                };
+                let buy_router = match get_router_by_name(&spread.buy_pool) {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("  Router not found for {}", spread.buy_pool);
+                        continue;
+                    }
+                };
+
+                // Get current balances (pre-execution)
+                let balances_before = get_balances(&provider, signer_address).await?;
+
+                // Check if we have enough WMON
+                if balances_before.wmon_human < amount {
+                    println!("  Insufficient WMON. Have: {:.6}, Need: {:.6}",
+                        balances_before.wmon_human, amount);
+                    continue;
+                }
+
+                // Calculate expected amounts
+                let expected_usdc = amount * spread.sell_price;
+                let expected_wmon_back = expected_usdc / spread.buy_price;
+
+                // Create pre-execution snapshot
+                let pre_snapshot = PreExecutionSnapshot {
+                    timestamp: Local::now().to_rfc3339(),
+                    wmon_balance: balances_before.wmon_human,
+                    usdc_balance: balances_before.usdc_human,
+                    mon_balance: balances_before.mon_human,
+                    sell_dex: spread.sell_pool.clone(),
+                    sell_price: spread.sell_price,
+                    buy_dex: spread.buy_pool.clone(),
+                    buy_price: spread.buy_price,
+                    gross_spread_bps: (spread.gross_spread_pct * 100.0) as i32,
+                    net_spread_bps,
+                    amount_wmon: amount,
+                    expected_usdc,
+                    expected_wmon_back,
+                    slippage_bps: slippage,
+                };
+
+                print_pre_execution(&pre_snapshot);
+
+                if dry_run {
+                    println!("\n  [DRY RUN] Would execute arb but dry_run=true. Skipping.");
+
+                    // Log dry run
+                    let record = ArbExecutionRecord {
+                        id: stats_logger.next_id(),
+                        pre: pre_snapshot,
+                        post: None,
+                        success: false,
+                        error: Some("Dry run - execution skipped".to_string()),
+                    };
+                    stats_logger.log_execution(&record);
+
+                    last_execution = std::time::Instant::now();
+                    execution_count += 1;
+                    continue;
+                }
+
+                // Fetch gas price
+                let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+
+                // Execute fast arb
+                println!("\n  EXECUTING ARB...");
+                let exec_start = std::time::Instant::now();
+
+                let arb_result = execute_fast_arb(
+                    &provider_with_signer,
+                    signer_address,
+                    &sell_router,
+                    &buy_router,
+                    amount,
+                    spread.sell_price,
+                    spread.buy_price,
+                    slippage,
+                    gas_price,
+                ).await;
+
+                let exec_time = exec_start.elapsed().as_millis();
+
+                // Get post-execution balances
+                let balances_after = get_balances(&provider, signer_address).await?;
+
+                // Create post-execution snapshot
+                let post_snapshot = match &arb_result {
+                    Ok(result) => {
+                        let wmon_delta = balances_after.wmon_human - balances_before.wmon_human;
+                        let usdc_delta = balances_after.usdc_human - balances_before.usdc_human;
+                        let mon_delta = balances_after.mon_human - balances_before.mon_human;
+                        let net_profit_bps = if amount > 0.0 {
+                            (wmon_delta / amount * 10000.0) as i32
+                        } else {
+                            0
+                        };
+
+                        PostExecutionSnapshot {
+                            timestamp: Local::now().to_rfc3339(),
+                            wmon_balance: balances_after.wmon_human,
+                            usdc_balance: balances_after.usdc_human,
+                            mon_balance: balances_after.mon_human,
+                            swap1_success: result.swap1_success,
+                            swap1_tx_hash: result.swap1_tx_hash.clone(),
+                            swap1_gas_used: result.swap1_gas_used,
+                            swap1_gas_estimated: result.swap1_gas_estimated,
+                            swap2_success: result.swap2_success,
+                            swap2_tx_hash: result.swap2_tx_hash.clone(),
+                            swap2_gas_used: result.swap2_gas_used,
+                            swap2_gas_estimated: result.swap2_gas_estimated,
+                            actual_usdc_received: result.usdc_intermediate,
+                            actual_wmon_back: result.wmon_out,
+                            wmon_delta,
+                            usdc_delta,
+                            mon_delta,
+                            total_gas_cost_mon: result.total_gas_cost_mon,
+                            net_profit_wmon: wmon_delta,
+                            net_profit_bps,
+                            total_execution_ms: exec_time,
+                        }
+                    }
+                    Err(_e) => {
+                        // Failed execution - still record balances
+                        PostExecutionSnapshot {
+                            timestamp: Local::now().to_rfc3339(),
+                            wmon_balance: balances_after.wmon_human,
+                            usdc_balance: balances_after.usdc_human,
+                            mon_balance: balances_after.mon_human,
+                            swap1_success: false,
+                            swap1_tx_hash: String::new(),
+                            swap1_gas_used: 0,
+                            swap1_gas_estimated: 0,
+                            swap2_success: false,
+                            swap2_tx_hash: String::new(),
+                            swap2_gas_used: 0,
+                            swap2_gas_estimated: 0,
+                            actual_usdc_received: 0.0,
+                            actual_wmon_back: 0.0,
+                            wmon_delta: balances_after.wmon_human - balances_before.wmon_human,
+                            usdc_delta: balances_after.usdc_human - balances_before.usdc_human,
+                            mon_delta: balances_after.mon_human - balances_before.mon_human,
+                            total_gas_cost_mon: 0.0,
+                            net_profit_wmon: 0.0,
+                            net_profit_bps: 0,
+                            total_execution_ms: exec_time,
+                        }
+                    }
+                };
+
+                print_post_execution(&pre_snapshot, &post_snapshot);
+
+                // Log execution record
+                let record = ArbExecutionRecord {
+                    id: stats_logger.next_id(),
+                    pre: pre_snapshot,
+                    post: Some(post_snapshot),
+                    success: arb_result.as_ref().map(|r| r.success).unwrap_or(false),
+                    error: arb_result.as_ref().err().map(|e| e.to_string()),
+                };
+                stats_logger.log_execution(&record);
+
+                // Print result summary
+                if let Ok(result) = &arb_result {
+                    print_fast_arb_result(result, &spread.sell_pool, &spread.buy_pool);
+                } else if let Err(e) = &arb_result {
+                    println!("\n  ARB EXECUTION FAILED: {}", e);
+                }
+
+                last_execution = std::time::Instant::now();
+                execution_count += 1;
+
+                println!("\n  Executions: {} / {}",
+                    execution_count,
+                    if max_executions == 0 { "unlimited".to_string() } else { max_executions.to_string() }
+                );
+                println!("  Cooldown: {} seconds before next execution...\n", cooldown_secs);
+            }
+        }
+    }
+
+    // Final summary
+    println!("\n═══════════════════════════════════════════════════════════════");
+    println!("  AUTO-ARB SESSION COMPLETE");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  Total executions: {}", execution_count);
+    println!("  Stats saved to:   {}", stats_file);
+
+    let final_balances = get_balances(&provider, signer_address).await?;
+    println!("\n  Final Balances:");
+    println!("    MON:  {:>18.6} (Delta {:>+.6})", final_balances.mon_human,
+        final_balances.mon_human - initial_balances.mon_human);
+    println!("    WMON: {:>18.6} (Delta {:>+.6})", final_balances.wmon_human,
+        final_balances.wmon_human - initial_balances.wmon_human);
+    println!("    USDC: {:>18.6} (Delta {:>+.6})", final_balances.usdc_human,
+        final_balances.usdc_human - initial_balances.usdc_human);
+    println!("═══════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
+/// Production arbitrage bot with safety checks
+async fn run_prod_arb(
+    min_spread_bps: i32,
+    amount: f64,
+    slippage: u32,
+    max_daily_loss: f64,
+    max_failures: u32,
+) -> Result<()> {
+    use chrono::Local;
+
+    // Safety check: enforce positive spread for production
+    if min_spread_bps <= 0 {
+        return Err(eyre::eyre!(
+            "Production mode requires positive min_spread_bps. Got: {}. Use --min-spread-bps with a positive value.",
+            min_spread_bps
+        ));
+    }
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+
+    // Initialize nonce
+    init_nonce(&provider, signer_address).await?;
+
+    // Create provider with signer (reused for all executions)
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Initialize stats logger
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let stats_file = format!("prod_arb_stats_{}.jsonl", timestamp);
+    let mut stats_logger = StatsLogger::new(&stats_file);
+
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  PRODUCTION ARB BOT STARTED");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  Wallet:          {:?}", signer_address);
+    println!("  Min Spread:      {} bps (ENFORCED POSITIVE)", min_spread_bps);
+    println!("  Amount per arb:  {} WMON", amount);
+    println!("  Slippage:        {} bps", slippage);
+    println!("  Max daily loss:  {} WMON", max_daily_loss);
+    println!("  Max failures:    {}", max_failures);
+    println!("  Stats file:      {}", stats_file);
+    println!("═══════════════════════════════════════════════════════════════");
+    println!();
+
+    // Show initial balances
+    let initial_balances = get_balances(&provider, signer_address).await?;
+    print_balances(&initial_balances);
+
+    let mut execution_count = 0u32;
+    let mut successful_arbs = 0u32;
+    let mut consecutive_failures = 0u32;
+    let mut cumulative_pnl: f64 = 0.0;
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
+    let cooldown_secs: u64 = 10; // Fixed cooldown for production
+    let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
+
+    loop {
+        poll_interval.tick().await;
+
+        // Safety check: stop if cumulative loss exceeds threshold
+        if cumulative_pnl < -max_daily_loss {
+            println!("\n  MAX DAILY LOSS EXCEEDED ({:.6} WMON). Stopping.", cumulative_pnl);
+            break;
+        }
+
+        // Safety check: pause if too many consecutive failures
+        if consecutive_failures >= max_failures {
+            println!("\n  {} consecutive failures. Pausing for 60 seconds...", consecutive_failures);
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            consecutive_failures = 0;
+            continue;
+        }
+
+        // Fetch current prices
+        let prices = match get_current_prices(&provider).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  Price fetch error: {}", e);
+                continue;
+            }
+        };
+
+        // Calculate spreads
+        let spreads = calculate_spreads(&prices);
+
+        // Find best opportunity (first one is best due to sorting)
+        let best_spread = spreads.first();
+
+        if let Some(spread) = best_spread {
+            // Display current best opportunity
+            let now = Local::now().format("%H:%M:%S");
+            print!("\r[{}] Best: {} -> {} | Net: {:+.2}% | P&L: {:+.6} WMON    ",
+                now,
+                spread.buy_pool,
+                spread.sell_pool,
+                spread.net_spread_pct,
+                cumulative_pnl
+            );
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+            let net_spread_bps = (spread.net_spread_pct * 100.0) as i32;
+
+            // Check if spread meets threshold and cooldown has passed
+            let cooldown_elapsed = last_execution.elapsed().as_secs() >= cooldown_secs;
+
+            if net_spread_bps >= min_spread_bps && cooldown_elapsed {
+                println!();
+                println!("\n  PROFITABLE OPPORTUNITY! Net spread: {} bps (threshold: {} bps)",
+                    net_spread_bps, min_spread_bps);
+
+                // Get routers for the opportunity
+                let sell_router = match get_router_by_name(&spread.sell_pool) {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("  Router not found for {}", spread.sell_pool);
+                        continue;
+                    }
+                };
+                let buy_router = match get_router_by_name(&spread.buy_pool) {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("  Router not found for {}", spread.buy_pool);
+                        continue;
+                    }
+                };
+
+                // Get current balances (pre-execution)
+                let balances_before = get_balances(&provider, signer_address).await?;
+
+                // Check if we have enough WMON
+                if balances_before.wmon_human < amount {
+                    println!("  Insufficient WMON. Have: {:.6}, Need: {:.6}",
+                        balances_before.wmon_human, amount);
+                    continue;
+                }
+
+                // Calculate expected amounts
+                let expected_usdc = amount * spread.sell_price;
+                let expected_wmon_back = expected_usdc / spread.buy_price;
+
+                // Create pre-execution snapshot
+                let pre_snapshot = PreExecutionSnapshot {
+                    timestamp: Local::now().to_rfc3339(),
+                    wmon_balance: balances_before.wmon_human,
+                    usdc_balance: balances_before.usdc_human,
+                    mon_balance: balances_before.mon_human,
+                    sell_dex: spread.sell_pool.clone(),
+                    sell_price: spread.sell_price,
+                    buy_dex: spread.buy_pool.clone(),
+                    buy_price: spread.buy_price,
+                    gross_spread_bps: (spread.gross_spread_pct * 100.0) as i32,
+                    net_spread_bps,
+                    amount_wmon: amount,
+                    expected_usdc,
+                    expected_wmon_back,
+                    slippage_bps: slippage,
+                };
+
+                print_pre_execution(&pre_snapshot);
+
+                // Fetch gas price
+                let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
+
+                // Execute fast arb
+                println!("\n  EXECUTING PRODUCTION ARB...");
+                let exec_start = std::time::Instant::now();
+
+                let arb_result = execute_fast_arb(
+                    &provider_with_signer,
+                    signer_address,
+                    &sell_router,
+                    &buy_router,
+                    amount,
+                    spread.sell_price,
+                    spread.buy_price,
+                    slippage,
+                    gas_price,
+                ).await;
+
+                let exec_time = exec_start.elapsed().as_millis();
+
+                // Get post-execution balances
+                let balances_after = get_balances(&provider, signer_address).await?;
+
+                let wmon_delta = balances_after.wmon_human - balances_before.wmon_human;
+
+                // Create post-execution snapshot
+                let post_snapshot = match &arb_result {
+                    Ok(result) => {
+                        let usdc_delta = balances_after.usdc_human - balances_before.usdc_human;
+                        let mon_delta = balances_after.mon_human - balances_before.mon_human;
+                        let net_profit_bps = if amount > 0.0 {
+                            (wmon_delta / amount * 10000.0) as i32
+                        } else {
+                            0
+                        };
+
+                        PostExecutionSnapshot {
+                            timestamp: Local::now().to_rfc3339(),
+                            wmon_balance: balances_after.wmon_human,
+                            usdc_balance: balances_after.usdc_human,
+                            mon_balance: balances_after.mon_human,
+                            swap1_success: result.swap1_success,
+                            swap1_tx_hash: result.swap1_tx_hash.clone(),
+                            swap1_gas_used: result.swap1_gas_used,
+                            swap1_gas_estimated: result.swap1_gas_estimated,
+                            swap2_success: result.swap2_success,
+                            swap2_tx_hash: result.swap2_tx_hash.clone(),
+                            swap2_gas_used: result.swap2_gas_used,
+                            swap2_gas_estimated: result.swap2_gas_estimated,
+                            actual_usdc_received: result.usdc_intermediate,
+                            actual_wmon_back: result.wmon_out,
+                            wmon_delta,
+                            usdc_delta,
+                            mon_delta,
+                            total_gas_cost_mon: result.total_gas_cost_mon,
+                            net_profit_wmon: wmon_delta,
+                            net_profit_bps,
+                            total_execution_ms: exec_time,
+                        }
+                    }
+                    Err(_e) => {
+                        PostExecutionSnapshot {
+                            timestamp: Local::now().to_rfc3339(),
+                            wmon_balance: balances_after.wmon_human,
+                            usdc_balance: balances_after.usdc_human,
+                            mon_balance: balances_after.mon_human,
+                            swap1_success: false,
+                            swap1_tx_hash: String::new(),
+                            swap1_gas_used: 0,
+                            swap1_gas_estimated: 0,
+                            swap2_success: false,
+                            swap2_tx_hash: String::new(),
+                            swap2_gas_used: 0,
+                            swap2_gas_estimated: 0,
+                            actual_usdc_received: 0.0,
+                            actual_wmon_back: 0.0,
+                            wmon_delta,
+                            usdc_delta: balances_after.usdc_human - balances_before.usdc_human,
+                            mon_delta: balances_after.mon_human - balances_before.mon_human,
+                            total_gas_cost_mon: 0.0,
+                            net_profit_wmon: 0.0,
+                            net_profit_bps: 0,
+                            total_execution_ms: exec_time,
+                        }
+                    }
+                };
+
+                print_post_execution(&pre_snapshot, &post_snapshot);
+
+                // Update cumulative P&L
+                cumulative_pnl += wmon_delta;
+
+                // Log execution record
+                let record = ArbExecutionRecord {
+                    id: stats_logger.next_id(),
+                    pre: pre_snapshot,
+                    post: Some(post_snapshot),
+                    success: arb_result.as_ref().map(|r| r.success).unwrap_or(false),
+                    error: arb_result.as_ref().err().map(|e| e.to_string()),
+                };
+                stats_logger.log_execution(&record);
+
+                // Update counters
+                if let Ok(result) = &arb_result {
+                    if result.success && wmon_delta > 0.0 {
+                        successful_arbs += 1;
+                        consecutive_failures = 0;
+                        print_fast_arb_result(result, &spread.sell_pool, &spread.buy_pool);
+                    } else {
+                        consecutive_failures += 1;
+                    }
+                } else if let Err(e) = &arb_result {
+                    consecutive_failures += 1;
+                    println!("\n  ARB EXECUTION FAILED: {}", e);
+                }
+
+                last_execution = std::time::Instant::now();
+                execution_count += 1;
+
+                let win_rate = if execution_count > 0 {
+                    (successful_arbs as f64 / execution_count as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                println!("\n  PRODUCTION STATS:");
+                println!("    Executions:    {}", execution_count);
+                println!("    Successful:    {} ({:.1}% win rate)", successful_arbs, win_rate);
+                println!("    Cumulative P&L: {:+.6} WMON", cumulative_pnl);
+                println!("    Failures:      {} consecutive", consecutive_failures);
+                println!("  Cooldown: {} seconds...\n", cooldown_secs);
+            }
+        }
+    }
+
+    // Final summary
+    println!("\n═══════════════════════════════════════════════════════════════");
+    println!("  PRODUCTION ARB SESSION COMPLETE");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  Total executions:  {}", execution_count);
+    println!("  Successful arbs:   {}", successful_arbs);
+    println!("  Win rate:          {:.1}%", if execution_count > 0 {
+        (successful_arbs as f64 / execution_count as f64) * 100.0
+    } else { 0.0 });
+    println!("  Cumulative P&L:    {:+.6} WMON", cumulative_pnl);
+    println!("  Stats saved to:    {}", stats_file);
+
+    let final_balances = get_balances(&provider, signer_address).await?;
+    println!("\n  Final Balances:");
+    println!("    MON:  {:>18.6} (Delta {:>+.6})", final_balances.mon_human,
+        final_balances.mon_human - initial_balances.mon_human);
+    println!("    WMON: {:>18.6} (Delta {:>+.6})", final_balances.wmon_human,
+        final_balances.wmon_human - initial_balances.wmon_human);
+    println!("    USDC: {:>18.6} (Delta {:>+.6})", final_balances.usdc_human,
+        final_balances.usdc_human - initial_balances.usdc_human);
+    println!("═══════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -1200,6 +1895,25 @@ async fn main() -> Result<()> {
         }
         Some(Commands::FastArb { sell_dex, buy_dex, amount, slippage }) => {
             run_fast_arb(&sell_dex, &buy_dex, amount, slippage).await
+        }
+        Some(Commands::AutoArb {
+            min_spread_bps,
+            amount,
+            slippage,
+            max_executions,
+            cooldown_secs,
+            dry_run,
+        }) => {
+            run_auto_arb(min_spread_bps, amount, slippage, max_executions, cooldown_secs, dry_run).await
+        }
+        Some(Commands::ProdArb {
+            min_spread_bps,
+            amount,
+            slippage,
+            max_daily_loss,
+            max_failures,
+        }) => {
+            run_prod_arb(min_spread_bps, amount, slippage, max_daily_loss, max_failures).await
         }
     }
 }
