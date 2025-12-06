@@ -64,6 +64,14 @@ sol! {
     ) external returns (int256 profit);
 
     #[derive(Debug)]
+    function executeArbUnchecked(
+        uint8 sellRouter,
+        bytes calldata sellRouterData,
+        uint8 buyRouter,
+        bytes calldata buyRouterData
+    ) external returns (int256 profit);
+
+    #[derive(Debug)]
     function getBalances() external view returns (uint256 wmon, uint256 usdc);
 
     // Custom errors for decoding
@@ -157,6 +165,7 @@ fn build_router_calldata(
 /// * `slippage_bps` - Slippage tolerance in basis points
 /// * `min_profit_bps` - Minimum profit required (0 = any profit)
 /// * `gas_price` - Pre-fetched gas price
+/// * `force` - If true, skip profit check (for testing)
 pub async fn execute_atomic_arb<P: Provider>(
     provider_with_signer: &P,
     signer_address: Address,
@@ -168,6 +177,7 @@ pub async fn execute_atomic_arb<P: Provider>(
     slippage_bps: u32,
     min_profit_bps: i32,
     gas_price: u128,
+    force: bool,
 ) -> Result<AtomicArbResult> {
     let start = std::time::Instant::now();
 
@@ -221,16 +231,26 @@ pub async fn execute_atomic_arb<P: Provider>(
         min_wmon_out_wei,
     )?;
 
-    // Build executeArb call
-    let execute_call = executeArbCall {
-        sellRouter: ContractRouter::from(sell_router.router_type) as u8,
-        sellRouterData: sell_calldata,
-        buyRouter: ContractRouter::from(buy_router.router_type) as u8,
-        buyRouterData: buy_calldata,
-        minProfit: min_profit_wei,
+    // Build executeArb call (use unchecked version if force=true)
+    let calldata = if force {
+        println!("  Using UNCHECKED mode (force=true) - no profit check");
+        let execute_call = executeArbUncheckedCall {
+            sellRouter: ContractRouter::from(sell_router.router_type) as u8,
+            sellRouterData: sell_calldata,
+            buyRouter: ContractRouter::from(buy_router.router_type) as u8,
+            buyRouterData: buy_calldata,
+        };
+        Bytes::from(execute_call.abi_encode())
+    } else {
+        let execute_call = executeArbCall {
+            sellRouter: ContractRouter::from(sell_router.router_type) as u8,
+            sellRouterData: sell_calldata,
+            buyRouter: ContractRouter::from(buy_router.router_type) as u8,
+            buyRouterData: buy_calldata,
+            minProfit: min_profit_wei,
+        };
+        Bytes::from(execute_call.abi_encode())
     };
-
-    let calldata = Bytes::from(execute_call.abi_encode());
 
     // Estimate gas
     println!("  Estimating gas...");

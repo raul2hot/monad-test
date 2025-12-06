@@ -204,6 +204,9 @@ enum Commands {
         slippage: u32,
         #[arg(long, default_value = "0")]
         min_profit_bps: i32,
+        /// Force execution even if unprofitable (for testing)
+        #[arg(long, default_value = "false")]
+        force: bool,
     },
 
     /// Automated arbitrage: monitors prices and executes when opportunity found
@@ -1238,7 +1241,7 @@ async fn run_fast_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32)
     Ok(())
 }
 
-async fn run_atomic_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32, min_profit_bps: i32) -> Result<()> {
+async fn run_atomic_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32, min_profit_bps: i32, force: bool) -> Result<()> {
     let total_start = std::time::Instant::now();
 
     let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
@@ -1298,6 +1301,7 @@ async fn run_atomic_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u3
         slippage,
         min_profit_bps,
         gas_price,
+        force,
     ).await?;
 
     print_atomic_arb_result(&result);
@@ -1499,6 +1503,7 @@ async fn run_auto_arb(
                         slippage,
                         0, // min_profit_bps = 0 (any profit)
                         gas_price,
+                        false, // force = false (monitor checks profitability)
                     ).await {
                         Ok(result) => {
                             print_atomic_arb_result(&result);
@@ -2193,8 +2198,8 @@ async fn main() -> Result<()> {
         Some(Commands::FastArb { sell_dex, buy_dex, amount, slippage }) => {
             run_fast_arb(&sell_dex, &buy_dex, amount, slippage).await
         }
-        Some(Commands::AtomicArb { sell_dex, buy_dex, amount, slippage, min_profit_bps }) => {
-            run_atomic_arb(&sell_dex, &buy_dex, amount, slippage, min_profit_bps).await
+        Some(Commands::AtomicArb { sell_dex, buy_dex, amount, slippage, min_profit_bps, force }) => {
+            run_atomic_arb(&sell_dex, &buy_dex, amount, slippage, min_profit_bps, force).await
         }
         Some(Commands::AutoArb {
             min_spread_bps,
