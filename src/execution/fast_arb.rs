@@ -1,10 +1,11 @@
 //! Fast DEX-to-DEX Arbitrage Module
 //!
-//! Optimized for <1.5s execution by:
+//! Optimized for <1.2s execution by:
 //! - Skipping wait_for_next_block
 //! - Sending both TXs back-to-back
-//! - Parallel receipt waiting
-//! - 50ms polling (vs 100ms)
+//! - Parallel receipt waiting with timeout
+//! - 20ms polling (optimized for Monad's fast blocks)
+//! - Dynamic safety buffer based on slippage
 //! - Skipping approval/balance checks
 
 use alloy::network::TransactionBuilder;
@@ -53,6 +54,10 @@ pub struct FastArbResult {
     pub usdc_intermediate: f64,  // Estimated USDC from swap 1
     pub wmon_out: f64,           // Estimated WMON from swap 2
 
+    // Actual vs Estimated tracking
+    pub wmon_out_actual: Option<f64>,        // Filled after balance check
+    pub estimation_error_bps: Option<i32>,   // (actual - estimated) / estimated * 10000
+
     // Profit/Loss
     pub gross_profit_wmon: f64,
     pub profit_bps: i32,
@@ -60,11 +65,13 @@ pub struct FastArbResult {
     // Gas costs
     pub total_gas_cost_wei: U256,
     pub total_gas_cost_mon: f64,
+    pub total_gas_used: u64,  // Combined gas used for both swaps
 
     // Timing
     pub total_time_ms: u128,
     pub swap1_time_ms: u128,
     pub swap2_time_ms: u128,
+    pub execution_time_ms: u128,  // Alias for total_time_ms for logging
 
     // Overall success
     pub success: bool,
@@ -88,13 +95,13 @@ fn get_gas_limit_for_router(router_type: RouterType) -> u64 {
     }
 }
 
-/// Wait for transaction receipt with FAST 50ms polling
+/// Wait for transaction receipt with FAST 20ms polling
 /// Times out after 15 seconds (faster than standard 30s)
 async fn wait_for_receipt_fast<P: Provider>(
     provider: &P,
     tx_hash: TxHash,
 ) -> Result<TransactionReceipt> {
-    let mut poll_interval = interval(Duration::from_millis(50)); // 50ms vs 100ms
+    let mut poll_interval = interval(Duration::from_millis(20)); // 20ms polling for Monad's fast blocks
     let deadline = Duration::from_secs(15); // 15s vs 30s
 
     timeout(deadline, async {
@@ -176,8 +183,9 @@ pub async fn execute_fast_arb<P: Provider>(
     let expected_usdc = amount * sell_price;
     let expected_usdc_wei = to_wei(expected_usdc, USDC_DECIMALS);
 
-    // Use 99% of expected USDC for swap 2 (safety margin)
-    let usdc_for_swap2 = expected_usdc * 0.99;
+    // Dynamic buffer: slippage 200bps → 99%, slippage 100bps → 99.5%, slippage 50bps → 99.75%
+    let safety_factor = 1.0 - (slippage_bps as f64 / 20000.0);
+    let usdc_for_swap2 = expected_usdc * safety_factor;
     let usdc_for_swap2_wei = to_wei(usdc_for_swap2, USDC_DECIMALS);
 
     let expected_wmon_back = usdc_for_swap2 / buy_price;
@@ -271,13 +279,17 @@ pub async fn execute_fast_arb<P: Provider>(
                 wmon_in: amount,
                 usdc_intermediate: 0.0,
                 wmon_out: 0.0,
+                wmon_out_actual: None,
+                estimation_error_bps: None,
                 gross_profit_wmon: 0.0,
                 profit_bps: 0,
                 total_gas_cost_wei: U256::ZERO,
                 total_gas_cost_mon: 0.0,
+                total_gas_used: 0,
                 total_time_ms: total_start.elapsed().as_millis(),
                 swap1_time_ms: 0,
                 swap2_time_ms: 0,
+                execution_time_ms: total_start.elapsed().as_millis(),
                 success: false,
                 error: Some(format!("Swap 1 send failed: {}", e)),
             });
@@ -293,13 +305,17 @@ pub async fn execute_fast_arb<P: Provider>(
                 wmon_in: amount,
                 usdc_intermediate: 0.0,
                 wmon_out: 0.0,
+                wmon_out_actual: None,
+                estimation_error_bps: None,
                 gross_profit_wmon: 0.0,
                 profit_bps: 0,
                 total_gas_cost_wei: U256::ZERO,
                 total_gas_cost_mon: 0.0,
+                total_gas_used: 0,
                 total_time_ms: total_start.elapsed().as_millis(),
                 swap1_time_ms: 0,
                 swap2_time_ms: 0,
+                execution_time_ms: total_start.elapsed().as_millis(),
                 success: false,
                 error: Some("Swap 1 send timeout".to_string()),
             });
@@ -333,13 +349,17 @@ pub async fn execute_fast_arb<P: Provider>(
                 wmon_in: amount,
                 usdc_intermediate: expected_usdc,
                 wmon_out: 0.0,
+                wmon_out_actual: None,
+                estimation_error_bps: None,
                 gross_profit_wmon: 0.0 - amount,
                 profit_bps: -10000,
                 total_gas_cost_wei: U256::from(swap1_receipt.gas_used) * U256::from(swap1_receipt.effective_gas_price),
                 total_gas_cost_mon: (swap1_receipt.gas_used as f64 * swap1_receipt.effective_gas_price as f64) / 1e18,
+                total_gas_used: swap1_receipt.gas_used,
                 total_time_ms: total_start.elapsed().as_millis(),
                 swap1_time_ms: swap1_time,
                 swap2_time_ms: 0,
+                execution_time_ms: total_start.elapsed().as_millis(),
                 success: false,
                 error: Some(format!("Swap 2 send failed: {}", e)),
             });
@@ -358,13 +378,17 @@ pub async fn execute_fast_arb<P: Provider>(
                 wmon_in: amount,
                 usdc_intermediate: expected_usdc,
                 wmon_out: 0.0,
+                wmon_out_actual: None,
+                estimation_error_bps: None,
                 gross_profit_wmon: 0.0 - amount,
                 profit_bps: -10000,
                 total_gas_cost_wei: U256::from(swap1_receipt.gas_used) * U256::from(swap1_receipt.effective_gas_price),
                 total_gas_cost_mon: (swap1_receipt.gas_used as f64 * swap1_receipt.effective_gas_price as f64) / 1e18,
+                total_gas_used: swap1_receipt.gas_used,
                 total_time_ms: total_start.elapsed().as_millis(),
                 swap1_time_ms: swap1_time,
                 swap2_time_ms: 0,
+                execution_time_ms: total_start.elapsed().as_millis(),
                 success: false,
                 error: Some("Swap 2 send timeout".to_string()),
             });
@@ -380,16 +404,18 @@ pub async fn execute_fast_arb<P: Provider>(
 
     println!("  Waiting for confirmations (parallel)...");
 
-    let (swap1_result, swap2_result) = tokio::join!(
-        wait_for_receipt_fast(provider_with_signer, swap1_hash),
-        wait_for_receipt_fast(provider_with_signer, swap2_hash)
+    // Add explicit timeout to prevent hanging if one receipt never arrives
+    let receipt_timeout = Duration::from_secs(15);
+    let (receipt1_result, receipt2_result) = tokio::join!(
+        timeout(receipt_timeout, wait_for_receipt_fast(provider_with_signer, swap1_hash)),
+        timeout(receipt_timeout, wait_for_receipt_fast(provider_with_signer, swap2_hash))
     );
 
     let swap1_time = swap1_start.elapsed().as_millis();
     let swap2_time = swap2_start.elapsed().as_millis();
 
-    let swap1_receipt = swap1_result?;
-    let swap2_receipt = swap2_result?;
+    let swap1_receipt = receipt1_result.map_err(|_| eyre!("Swap 1 receipt timeout"))??;
+    let swap2_receipt = receipt2_result.map_err(|_| eyre!("Swap 2 receipt timeout"))??;
 
     println!("    Swap 1 confirmed: {} (gas: {})",
         if swap1_receipt.status() { "SUCCESS" } else { "REVERTED" },
@@ -418,7 +444,10 @@ pub async fn execute_fast_arb<P: Provider>(
         0
     };
 
-    Ok(FastArbResult {
+    let total_gas_used = swap1_receipt.gas_used + swap2_receipt.gas_used;
+    let execution_time = total_start.elapsed().as_millis();
+
+    let result = FastArbResult {
         swap1_tx_hash: format!("{:?}", swap1_hash),
         swap1_gas_used: swap1_receipt.gas_used,
         swap1_success: swap1_receipt.status(),
@@ -428,16 +457,52 @@ pub async fn execute_fast_arb<P: Provider>(
         wmon_in: amount,
         usdc_intermediate: usdc_for_swap2,
         wmon_out: if both_success { expected_wmon_back } else { 0.0 },
+        wmon_out_actual: None,  // Can be filled after balance check
+        estimation_error_bps: None,
         gross_profit_wmon: gross_profit,
         profit_bps,
         total_gas_cost_wei,
         total_gas_cost_mon,
-        total_time_ms: total_start.elapsed().as_millis(),
+        total_gas_used,
+        total_time_ms: execution_time,
         swap1_time_ms: swap1_time,
         swap2_time_ms: swap2_time,
+        execution_time_ms: execution_time,
         success: both_success,
         error: if both_success { None } else { Some("One or both swaps reverted".to_string()) },
-    })
+    };
+
+    // Log to arb execution history (Issue 9)
+    log_arb_execution(&result, sell_router, buy_router);
+
+    Ok(result)
+}
+
+/// Log arb execution to CSV file for analytics
+fn log_arb_execution(result: &FastArbResult, sell_router: &RouterConfig, buy_router: &RouterConfig) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let log_line = format!(
+        "{},{},{},{},{},{},{},{},{}\n",
+        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        sell_router.name,
+        buy_router.name,
+        result.wmon_in,
+        result.usdc_intermediate,
+        result.wmon_out,
+        result.total_gas_used,
+        result.execution_time_ms,
+        if result.error.is_some() { "FAILED" } else { "SUCCESS" }
+    );
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("arb_executions.csv")
+    {
+        let _ = file.write_all(log_line.as_bytes());
+    }
 }
 
 /// Print the fast arb result in a nice format
