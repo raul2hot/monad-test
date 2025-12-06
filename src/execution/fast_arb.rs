@@ -473,36 +473,9 @@ pub async fn execute_fast_arb<P: Provider>(
     };
 
     // Log to arb execution history (Issue 9)
-    log_arb_execution(&result, sell_router, buy_router);
+    // log_arb_execution(&result, sell_router, buy_router);
 
     Ok(result)
-}
-
-/// Log arb execution to CSV file for analytics
-fn log_arb_execution(result: &FastArbResult, sell_router: &RouterConfig, buy_router: &RouterConfig) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let log_line = format!(
-        "{},{},{},{},{},{},{},{},{}\n",
-        Local::now().format("%Y-%m-%d %H:%M:%S"),
-        sell_router.name,
-        buy_router.name,
-        result.wmon_in,
-        result.usdc_intermediate,
-        result.wmon_out,
-        result.total_gas_used,
-        result.execution_time_ms,
-        if result.error.is_some() { "FAILED" } else { "SUCCESS" }
-    );
-
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("arb_executions.csv")
-    {
-        let _ = file.write_all(log_line.as_bytes());
-    }
 }
 
 /// Print the fast arb result in a nice format
