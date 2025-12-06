@@ -7,6 +7,10 @@
 //! - 20ms polling (optimized for Monad's fast blocks)
 //! - Dynamic safety buffer based on slippage
 //! - Skipping approval/balance checks
+//!
+//! CRITICAL MONAD GAS FIX:
+//! Monad charges gas_limit, NOT gas_used!
+//! We use eth_estimateGas + 10% buffer instead of hardcoded limits.
 
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, TxHash, U256};
@@ -27,6 +31,13 @@ use super::SwapDirection;
 // Monad mainnet chain ID
 const MONAD_CHAIN_ID: u64 = 143;
 
+// Gas estimation buffer (10% for Monad - keep tight to minimize costs!)
+const GAS_BUFFER_PERCENT: u64 = 10;
+
+// Fallback gas limits (only used if estimation fails)
+const FALLBACK_GAS_LIMIT_SIMPLE: u64 = 250_000;
+const FALLBACK_GAS_LIMIT_COMPLEX: u64 = 400_000;
+
 // ERC20 interface for approvals
 sol! {
     #[derive(Debug)]
@@ -42,11 +53,13 @@ pub struct FastArbResult {
     // Swap 1: Sell WMON for USDC
     pub swap1_tx_hash: String,
     pub swap1_gas_used: u64,
+    pub swap1_gas_estimated: u64,  // NEW: Track estimated vs actual
     pub swap1_success: bool,
 
     // Swap 2: Buy WMON with USDC
     pub swap2_tx_hash: String,
     pub swap2_gas_used: u64,
+    pub swap2_gas_estimated: u64,  // NEW: Track estimated vs actual
     pub swap2_success: bool,
 
     // Amounts
@@ -65,7 +78,8 @@ pub struct FastArbResult {
     // Gas costs
     pub total_gas_cost_wei: U256,
     pub total_gas_cost_mon: f64,
-    pub total_gas_used: u64,  // Combined gas used for both swaps
+    pub total_gas_used: u64,      // Combined gas used for both swaps
+    pub total_gas_estimated: u64, // NEW: Combined gas estimated (what we paid for on Monad!)
 
     // Timing
     pub total_time_ms: u128,
@@ -85,13 +99,42 @@ fn to_wei(amount: f64, decimals: u8) -> U256 {
     U256::from(amount_scaled) * multiplier / U256::from(10u64).pow(U256::from(18u8))
 }
 
-/// Get hardcoded gas limit for a router type
-fn get_gas_limit_for_router(router_type: RouterType) -> u64 {
+/// Get fallback gas limit for a router type (only used if estimation fails)
+fn get_fallback_gas_limit(router_type: RouterType) -> u64 {
     match router_type {
-        RouterType::UniswapV3 => 400_000,
-        RouterType::PancakeV3 => 800_000,
-        RouterType::LfjLB => 800_000,
-        RouterType::MondayTrade => 800_000,
+        RouterType::UniswapV3 => FALLBACK_GAS_LIMIT_SIMPLE,
+        RouterType::PancakeV3 => FALLBACK_GAS_LIMIT_COMPLEX, // Multicall wrapper
+        RouterType::LfjLB => FALLBACK_GAS_LIMIT_COMPLEX,     // Complex path routing
+        RouterType::MondayTrade => FALLBACK_GAS_LIMIT_SIMPLE,
+    }
+}
+
+/// Estimate gas for a transaction using eth_estimateGas
+/// Returns estimated gas + buffer, or fallback if estimation fails
+async fn estimate_gas_with_buffer<P: Provider>(
+    provider: &P,
+    to: Address,
+    from: Address,
+    calldata: &Bytes,
+    router_type: RouterType,
+) -> u64 {
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(to)
+        .from(from)
+        .input(alloy::rpc::types::TransactionInput::new(calldata.clone()));
+
+    match provider.estimate_gas(tx).await {
+        Ok(estimated) => {
+            // Add buffer: estimated * (100 + buffer%) / 100
+            let with_buffer = estimated * (100 + GAS_BUFFER_PERCENT) / 100;
+            println!("    Gas estimated: {} + {}% buffer = {}", estimated, GAS_BUFFER_PERCENT, with_buffer);
+            with_buffer
+        }
+        Err(e) => {
+            let fallback = get_fallback_gas_limit(router_type);
+            println!("    ⚠ Gas estimation failed ({}), using fallback: {}", e, fallback);
+            fallback
+        }
     }
 }
 
@@ -148,12 +191,9 @@ pub fn build_fast_swap_tx(
 
 /// Execute fast DEX-to-DEX arbitrage
 ///
-/// Optimizations:
-/// - No wait_for_next_block between swaps
-/// - Both TXs sent back-to-back
-/// - Parallel receipt waiting
-/// - 50ms polling
-/// - No balance checks (uses estimated amounts)
+/// MONAD GAS OPTIMIZATION:
+/// Uses eth_estimateGas + 10% buffer instead of hardcoded limits.
+/// On Monad, you pay for gas_limit, not gas_used!
 ///
 /// # Arguments
 /// * `provider_with_signer` - Provider with wallet for sending transactions
@@ -226,9 +266,32 @@ pub async fn execute_fast_arb<P: Provider>(
         signer_address,
     )?;
 
-    // Get gas limits
-    let swap1_gas_limit = get_gas_limit_for_router(sell_router.router_type);
-    let swap2_gas_limit = get_gas_limit_for_router(buy_router.router_type);
+    // ═══════════════════════════════════════════════════════════════════════
+    // MONAD GAS FIX: Estimate gas dynamically instead of hardcoded limits!
+    // On Monad, you pay gas_limit, not gas_used. Every extra gas unit costs money.
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    println!("\n  Estimating gas (MONAD: you pay gas_limit, not gas_used!)...");
+    
+    let swap1_gas_limit = estimate_gas_with_buffer(
+        provider_with_signer,
+        sell_router.address,
+        signer_address,
+        &swap1_calldata,
+        sell_router.router_type,
+    ).await;
+
+    let swap2_gas_limit = estimate_gas_with_buffer(
+        provider_with_signer,
+        buy_router.address,
+        signer_address,
+        &swap2_calldata,
+        buy_router.router_type,
+    ).await;
+
+    println!("    Swap 1 gas limit: {} (will be charged on Monad)", swap1_gas_limit);
+    println!("    Swap 2 gas limit: {} (will be charged on Monad)", swap2_gas_limit);
+    println!("    TOTAL gas budget: {} (this is your actual cost!)", swap1_gas_limit + swap2_gas_limit);
 
     // Build swap 1 transaction
     let swap1_nonce = next_nonce();
@@ -272,9 +335,11 @@ pub async fn execute_fast_arb<P: Provider>(
             return Ok(FastArbResult {
                 swap1_tx_hash: String::new(),
                 swap1_gas_used: 0,
+                swap1_gas_estimated: swap1_gas_limit,
                 swap1_success: false,
                 swap2_tx_hash: String::new(),
                 swap2_gas_used: 0,
+                swap2_gas_estimated: swap2_gas_limit,
                 swap2_success: false,
                 wmon_in: amount,
                 usdc_intermediate: 0.0,
@@ -286,6 +351,7 @@ pub async fn execute_fast_arb<P: Provider>(
                 total_gas_cost_wei: U256::ZERO,
                 total_gas_cost_mon: 0.0,
                 total_gas_used: 0,
+                total_gas_estimated: swap1_gas_limit + swap2_gas_limit,
                 total_time_ms: total_start.elapsed().as_millis(),
                 swap1_time_ms: 0,
                 swap2_time_ms: 0,
@@ -298,9 +364,11 @@ pub async fn execute_fast_arb<P: Provider>(
             return Ok(FastArbResult {
                 swap1_tx_hash: String::new(),
                 swap1_gas_used: 0,
+                swap1_gas_estimated: swap1_gas_limit,
                 swap1_success: false,
                 swap2_tx_hash: String::new(),
                 swap2_gas_used: 0,
+                swap2_gas_estimated: swap2_gas_limit,
                 swap2_success: false,
                 wmon_in: amount,
                 usdc_intermediate: 0.0,
@@ -312,6 +380,7 @@ pub async fn execute_fast_arb<P: Provider>(
                 total_gas_cost_wei: U256::ZERO,
                 total_gas_cost_mon: 0.0,
                 total_gas_used: 0,
+                total_gas_estimated: swap1_gas_limit + swap2_gas_limit,
                 total_time_ms: total_start.elapsed().as_millis(),
                 swap1_time_ms: 0,
                 swap2_time_ms: 0,
@@ -342,9 +411,11 @@ pub async fn execute_fast_arb<P: Provider>(
             return Ok(FastArbResult {
                 swap1_tx_hash: format!("{:?}", swap1_hash),
                 swap1_gas_used: swap1_receipt.gas_used,
+                swap1_gas_estimated: swap1_gas_limit,
                 swap1_success: swap1_receipt.status(),
                 swap2_tx_hash: String::new(),
                 swap2_gas_used: 0,
+                swap2_gas_estimated: swap2_gas_limit,
                 swap2_success: false,
                 wmon_in: amount,
                 usdc_intermediate: expected_usdc,
@@ -353,9 +424,10 @@ pub async fn execute_fast_arb<P: Provider>(
                 estimation_error_bps: None,
                 gross_profit_wmon: 0.0 - amount,
                 profit_bps: -10000,
-                total_gas_cost_wei: U256::from(swap1_receipt.gas_used) * U256::from(swap1_receipt.effective_gas_price),
-                total_gas_cost_mon: (swap1_receipt.gas_used as f64 * swap1_receipt.effective_gas_price as f64) / 1e18,
+                total_gas_cost_wei: U256::from(swap1_gas_limit) * U256::from(swap1_receipt.effective_gas_price),
+                total_gas_cost_mon: (swap1_gas_limit as f64 * swap1_receipt.effective_gas_price as f64) / 1e18,
                 total_gas_used: swap1_receipt.gas_used,
+                total_gas_estimated: swap1_gas_limit,
                 total_time_ms: total_start.elapsed().as_millis(),
                 swap1_time_ms: swap1_time,
                 swap2_time_ms: 0,
@@ -371,9 +443,11 @@ pub async fn execute_fast_arb<P: Provider>(
             return Ok(FastArbResult {
                 swap1_tx_hash: format!("{:?}", swap1_hash),
                 swap1_gas_used: swap1_receipt.gas_used,
+                swap1_gas_estimated: swap1_gas_limit,
                 swap1_success: swap1_receipt.status(),
                 swap2_tx_hash: String::new(),
                 swap2_gas_used: 0,
+                swap2_gas_estimated: swap2_gas_limit,
                 swap2_success: false,
                 wmon_in: amount,
                 usdc_intermediate: expected_usdc,
@@ -382,9 +456,10 @@ pub async fn execute_fast_arb<P: Provider>(
                 estimation_error_bps: None,
                 gross_profit_wmon: 0.0 - amount,
                 profit_bps: -10000,
-                total_gas_cost_wei: U256::from(swap1_receipt.gas_used) * U256::from(swap1_receipt.effective_gas_price),
-                total_gas_cost_mon: (swap1_receipt.gas_used as f64 * swap1_receipt.effective_gas_price as f64) / 1e18,
+                total_gas_cost_wei: U256::from(swap1_gas_limit) * U256::from(swap1_receipt.effective_gas_price),
+                total_gas_cost_mon: (swap1_gas_limit as f64 * swap1_receipt.effective_gas_price as f64) / 1e18,
                 total_gas_used: swap1_receipt.gas_used,
+                total_gas_estimated: swap1_gas_limit,
                 total_time_ms: total_start.elapsed().as_millis(),
                 swap1_time_ms: swap1_time,
                 swap2_time_ms: 0,
@@ -417,16 +492,23 @@ pub async fn execute_fast_arb<P: Provider>(
     let swap1_receipt = receipt1_result.map_err(|_| eyre!("Swap 1 receipt timeout"))??;
     let swap2_receipt = receipt2_result.map_err(|_| eyre!("Swap 2 receipt timeout"))??;
 
-    println!("    Swap 1 confirmed: {} (gas: {})",
+    println!("    Swap 1 confirmed: {} (gas used: {}, estimated: {})",
         if swap1_receipt.status() { "SUCCESS" } else { "REVERTED" },
-        swap1_receipt.gas_used);
-    println!("    Swap 2 confirmed: {} (gas: {})",
+        swap1_receipt.gas_used,
+        swap1_gas_limit);
+    println!("    Swap 2 confirmed: {} (gas used: {}, estimated: {})",
         if swap2_receipt.status() { "SUCCESS" } else { "REVERTED" },
-        swap2_receipt.gas_used);
+        swap2_receipt.gas_used,
+        swap2_gas_limit);
 
-    // Calculate results
-    let swap1_gas_cost = U256::from(swap1_receipt.gas_used) * U256::from(swap1_receipt.effective_gas_price);
-    let swap2_gas_cost = U256::from(swap2_receipt.gas_used) * U256::from(swap2_receipt.effective_gas_price);
+    // ═══════════════════════════════════════════════════════════════════════
+    // MONAD GAS COST CALCULATION
+    // CRITICAL: On Monad, you pay gas_limit * gas_price, NOT gas_used * gas_price!
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    // Calculate actual cost (what Monad charged us = gas_limit * price)
+    let swap1_gas_cost = U256::from(swap1_gas_limit) * U256::from(swap1_receipt.effective_gas_price);
+    let swap2_gas_cost = U256::from(swap2_gas_limit) * U256::from(swap2_receipt.effective_gas_price);
     let total_gas_cost_wei = swap1_gas_cost + swap2_gas_cost;
     let total_gas_cost_mon = total_gas_cost_wei.to::<u128>() as f64 / 1e18;
 
@@ -445,14 +527,26 @@ pub async fn execute_fast_arb<P: Provider>(
     };
 
     let total_gas_used = swap1_receipt.gas_used + swap2_receipt.gas_used;
+    let total_gas_estimated = swap1_gas_limit + swap2_gas_limit;
     let execution_time = total_start.elapsed().as_millis();
+
+    // Log gas efficiency
+    let gas_efficiency = (total_gas_used as f64 / total_gas_estimated as f64) * 100.0;
+    println!("\n  ⛽ GAS EFFICIENCY: {:.1}% (used {} of {} budgeted)", 
+             gas_efficiency, total_gas_used, total_gas_estimated);
+    
+    if gas_efficiency < 80.0 {
+        println!("    💡 Consider reducing buffer - you're overpaying by {:.1}%", 100.0 - gas_efficiency);
+    }
 
     let result = FastArbResult {
         swap1_tx_hash: format!("{:?}", swap1_hash),
         swap1_gas_used: swap1_receipt.gas_used,
+        swap1_gas_estimated: swap1_gas_limit,
         swap1_success: swap1_receipt.status(),
         swap2_tx_hash: format!("{:?}", swap2_hash),
         swap2_gas_used: swap2_receipt.gas_used,
+        swap2_gas_estimated: swap2_gas_limit,
         swap2_success: swap2_receipt.status(),
         wmon_in: amount,
         usdc_intermediate: usdc_for_swap2,
@@ -464,6 +558,7 @@ pub async fn execute_fast_arb<P: Provider>(
         total_gas_cost_wei,
         total_gas_cost_mon,
         total_gas_used,
+        total_gas_estimated,
         total_time_ms: execution_time,
         swap1_time_ms: swap1_time,
         swap2_time_ms: swap2_time,
@@ -471,9 +566,6 @@ pub async fn execute_fast_arb<P: Provider>(
         success: both_success,
         error: if both_success { None } else { Some("One or both swaps reverted".to_string()) },
     };
-
-    // Log to arb execution history (Issue 9)
-    // log_arb_execution(&result, sell_router, buy_router);
 
     Ok(result)
 }
@@ -490,16 +582,18 @@ pub fn print_fast_arb_result(result: &FastArbResult, sell_dex: &str, buy_dex: &s
     println!("  Route: WMON --({})-> USDC --({})-> WMON", sell_dex, buy_dex);
     println!();
     println!("  SWAP 1 (Sell on {}):", sell_dex);
-    println!("    Status:     {}", if result.swap1_success { "SUCCESS" } else { "REVERTED" });
-    println!("    TX:         {}", result.swap1_tx_hash);
-    println!("    Gas Used:   {}", result.swap1_gas_used);
-    println!("    Time:       {}ms", result.swap1_time_ms);
+    println!("    Status:       {}", if result.swap1_success { "SUCCESS" } else { "REVERTED" });
+    println!("    TX:           {}", result.swap1_tx_hash);
+    println!("    Gas Used:     {}", result.swap1_gas_used);
+    println!("    Gas Limit:    {} (CHARGED on Monad!)", result.swap1_gas_estimated);
+    println!("    Time:         {}ms", result.swap1_time_ms);
     println!();
     println!("  SWAP 2 (Buy on {}):", buy_dex);
-    println!("    Status:     {}", if result.swap2_success { "SUCCESS" } else { "REVERTED" });
-    println!("    TX:         {}", result.swap2_tx_hash);
-    println!("    Gas Used:   {}", result.swap2_gas_used);
-    println!("    Time:       {}ms", result.swap2_time_ms);
+    println!("    Status:       {}", if result.swap2_success { "SUCCESS" } else { "REVERTED" });
+    println!("    TX:           {}", result.swap2_tx_hash);
+    println!("    Gas Used:     {}", result.swap2_gas_used);
+    println!("    Gas Limit:    {} (CHARGED on Monad!)", result.swap2_gas_estimated);
+    println!("    Time:         {}ms", result.swap2_time_ms);
     println!();
     println!("  AMOUNTS (estimated):");
     println!("    WMON In:         {:>12.6} WMON", result.wmon_in);
@@ -510,7 +604,15 @@ pub fn print_fast_arb_result(result: &FastArbResult, sell_dex: &str, buy_dex: &s
     let profit_color = if result.gross_profit_wmon >= 0.0 { "32" } else { "31" };
     println!("    Gross P/L:       \x1b[1;{}m{:>+12.6} WMON ({:+}bps)\x1b[0m",
         profit_color, result.gross_profit_wmon, result.profit_bps);
+    println!();
+    println!("  GAS (MONAD - charged by gas_limit!):");
+    println!("    Gas Used:        {:>12} (actual execution)", result.total_gas_used);
+    println!("    Gas Limit:       {:>12} (WHAT YOU PAID FOR!)", result.total_gas_estimated);
     println!("    Gas Cost:        {:>12.6} MON", result.total_gas_cost_mon);
+    
+    let efficiency = (result.total_gas_used as f64 / result.total_gas_estimated as f64) * 100.0;
+    let eff_color = if efficiency > 80.0 { "32" } else { "33" };
+    println!("    Efficiency:      \x1b[1;{}m{:>11.1}%\x1b[0m", eff_color, efficiency);
     println!();
     println!("  TIMING:");
     println!("    Total Time:      {}ms", result.total_time_ms);

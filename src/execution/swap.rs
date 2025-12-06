@@ -15,6 +15,13 @@ use super::routers::build_swap_calldata;
 // Monad mainnet chain ID
 const MONAD_CHAIN_ID: u64 = 143;
 
+// Gas estimation buffer (10% for Monad - keep tight to minimize costs!)
+const GAS_BUFFER_PERCENT: u64 = 10;
+
+// Fallback gas limits (only used if estimation fails)
+const FALLBACK_GAS_LIMIT_SIMPLE: u64 = 250_000;
+const FALLBACK_GAS_LIMIT_COMPLEX: u64 = 400_000;
+
 // ERC20 interface for approvals and balance checks
 sol! {
     #[derive(Debug)]
@@ -56,6 +63,7 @@ pub struct SwapResult {
     pub executed_price: f64,
     pub price_impact_bps: i32,
     pub gas_used: u64,
+    pub gas_estimated: u64,     // NEW: Track what we actually paid for on Monad
     pub gas_price: u128,
     pub gas_cost_wei: U256,
     pub tx_hash: String,
@@ -77,13 +85,46 @@ fn from_wei(amount: U256, decimals: u8) -> f64 {
     amount_u128 as f64 / divisor
 }
 
-/// Get hardcoded gas limit for a router type (eliminates gas estimation RPC calls)
-fn get_gas_limit_for_router(router_type: RouterType) -> u64 {
+/// Get fallback gas limit for a router type (only used if estimation fails)
+fn get_fallback_gas_limit(router_type: RouterType) -> u64 {
     match router_type {
-        RouterType::UniswapV3 => 400_000,     // Was 280k
-        RouterType::PancakeV3 => 800_000,     // Was 280k - BUY needs A LOT!
-        RouterType::LfjLB => 800_000,         // Was 420k
-        RouterType::MondayTrade => 800_000,   // Was 280k
+        RouterType::UniswapV3 => FALLBACK_GAS_LIMIT_SIMPLE,
+        RouterType::PancakeV3 => FALLBACK_GAS_LIMIT_COMPLEX, // Multicall wrapper
+        RouterType::LfjLB => FALLBACK_GAS_LIMIT_COMPLEX,     // Complex path routing
+        RouterType::MondayTrade => FALLBACK_GAS_LIMIT_SIMPLE,
+    }
+}
+
+/// Estimate gas for a transaction using eth_estimateGas
+/// Returns estimated gas + buffer, or fallback if estimation fails
+/// 
+/// MONAD CRITICAL: You pay gas_limit, not gas_used!
+/// So we need accurate estimates with minimal buffer.
+async fn estimate_gas_with_buffer<P: Provider>(
+    provider: &P,
+    to: Address,
+    from: Address,
+    calldata: &Bytes,
+    router_type: RouterType,
+) -> u64 {
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(to)
+        .from(from)
+        .input(alloy::rpc::types::TransactionInput::new(calldata.clone()));
+
+    match provider.estimate_gas(tx).await {
+        Ok(estimated) => {
+            // Add buffer: estimated * (100 + buffer%) / 100
+            let with_buffer = estimated * (100 + GAS_BUFFER_PERCENT) / 100;
+            println!("    Gas: {} + {}% = {} (MONAD charges this!)", 
+                     estimated, GAS_BUFFER_PERCENT, with_buffer);
+            with_buffer
+        }
+        Err(e) => {
+            let fallback = get_fallback_gas_limit(router_type);
+            println!("    ⚠ Gas estimation failed ({}), fallback: {}", e, fallback);
+            fallback
+        }
     }
 }
 
@@ -162,6 +203,10 @@ pub async fn check_approval<P: Provider>(
 }
 
 /// Execute a swap on the specified DEX
+///
+/// MONAD GAS OPTIMIZATION:
+/// Uses eth_estimateGas + 10% buffer instead of hardcoded limits.
+/// On Monad, you pay for gas_limit, not gas_used!
 ///
 /// # Arguments
 /// * `provider` - Provider for read-only calls
@@ -257,10 +302,20 @@ pub async fn execute_swap<P: Provider, S: Provider>(
         U256::from_be_slice(&result)
     };
 
-    // Use hardcoded gas limit based on router type (eliminates gas estimation RPC call)
-    let gas_limit = get_gas_limit_for_router(params.router.router_type);
+    // ═══════════════════════════════════════════════════════════════════════
+    // MONAD GAS FIX: Estimate gas dynamically instead of hardcoded limits!
+    // On Monad, you pay gas_limit * gas_price, NOT gas_used * gas_price!
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    let gas_limit = estimate_gas_with_buffer(
+        provider,
+        params.router.address,
+        wallet_address,
+        &Bytes::from(calldata.clone()),
+        params.router.router_type,
+    ).await;
 
-    println!("    Gas Limit: {} (hardcoded), gas_price: {} gwei",
+    println!("    Gas Limit: {} (MONAD CHARGES THIS!), gas_price: {} gwei",
              gas_limit, gas_price / 1_000_000_000);
 
     // Build transaction with ALL fields set to prevent filler RPC calls
@@ -319,12 +374,15 @@ pub async fn execute_swap<P: Provider, S: Provider>(
 
             let price_impact_bps = ((executed_price - params.expected_price) / params.expected_price * 10000.0) as i32;
 
+            // MONAD: Gas cost is based on gas_limit, not gas_used!
             let gas_used = receipt.gas_used;
-            let gas_price = receipt.effective_gas_price;
-            let gas_cost_wei = U256::from(gas_used) * U256::from(gas_price);
+            let gas_price_effective = receipt.effective_gas_price;
+            let gas_cost_wei = U256::from(gas_limit) * U256::from(gas_price_effective);
 
             println!("  ✓ Swap completed in {:?}", elapsed);
             println!("    TX: {:?}", receipt.transaction_hash);
+            println!("    Gas used: {} / {} limit ({:.1}% efficiency)",
+                     gas_used, gas_limit, (gas_used as f64 / gas_limit as f64) * 100.0);
 
             Ok(SwapResult {
                 dex_name: params.router.name.to_string(),
@@ -339,7 +397,8 @@ pub async fn execute_swap<P: Provider, S: Provider>(
                 executed_price,
                 price_impact_bps,
                 gas_used,
-                gas_price,
+                gas_estimated: gas_limit,
+                gas_price: gas_price_effective,
                 gas_cost_wei,
                 tx_hash: format!("{:?}", receipt.transaction_hash),
                 success: receipt.status(),
@@ -360,6 +419,7 @@ pub async fn execute_swap<P: Provider, S: Provider>(
                 executed_price: 0.0,
                 price_impact_bps: 0,
                 gas_used: 0,
+                gas_estimated: gas_limit,
                 gas_price: 0,
                 gas_cost_wei: U256::ZERO,
                 tx_hash: String::new(),

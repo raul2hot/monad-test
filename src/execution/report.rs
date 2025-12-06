@@ -54,8 +54,19 @@ pub fn print_swap_report(result: &SwapResult) {
         );
         println!();
 
-        println!("  GAS:");
-        println!("    Gas Used:       {}", result.gas_used);
+        // MONAD GAS SECTION - Show both used and estimated (what you paid for!)
+        println!("  GAS (MONAD charges gas_limit, not gas_used!):");
+        println!("    Gas Used:       {} (actual execution)", result.gas_used);
+        println!("    Gas Limit:      {} (WHAT YOU PAID FOR!)", result.gas_estimated);
+        
+        let efficiency = if result.gas_estimated > 0 {
+            (result.gas_used as f64 / result.gas_estimated as f64) * 100.0
+        } else {
+            0.0
+        };
+        let eff_color = if efficiency > 80.0 { "32" } else { "33" };
+        println!("    Efficiency:     \x1b[1;{}m{:.1}%\x1b[0m", eff_color, efficiency);
+        
         println!("    Gas Price:      {} gwei", result.gas_price / 1_000_000_000);
 
         let gas_cost_mon = result.gas_cost_wei.to::<u128>() as f64 / 1e18;
@@ -92,32 +103,40 @@ pub fn print_comparison_report(results: &[SwapResult]) {
     println!("  MULTI-DEX COMPARISON REPORT | {}", timestamp);
     println!("═══════════════════════════════════════════════════════════════");
     println!();
-    println!("  {:<15} │ {:>10} │ {:>12} │ {:>10} │ {:>8}",
-        "DEX", "Exec Price", "Price Impact", "Gas Used", "Status"
+    println!("  {:<15} │ {:>10} │ {:>12} │ {:>10} │ {:>8} │ {:>6}",
+        "DEX", "Exec Price", "Price Impact", "Gas Limit", "Status", "Eff%"
     );
-    println!("  {}", "─".repeat(60));
+    println!("  {}", "─".repeat(75));
 
     for result in results {
         let status = if result.success { "✓" } else { "✗" };
         let status_color = if result.success { "32" } else { "31" };
 
         if result.success {
-            println!("  {:<15} │ {:>10.6} │ {:>+10}bps │ {:>10} │ \x1b[1;{}m{}\x1b[0m",
+            let efficiency = if result.gas_estimated > 0 {
+                (result.gas_used as f64 / result.gas_estimated as f64) * 100.0
+            } else {
+                0.0
+            };
+            
+            println!("  {:<15} │ {:>10.6} │ {:>+10}bps │ {:>10} │ \x1b[1;{}m{}\x1b[0m      │ {:>5.1}",
                 result.dex_name,
                 result.executed_price,
                 result.price_impact_bps,
-                result.gas_used,
+                result.gas_estimated,  // Show what was charged, not used
                 status_color,
-                status
+                status,
+                efficiency
             );
         } else {
-            println!("  {:<15} │ {:>10} │ {:>12} │ {:>10} │ \x1b[1;{}m{}\x1b[0m",
+            println!("  {:<15} │ {:>10} │ {:>12} │ {:>10} │ \x1b[1;{}m{}\x1b[0m      │ {:>6}",
                 result.dex_name,
                 "N/A",
                 "N/A",
                 "N/A",
                 status_color,
-                status
+                status,
+                "N/A"
             );
         }
     }
@@ -132,6 +151,13 @@ pub fn print_comparison_report(results: &[SwapResult]) {
             .unwrap();
 
         println!("  Best Execution: {} @ {:.6} USDC/WMON", best.dex_name, best.executed_price);
+        
+        // Show total gas efficiency
+        let total_used: u64 = successful.iter().map(|r| r.gas_used).sum();
+        let total_estimated: u64 = successful.iter().map(|r| r.gas_estimated).sum();
+        let avg_efficiency = (total_used as f64 / total_estimated as f64) * 100.0;
+        println!("  Avg Gas Efficiency: {:.1}% (used {} of {} budgeted)", 
+                 avg_efficiency, total_used, total_estimated);
     }
 
     println!("═══════════════════════════════════════════════════════════════");
