@@ -62,3 +62,33 @@ pub fn build_exact_input_single(
 
     Ok(Bytes::from(calldata))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_pancake_selectors() {
+        // Test the inner exactInputSingle selector
+        let params = ExactInputSingleParams {
+            tokenIn: Address::ZERO,
+            tokenOut: Address::ZERO,
+            fee: Uint::from(3000u32),
+            recipient: Address::ZERO,
+            amountIn: U256::from(1000000u64),
+            amountOutMinimum: U256::from(900000u64),
+            sqrtPriceLimitX96: U160::ZERO,
+        };
+        let inner_calldata = exactInputSingleCall { params }.abi_encode();
+        println!("PancakeSwap Inner (exactInputSingle) Selector: 0x{:02x}{:02x}{:02x}{:02x}",
+            inner_calldata[0], inner_calldata[1], inner_calldata[2], inner_calldata[3]);
+
+        // Test the multicall selector
+        let multicall_calldata = multicallCall {
+            deadline: U256::from(1234567890u64),
+            data: vec![Bytes::from(inner_calldata)],
+        }.abi_encode();
+        println!("PancakeSwap Outer (multicall) Selector: 0x{:02x}{:02x}{:02x}{:02x}",
+            multicall_calldata[0], multicall_calldata[1], multicall_calldata[2], multicall_calldata[3]);
+    }
+}
