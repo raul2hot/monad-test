@@ -44,6 +44,29 @@ contract MonadAtomicArb {
         _;
     }
 
+    /// @notice Get router address from enum
+    function _getRouterAddress(Router router) internal pure returns (address) {
+        if (router == Router.Uniswap) return UNISWAP_ROUTER;
+        if (router == Router.PancakeSwap) return PANCAKE_ROUTER;
+        if (router == Router.MondayTrade) return MONDAY_ROUTER;
+        if (router == Router.LFJ) return LFJ_ROUTER;
+        revert InvalidRouter();
+    }
+
+    /// @notice Execute swap 1 (sell WMON for USDC)
+    function _executeSwap1(Router sellRouter, bytes calldata sellRouterData) internal {
+        (bool success,) = _getRouterAddress(sellRouter).call(sellRouterData);
+        if (!success) revert SwapFailed(1);
+    }
+
+    /// @notice Execute swap 2 (buy WMON with USDC) using actual USDC balance
+    function _executeSwap2(Router buyRouter, uint24 buyPoolFee, uint256 minWmonOut) internal {
+        uint256 usdcToSwap = IERC20(USDC).balanceOf(address(this));
+        bytes memory buyCalldata = _buildBuyCalldata(buyRouter, usdcToSwap, minWmonOut, buyPoolFee);
+        (bool success,) = _getRouterAddress(buyRouter).call(buyCalldata);
+        if (!success) revert SwapFailed(2);
+    }
+
     /// @notice Build exactInputSingle calldata for V3-style routers
     /// @dev Works for Uniswap, PancakeSwap (wrapped in multicall), and Monday
     function _buildBuyCalldata(
@@ -142,39 +165,18 @@ contract MonadAtomicArb {
     ) external onlyOwner returns (int256 profit) {
         uint256 wmonBefore = IERC20(WMON).balanceOf(address(this));
 
-        // Swap 1: WMON -> USDC on sellRouter (calldata pre-built by Rust)
-        address sellAddr = _getRouterAddress(sellRouter);
-        (bool success1,) = sellAddr.call(sellRouterData);
-        if (!success1) revert SwapFailed(1);
-
-        // Get ACTUAL USDC balance after swap 1
-        uint256 usdcToSwap = IERC20(USDC).balanceOf(address(this));
-
-        // Build swap 2 calldata ON-CHAIN using actual USDC
-        bytes memory buyCalldata = _buildBuyCalldata(buyRouter, usdcToSwap, minWmonOut, buyPoolFee);
-
-        // Swap 2: USDC -> WMON on buyRouter
-        address buyAddr = _getRouterAddress(buyRouter);
-        (bool success2,) = buyAddr.call(buyCalldata);
-        if (!success2) revert SwapFailed(2);
+        // Execute both swaps using helper functions
+        _executeSwap1(sellRouter, sellRouterData);
+        _executeSwap2(buyRouter, buyPoolFee, minWmonOut);
 
         uint256 wmonAfter = IERC20(WMON).balanceOf(address(this));
-
-        // Calculate profit
         profit = int256(wmonAfter) - int256(wmonBefore);
 
-        // Revert if below minimum
         if (wmonAfter < wmonBefore + minProfit) {
             revert Unprofitable(wmonBefore, wmonAfter);
         }
 
-        emit ArbExecuted(
-            uint8(sellRouter),
-            uint8(buyRouter),
-            wmonBefore,
-            wmonAfter,
-            profit
-        );
+        emit ArbExecuted(uint8(sellRouter), uint8(buyRouter), wmonBefore, wmonAfter, profit);
     }
 
     /// @notice Execute atomic arbitrage WITHOUT profit check (for testing)
@@ -188,34 +190,14 @@ contract MonadAtomicArb {
     ) external onlyOwner returns (int256 profit) {
         uint256 wmonBefore = IERC20(WMON).balanceOf(address(this));
 
-        // Swap 1: WMON -> USDC on sellRouter (calldata pre-built by Rust)
-        address sellAddr = _getRouterAddress(sellRouter);
-        (bool success1,) = sellAddr.call(sellRouterData);
-        if (!success1) revert SwapFailed(1);
-
-        // Get ACTUAL USDC balance after swap 1
-        uint256 usdcToSwap = IERC20(USDC).balanceOf(address(this));
-
-        // Build swap 2 calldata ON-CHAIN using actual USDC
-        bytes memory buyCalldata = _buildBuyCalldata(buyRouter, usdcToSwap, minWmonOut, buyPoolFee);
-
-        // Swap 2: USDC -> WMON on buyRouter
-        address buyAddr = _getRouterAddress(buyRouter);
-        (bool success2,) = buyAddr.call(buyCalldata);
-        if (!success2) revert SwapFailed(2);
+        // Execute both swaps using helper functions
+        _executeSwap1(sellRouter, sellRouterData);
+        _executeSwap2(buyRouter, buyPoolFee, minWmonOut);
 
         uint256 wmonAfter = IERC20(WMON).balanceOf(address(this));
-
-        // Calculate profit (can be negative) - NO REVERT on loss
         profit = int256(wmonAfter) - int256(wmonBefore);
 
-        emit ArbExecuted(
-            uint8(sellRouter),
-            uint8(buyRouter),
-            wmonBefore,
-            wmonAfter,
-            profit
-        );
+        emit ArbExecuted(uint8(sellRouter), uint8(buyRouter), wmonBefore, wmonAfter, profit);
     }
 
     /// @notice Withdraw tokens (emergency or profit collection)
@@ -227,15 +209,6 @@ contract MonadAtomicArb {
     function withdrawAllToken(address token) external onlyOwner {
         uint256 balance = IERC20(token).balanceOf(address(this));
         IERC20(token).transfer(owner, balance);
-    }
-
-    /// @notice Get router address from enum
-    function _getRouterAddress(Router router) internal pure returns (address) {
-        if (router == Router.Uniswap) return UNISWAP_ROUTER;
-        if (router == Router.PancakeSwap) return PANCAKE_ROUTER;
-        if (router == Router.MondayTrade) return MONDAY_ROUTER;
-        if (router == Router.LFJ) return LFJ_ROUTER;
-        revert InvalidRouter();
     }
 
     /// @notice Check current balances
