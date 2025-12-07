@@ -91,13 +91,62 @@ pub fn build_swap_with_bin_step(
         tokenPath: vec![token_in, token_out],
     };
 
-    let calldata = swapExactTokensForTokensCall {
+    let call = swapExactTokensForTokensCall {
         amountIn: amount_in,
         amountOutMin: amount_out_min,
         path,
         to: recipient,
         deadline: U256::from(deadline),
-    }.abi_encode();
+    };
+
+    let calldata = call.abi_encode();
+
+    // Debug: print the selector (first 4 bytes)
+    if calldata.len() >= 4 {
+        println!("  [LFJ DEBUG] Selector: 0x{:02x}{:02x}{:02x}{:02x}",
+            calldata[0], calldata[1], calldata[2], calldata[3]);
+    }
 
     Ok(Bytes::from(calldata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_lfj_selector() {
+        let token_in = Address::ZERO;
+        let token_out = Address::ZERO;
+        let amount_in = U256::from(1000000u64);
+        let amount_out_min = U256::from(900000u64);
+        let recipient = Address::ZERO;
+        let deadline = 1234567890u64;
+        let bin_step = 10u64;
+
+        let path = Path {
+            pairBinSteps: vec![U256::from(bin_step)],
+            versions: vec![3],
+            tokenPath: vec![token_in, token_out],
+        };
+
+        let call = swapExactTokensForTokensCall {
+            amountIn: amount_in,
+            amountOutMin: amount_out_min,
+            path,
+            to: recipient,
+            deadline: U256::from(deadline),
+        };
+
+        let calldata = call.abi_encode();
+        println!("LFJ Selector: 0x{:02x}{:02x}{:02x}{:02x}",
+            calldata[0], calldata[1], calldata[2], calldata[3]);
+
+        // Print first 68 bytes (selector + 2 uint256 params)
+        print!("Calldata start: 0x");
+        for b in calldata.iter().take(68) {
+            print!("{:02x}", b);
+        }
+        println!();
+    }
 }

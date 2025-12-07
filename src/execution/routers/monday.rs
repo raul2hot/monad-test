@@ -55,3 +55,18 @@ pub fn build_exact_input_single(
     let calldata = exactInputSingleCall { params }.abi_encode();
     Ok(Bytes::from(calldata))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_monday_selector() {
+        let calldata = build_exact_input_single(
+            Address::ZERO, Address::ZERO, 3000, Address::ZERO,
+            U256::from(1000000u64), U256::from(900000u64), 1234567890u64
+        ).unwrap();
+        println!("MondayTrade Selector: 0x{:02x}{:02x}{:02x}{:02x}",
+            calldata[0], calldata[1], calldata[2], calldata[3]);
+    }
+}
