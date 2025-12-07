@@ -35,6 +35,7 @@ mod node_config;
 mod nonce;
 mod pools;
 mod price;
+mod spread_tracker;
 mod stats;
 mod wallet;
 
@@ -53,6 +54,7 @@ use stats::{
 };
 use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata, wait_for_next_block, execute_fast_arb, print_fast_arb_result, execute_atomic_arb, print_atomic_arb_result, query_contract_balances};
 use execution::report::print_comparison_report;
+use spread_tracker::SpreadTracker;
 use multicall::fetch_prices_batched;
 use nonce::init_nonce;
 use pools::{create_lfj_active_id_call, create_lfj_bin_step_call, create_slot0_call, PriceCall, PoolPrice};
@@ -242,6 +244,18 @@ enum Commands {
         /// Force execution even if unprofitable (for testing)
         #[arg(long, default_value = "false")]
         force: bool,
+
+        /// Enable spread velocity tracking (saves last N spreads before trigger)
+        #[arg(long, default_value = "false")]
+        track_velocity: bool,
+
+        /// Number of spread snapshots to retain in ring buffer
+        #[arg(long, default_value = "10")]
+        history_size: usize,
+
+        /// Minimum spread velocity (bps/sec) to trigger - 0 disables velocity filter
+        #[arg(long, default_value = "0")]
+        min_velocity: i32,
     },
 
     /// Production arbitrage bot with safety checks
@@ -1337,6 +1351,9 @@ async fn run_auto_arb(
     cooldown_secs: u64,
     dry_run: bool,
     force: bool,
+    track_velocity: bool,
+    history_size: usize,
+    min_velocity: i32,
 ) -> Result<()> {
     use chrono::Local;
 
@@ -1368,6 +1385,13 @@ async fn run_auto_arb(
     let stats_file = format!("arb_stats_{}.jsonl", timestamp);
     let mut stats_logger = StatsLogger::new(&stats_file);
 
+    // Initialize spread tracker for velocity analysis
+    let mut spread_tracker = if track_velocity {
+        Some(SpreadTracker::new(history_size))
+    } else {
+        None
+    };
+
     // Get polling interval from node config (50ms local, 1000ms remote)
     let poll_interval_ms = node_config.poll_interval.as_millis() as u64;
 
@@ -1384,6 +1408,9 @@ async fn run_auto_arb(
     println!("  Receipt poll:    {} ms", node_config.receipt_poll_interval.as_millis());
     println!("  Dry run:         {}", dry_run);
     println!("  Stats file:      {}", stats_file);
+    if track_velocity {
+        println!("  Velocity track:  enabled (history: {}, min_velocity: {} bps/sec)", history_size, min_velocity);
+    }
     println!("═══════════════════════════════════════════════════════════════");
     println!();
 
@@ -1423,6 +1450,18 @@ async fn run_auto_arb(
         let best_spread = spreads.first();
 
         if let Some(spread) = best_spread {
+            // Record spread for velocity tracking (no extra latency - uses existing data)
+            if let Some(ref mut tracker) = spread_tracker {
+                tracker.record(
+                    &spread.buy_pool,
+                    &spread.sell_pool,
+                    spread.buy_price,
+                    spread.sell_price,
+                    (spread.gross_spread_pct * 100.0) as i32,
+                    (spread.net_spread_pct * 100.0) as i32,
+                );
+            }
+
             // Display current best opportunity
             let now = Local::now().format("%H:%M:%S");
             print!("\r[{}] Best: {} -> {} | Net: {:+.2}% ({:+} bps)    ",
@@ -1443,6 +1482,30 @@ async fn run_auto_arb(
                 println!();  // New line after the \r print
                 println!("\n  OPPORTUNITY DETECTED! Net spread: {} bps (threshold: {} bps)",
                     net_spread_bps, min_spread_bps);
+
+                // Analyze spread velocity before execution
+                let velocity_analysis = spread_tracker.as_ref().and_then(|t| t.analyze());
+
+                if let Some(ref analysis) = velocity_analysis {
+                    println!("\n  SPREAD VELOCITY ANALYSIS:");
+                    println!("    History: {}", spread_tracker.as_ref().unwrap().format_history());
+                    println!("    Velocity: {:.2} bps/sec", analysis.velocity_bps_per_sec);
+                    println!("    Acceleration: {:.2} bps/sec^2", analysis.acceleration);
+                    println!("    Pattern: {}", if analysis.is_spike { "SPIKE" } else { "GRADUAL" });
+                    println!("    Window: {} ms", analysis.window_duration_ms);
+                    println!("    Range: {} to {} bps", analysis.min_spread_in_window, analysis.max_spread_in_window);
+                }
+
+                // Optional: Skip if velocity filter enabled and not a spike
+                if min_velocity > 0 {
+                    if let Some(ref analysis) = velocity_analysis {
+                        if analysis.velocity_bps_per_sec < min_velocity as f64 {
+                            println!("    SKIPPING: velocity {:.2} < threshold {} bps/sec",
+                                analysis.velocity_bps_per_sec, min_velocity);
+                            continue;
+                        }
+                    }
+                }
 
                 // Get routers for the opportunity
                 let sell_router = match get_router_by_name(&spread.sell_pool) {
@@ -1490,6 +1553,11 @@ async fn run_auto_arb(
                     expected_usdc,
                     expected_wmon_back,
                     slippage_bps: slippage,
+                    // Velocity tracking data (optional)
+                    spread_history: velocity_analysis.as_ref().map(|a| a.snapshots.clone()),
+                    velocity_bps_per_sec: velocity_analysis.as_ref().map(|a| a.velocity_bps_per_sec),
+                    acceleration: velocity_analysis.as_ref().map(|a| a.acceleration),
+                    is_spike_pattern: velocity_analysis.as_ref().map(|a| a.is_spike),
                 };
 
                 print_pre_execution(&pre_snapshot);
@@ -1906,6 +1974,11 @@ async fn run_prod_arb(
                     expected_usdc,
                     expected_wmon_back,
                     slippage_bps: slippage,
+                    // Velocity tracking not enabled for ProdArb
+                    spread_history: None,
+                    velocity_bps_per_sec: None,
+                    acceleration: None,
+                    is_spike_pattern: None,
                 };
 
                 print_pre_execution(&pre_snapshot);
@@ -2264,8 +2337,11 @@ async fn main() -> Result<()> {
             cooldown_secs,
             dry_run,
             force,
+            track_velocity,
+            history_size,
+            min_velocity,
         }) => {
-            run_auto_arb(min_spread_bps, amount, slippage, max_executions, cooldown_secs, dry_run, force).await
+            run_auto_arb(min_spread_bps, amount, slippage, max_executions, cooldown_secs, dry_run, force, track_velocity, history_size, min_velocity).await
         }
         Some(Commands::ProdArb {
             min_spread_bps,
