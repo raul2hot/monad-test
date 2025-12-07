@@ -1515,6 +1515,34 @@ async fn run_auto_arb(
                 // Fetch gas price
                 let gas_price = provider.get_gas_price().await.unwrap_or(100_000_000_000);
 
+                // Fix 6: Re-check prices before execution to avoid stale spread
+                println!("  Re-checking prices before execution...");
+                let fresh_prices = match get_current_prices(&provider).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("  Price recheck failed: {}. Skipping execution.", e);
+                        continue;
+                    }
+                };
+                let fresh_spreads = calculate_spreads(&fresh_prices);
+
+                // Find the same pair in fresh spreads
+                let fresh_spread = fresh_spreads.iter().find(|s| {
+                    s.sell_pool == spread.sell_pool && s.buy_pool == spread.buy_pool
+                });
+
+                if let Some(fs) = fresh_spread {
+                    let fresh_spread_bps = (fs.net_spread_pct * 100.0) as i32;
+                    if fresh_spread_bps < min_spread_bps {
+                        println!("  Spread evaporated! Was {} bps, now {} bps. Skipping.",
+                            net_spread_bps, fresh_spread_bps);
+                        continue;
+                    }
+                    println!("  Fresh spread: {} bps (still above threshold)", fresh_spread_bps);
+                } else {
+                    println!("  WARNING: Could not find matching spread in fresh prices. Proceeding with caution.");
+                }
+
                 // Execute arb - use atomic if contract is deployed, otherwise fast_arb
                 println!("\n  EXECUTING ARB...");
                 let exec_start = std::time::Instant::now();

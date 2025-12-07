@@ -188,6 +188,10 @@ pub async fn execute_atomic_arb<P: Provider>(
         return Err(eyre!("ATOMIC_ARB_CONTRACT not set in config.rs. Deploy contract first!"));
     }
 
+    // Fix 3: Pre-TX balance snapshot - query balances BEFORE execution
+    let (wmon_before, usdc_before) = query_contract_balances(provider_with_signer).await?;
+    println!("  Contract balances before: {:.6} WMON, {:.6} USDC", wmon_before, usdc_before);
+
     // Calculate amounts
     let wmon_in_wei = to_wei(amount, WMON_DECIMALS);
     let expected_usdc = amount * sell_price;
@@ -389,22 +393,38 @@ pub async fn execute_atomic_arb<P: Provider>(
     let exec_time = start.elapsed().as_millis();
 
     if receipt.status() {
-        // Parse profit from logs/return value
-        // For now, query contract balance change or estimate
-        let estimated_profit = expected_wmon_back - amount;
-        let profit_bps = if amount > 0.0 {
-            (estimated_profit / amount * 10000.0) as i32
+        // Fix 2: Query ACTUAL balances instead of using estimates
+        let (wmon_after, usdc_after) = query_contract_balances(provider_with_signer).await?;
+        println!("  Contract balances after: {:.6} WMON, {:.6} USDC", wmon_after, usdc_after);
+
+        // Calculate actual profit from balance change
+        // The arb spends `amount` WMON and receives some WMON back
+        // Net change = wmon_after - wmon_before (should be positive if profitable)
+        let actual_wmon_delta = wmon_after - wmon_before;
+        let actual_profit = actual_wmon_delta; // Delta IS the profit since we start and end with WMON
+        let actual_profit_bps = if amount > 0.0 {
+            (actual_profit / amount * 10000.0) as i32
         } else {
             0
         };
+
+        // Log comparison between estimated and actual
+        let estimated_profit = expected_wmon_back - amount;
+        println!("  Estimated profit: {:.6} WMON, Actual profit: {:.6} WMON",
+            estimated_profit, actual_profit);
+        if (actual_profit - estimated_profit).abs() > 0.0001 {
+            println!("  WARNING: Actual profit differs from estimate by {:.6} WMON ({} bps)",
+                actual_profit - estimated_profit,
+                ((actual_profit - estimated_profit) / amount * 10000.0) as i32);
+        }
 
         println!("  Atomic arb SUCCESS in {}ms", exec_time);
 
         Ok(AtomicArbResult {
             tx_hash: format!("{:?}", tx_hash),
             success: true,
-            profit_wmon: estimated_profit,
-            profit_bps,
+            profit_wmon: actual_profit,  // Use ACTUAL, not estimated
+            profit_bps: actual_profit_bps,
             gas_used: receipt.gas_used,
             gas_limit: gas_estimate,
             gas_cost_mon,
