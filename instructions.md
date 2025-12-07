@@ -1,343 +1,212 @@
-# Atomic Arbitrage USDC Balance Bug Fix
+# Monad Arb Bot - Troubleshooting: Negative Profit on "Successful" Atomic Arb
 
-## Overview
+## Summary of the Issue
 
-Fix a critical bug where swap 2 uses a PRE-CALCULATED USDC amount instead of the ACTUAL USDC received from swap 1. This causes USDC balance leakage from the contract.
+**Log Analysis:**
+```
+Pre-execution:  WMON balance = 1000.627
+Post-execution: WMON balance = 1000.280
+Delta:          -0.347 WMON (LOSS of ~14 bps)
+Expected:       +0.754 WMON (PROFIT of ~30 bps)
+Total Deviation: ~44 bps worse than expected
+```
+
+The arb "succeeded" (didn't revert) but lost money because `--force` flag was used.
 
 ---
 
-## The Bug
+## Root Cause Analysis
 
-**Location:** `src/execution/atomic_arb.rs` lines ~180-185
+### 1. The `--force` Flag Bypasses Profit Checks
 
-**Current broken code:**
-```rust
-// For swap 2, use conservative USDC estimate
-let usdc_for_swap2 = expected_usdc * 0.999; // Tiny buffer for dust
-let usdc_for_swap2_wei = to_wei(usdc_for_swap2, USDC_DECIMALS);
-```
-
-**Problem:** Rust pre-calculates `usdc_for_swap2` BEFORE swap 1 executes. The Solidity contract receives this pre-built calldata and uses it blindly.
-
-**Result:** 
-- Swap 1 might return 0.041097 USDC (actual)
-- Swap 2 tries to spend 0.038455 USDC (pre-calculated estimate)
-- Contract loses the difference: -0.002642 USDC per trade
-
----
-
-## The Fix
-
-Build swap 2 calldata ON-CHAIN in Solidity using the ACTUAL USDC balance after swap 1.
-
----
-
-## Step 1: Modify Solidity Contract
-
-**File:** `contracts/src/MonadAtomicArb.sol`
-
-### 1.1 Change the `executeArb` function signature
-
-**Remove:** `bytes calldata buyRouterData` parameter  
-**Add:** `uint8 buyRouter`, `uint24 buyPoolFee`, `uint256 minWmonOut`
-
-**New signature:**
-```solidity
-function executeArb(
-    Router sellRouter,
-    bytes calldata sellRouterData,
-    Router buyRouter,
-    uint24 buyPoolFee,
-    uint256 minWmonOut,
-    uint256 minProfit
-) external onlyOwner returns (int256 profit)
-```
-
-### 1.2 Add helper function to build swap calldata on-chain
-
-Add this function before `executeArb`:
-
-```solidity
-/// @notice Build exactInputSingle calldata for V3-style routers
-/// @dev Works for Uniswap, PancakeSwap (wrapped in multicall), and Monday
-function _buildBuyCalldata(
-    Router router,
-    uint256 amountIn,
-    uint256 amountOutMin,
-    uint24 fee
-) internal view returns (bytes memory) {
-    if (router == Router.Uniswap || router == Router.MondayTrade) {
-        // Uniswap/Monday: exactInputSingle with deadline in struct (Monday) or not (Uniswap)
-        // For simplicity, use Uniswap format (no deadline in struct)
-        return abi.encodeWithSelector(
-            bytes4(0x04e45aaf), // exactInputSingle selector
-            USDC,              // tokenIn
-            WMON,              // tokenOut
-            fee,               // fee tier
-            address(this),     // recipient
-            amountIn,          // amountIn
-            amountOutMin,      // amountOutMinimum
-            uint160(0)         // sqrtPriceLimitX96 (0 = no limit)
-        );
-    } else if (router == Router.PancakeSwap) {
-        // PancakeSwap: wrap in multicall(deadline, data[])
-        bytes memory innerCall = abi.encodeWithSelector(
-            bytes4(0x04e45aaf), // exactInputSingle selector
-            USDC,
-            WMON,
-            fee,
-            address(this),
-            amountIn,
-            amountOutMin,
-            uint160(0)
-        );
-        bytes[] memory calls = new bytes[](1);
-        calls[0] = innerCall;
-        return abi.encodeWithSelector(
-            bytes4(0x5ae401dc), // multicall(uint256,bytes[]) selector
-            block.timestamp + 300, // deadline
-            calls
-        );
-    } else if (router == Router.LFJ) {
-        // LFJ: swapExactTokensForTokens with Path struct
-        // Path: pairBinSteps[], versions[], tokenPath[]
-        uint256[] memory binSteps = new uint256[](1);
-        binSteps[0] = uint256(fee); // fee is binStep for LFJ
-        uint8[] memory versions = new uint8[](1);
-        versions[0] = 3; // V2_2
-        address[] memory path = new address[](2);
-        path[0] = USDC;
-        path[1] = WMON;
-        
-        return abi.encodeWithSelector(
-            bytes4(0x4b126ad4), // swapExactTokensForTokens selector
-            amountIn,
-            amountOutMin,
-            binSteps,
-            versions,
-            path,
-            address(this),
-            block.timestamp + 300
-        );
-    }
-    revert InvalidRouter();
-}
-```
-
-### 1.3 Update executeArb implementation
-
-Replace the current `executeArb` function body:
-
-```solidity
-function executeArb(
-    Router sellRouter,
-    bytes calldata sellRouterData,
-    Router buyRouter,
-    uint24 buyPoolFee,
-    uint256 minWmonOut,
-    uint256 minProfit
-) external onlyOwner returns (int256 profit) {
-    uint256 wmonBefore = IERC20(WMON).balanceOf(address(this));
-
-    // Swap 1: WMON -> USDC on sellRouter (calldata pre-built by Rust)
-    address sellAddr = _getRouterAddress(sellRouter);
-    (bool success1,) = sellAddr.call(sellRouterData);
-    if (!success1) revert SwapFailed(1);
-
-    // Get ACTUAL USDC balance after swap 1
-    uint256 usdcToSwap = IERC20(USDC).balanceOf(address(this));
-    
-    // Build swap 2 calldata ON-CHAIN using actual USDC
-    bytes memory buyCalldata = _buildBuyCalldata(buyRouter, usdcToSwap, minWmonOut, buyPoolFee);
-    
-    // Swap 2: USDC -> WMON on buyRouter
-    address buyAddr = _getRouterAddress(buyRouter);
-    (bool success2,) = buyAddr.call(buyCalldata);
-    if (!success2) revert SwapFailed(2);
-
-    uint256 wmonAfter = IERC20(WMON).balanceOf(address(this));
-
-    // Calculate profit
-    profit = int256(wmonAfter) - int256(wmonBefore);
-
-    // Revert if below minimum
-    if (wmonAfter < wmonBefore + minProfit) {
-        revert Unprofitable(wmonBefore, wmonAfter);
-    }
-
-    emit ArbExecuted(
-        uint8(sellRouter),
-        uint8(buyRouter),
-        wmonBefore,
-        wmonAfter,
-        profit
-    );
-}
-```
-
-### 1.4 Update executeArbUnchecked similarly
-
-Apply the same pattern to `executeArbUnchecked` - remove `buyRouterData`, add `buyRouter`, `buyPoolFee`, `minWmonOut`.
-
----
-
-## Step 2: Modify Rust Code
-
-**File:** `src/execution/atomic_arb.rs`
-
-### 2.1 Remove usdc_for_swap2 calculation
-
-**Delete these lines (~180-190):**
-```rust
-// For swap 2, use conservative USDC estimate
-let usdc_for_swap2 = expected_usdc * 0.999; // Tiny buffer for dust
-let usdc_for_swap2_wei = to_wei(usdc_for_swap2, USDC_DECIMALS);
-let expected_wmon_back = usdc_for_swap2 / buy_price;
-let min_wmon_out = expected_wmon_back * slippage_mult;
-let min_wmon_out_wei = to_wei(min_wmon_out, WMON_DECIMALS);
-```
-
-### 2.2 Remove buy_calldata building
-
-**Delete the buy_calldata construction (~200-210):**
-```rust
-let buy_calldata = build_router_calldata(
-    buy_router,
-    SwapDirection::Buy,
-    usdc_for_swap2_wei,
-    min_wmon_out_wei,
-)?;
-```
-
-### 2.3 Update the Solidity call encoding
-
-**Change the sol! macro definitions:**
-
-```rust
-sol! {
-    #[derive(Debug)]
-    function executeArb(
-        uint8 sellRouter,
-        bytes calldata sellRouterData,
-        uint8 buyRouter,
-        uint24 buyPoolFee,
-        uint256 minWmonOut,
-        uint256 minProfit
-    ) external returns (int256 profit);
-
-    #[derive(Debug)]
-    function executeArbUnchecked(
-        uint8 sellRouter,
-        bytes calldata sellRouterData,
-        uint8 buyRouter,
-        uint24 buyPoolFee,
-        uint256 minWmonOut
-    ) external returns (int256 profit);
-}
-```
-
-### 2.4 Update calldata encoding
-
-**Calculate minWmonOut in Rust:**
-```rust
-// Calculate minimum WMON output (for slippage protection)
-let expected_wmon_back = expected_usdc / buy_price;
-let min_wmon_out = expected_wmon_back * slippage_mult;
-let min_wmon_out_wei = to_wei(min_wmon_out, WMON_DECIMALS);
-
-// Get pool fee for the buy router
-let buy_pool_fee = buy_router.pool_fee; // This is u32, need to convert to u24
-```
-
-**Update the executeArb call:**
+In `atomic_arb.rs` (lines ~150-170):
 ```rust
 let calldata = if force {
-    let execute_call = executeArbUncheckedCall {
-        sellRouter: ContractRouter::from(sell_router.router_type) as u8,
-        sellRouterData: sell_calldata,
-        buyRouter: ContractRouter::from(buy_router.router_type) as u8,
-        buyPoolFee: buy_router.pool_fee.try_into().unwrap_or(3000), // u24
-        minWmonOut: min_wmon_out_wei,
+    println!("  Using UNCHECKED mode (force=true) - no profit check");
+    let execute_call = executeArbUncheckedCall {  // <-- NO minProfit check!
+        ...
+        minWmonOut: min_wmon_out_wei,  // Only checks slippage, not profit
     };
-    Bytes::from(execute_call.abi_encode())
-} else {
-    let execute_call = executeArbCall {
-        sellRouter: ContractRouter::from(sell_router.router_type) as u8,
-        sellRouterData: sell_calldata,
-        buyRouter: ContractRouter::from(buy_router.router_type) as u8,
-        buyPoolFee: buy_router.pool_fee.try_into().unwrap_or(3000), // u24
-        minWmonOut: min_wmon_out_wei,
-        minProfit: min_profit_wei,
-    };
-    Bytes::from(execute_call.abi_encode())
-};
 ```
 
----
+**Problem:** `executeArbUnchecked` only verifies `minWmonOut` (slippage), NOT profitability. The arb can succeed with 200 bps slippage (getting back 245.7+ WMON) while still being unprofitable.
 
-## Step 3: Rebuild and Redeploy
+### 2. Price Moved During Execution (~940ms)
 
-### 3.1 Compile Solidity
+The log shows:
+- `total_execution_ms: 940`
+- Price fetch was done BEFORE execution
+- By the time TX confirmed, prices likely shifted
 
-```bash
-cd contracts
-forge build
-```
+With volatile markets, 940ms is enough for the spread to evaporate.
 
-### 3.2 Deploy new contract
+### 3. Trade Size vs Liquidity (250 WMON)
 
-```bash
-forge create --rpc-url $MONAD_RPC_URL --private-key $PRIVATE_KEY src/MonadAtomicArb.sol:MonadAtomicArb
-```
+250 WMON is a significant trade that causes:
+- **Price impact on sell**: Pushed PancakeSwap1 price down
+- **Price impact on buy**: Pushed MondayTrade price up
+- Combined impact likely exceeded the 30 bps gross spread
 
-### 3.3 Update config.rs
+### 4. Post-Execution Logging Bug
 
-**File:** `src/config.rs`
-
-Update `ATOMIC_ARB_CONTRACT` with the new contract address:
+In `run_auto_arb` (main.rs ~1640), the `PostExecutionSnapshot` for atomic arb shows:
 ```rust
-pub const ATOMIC_ARB_CONTRACT: Address = alloy::primitives::address!("NEW_ADDRESS_HERE");
+actual_usdc_received: result.usdc_intermediate,  // This is 0 for atomic arb!
+actual_wmon_back: result.wmon_out,              // This uses ESTIMATED value!
 ```
 
-### 3.4 Setup approvals
+The atomic result's `wmon_out` is calculated as:
+```rust
+wmon_out: result.wmon_in + result.profit_wmon,  // Uses estimated profit!
+```
+
+---
+
+## Fixes Required
+
+### Fix 1: Remove `--force` Flag for Testing (Immediate)
+
+**Never use `--force` with real funds.** It's only for debugging contract execution paths.
+
+Run without `--force`:
+```bash
+cargo run -- auto-arb --min-spread-bps 50 --amount 10 --slippage 150
+```
+
+### Fix 2: Add Real Profit Verification in Atomic Arb
+
+In `src/execution/atomic_arb.rs`, after receipt confirmation, query actual balance change:
+
+```rust
+// After line ~280 (after receipt check)
+if receipt.status() {
+    // Query ACTUAL balances instead of using estimates
+    let (wmon_after, _) = query_contract_balances(provider_with_signer).await?;
+    let actual_wmon_back = wmon_after - wmon_before + amount; // Account for initial spend
+    let actual_profit = actual_wmon_back - amount;
+    let actual_profit_bps = if amount > 0.0 {
+        (actual_profit / amount * 10000.0) as i32
+    } else {
+        0
+    };
+    
+    // Use actual values, not estimates
+    return Ok(AtomicArbResult {
+        ...
+        profit_wmon: actual_profit,  // ACTUAL, not estimated
+        profit_bps: actual_profit_bps,
+        ...
+    });
+}
+```
+
+### Fix 3: Add Pre-TX Balance Snapshot
+
+In `execute_atomic_arb`, add balance query BEFORE execution:
+
+```rust
+// Add at start of function (after validations)
+let (wmon_before, usdc_before) = query_contract_balances(provider_with_signer).await?;
+println!("  Contract balances before: {:.6} WMON, {:.6} USDC", wmon_before, usdc_before);
+```
+
+### Fix 4: Reduce Trade Size for Testing
+
+In your test command:
+```bash
+# Use small amounts until confident
+cargo run -- auto-arb --amount 1.0 --min-spread-bps 50 --slippage 150
+```
+
+### Fix 5: Tighten Slippage Tolerance
+
+200 bps slippage is too loose. A "profitable" 30 bps spread can easily become a loss.
 
 ```bash
-cargo run -- contract-balance  # Verify new contract
-cargo run -- fund-contract --amount 0.5  # Fund with test amount
+# Use 50-100 bps slippage for real trading
+cargo run -- auto-arb --slippage 75 --min-spread-bps 30
+```
+
+### Fix 6: Add Real-Time Price Recheck Before Execution
+
+In `run_auto_arb`, before executing, re-fetch prices:
+
+```rust
+// Before execute_atomic_arb call
+println!("  Re-checking prices before execution...");
+let fresh_prices = get_current_prices(&provider).await?;
+let fresh_sell = fresh_prices.iter().find(|p| p.pool_name == spread.sell_pool);
+let fresh_buy = fresh_prices.iter().find(|p| p.pool_name == spread.buy_pool);
+
+if let (Some(sell), Some(buy)) = (fresh_sell, fresh_buy) {
+    let fresh_spread_bps = ((sell.price - buy.price) / buy.price * 10000.0) as i32;
+    if fresh_spread_bps < min_spread_bps {
+        println!("  Spread evaporated! Was {} bps, now {} bps. Skipping.", 
+            net_spread_bps, fresh_spread_bps);
+        continue;
+    }
+}
 ```
 
 ---
 
-## Step 4: Test
+## Recommended Testing Workflow
 
+### Step 1: Verify Contract Logic (Dry Run)
 ```bash
-# Dry run first
-cargo run -- atomic-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 0.1 --slippage 200 --force
-
-# Check contract balances before and after
-cargo run -- contract-balance
+cargo run -- auto-arb --dry-run --min-spread-bps 20 --amount 10
 ```
 
-**Expected Result:**
-- USDC balance should be ~0 after arb (all USDC used)
-- No USDC leakage between trades
+### Step 2: Small Amount Test (NO --force)
+```bash
+cargo run -- auto-arb --amount 0.1 --min-spread-bps 50 --slippage 100 --max-executions 1
+```
+
+### Step 3: Monitor Results
+Check `arb_stats_*.jsonl` for:
+- `post.wmon_delta` - actual balance change
+- `post.net_profit_bps` - should match expectation
+- Compare `pre.net_spread_bps` vs `post.net_profit_bps`
+
+### Step 4: Scale Up Gradually
+Only increase `--amount` after confirming profitability at lower sizes.
 
 ---
 
-## Summary of Changes
+## Key Metrics to Monitor
 
-| File | Change |
-|------|--------|
-| `contracts/src/MonadAtomicArb.sol` | New function signature, add `_buildBuyCalldata()`, query actual USDC balance |
-| `src/execution/atomic_arb.rs` | Remove `usdc_for_swap2` calculation, remove `buy_calldata` building, update call encoding |
-| `src/config.rs` | Update `ATOMIC_ARB_CONTRACT` after deployment |
+| Metric | Expected | Your Log | Issue |
+|--------|----------|----------|-------|
+| `swap2_tx_hash` | empty (atomic) | empty | ✓ OK |
+| `actual_usdc_received` | >0 | 0.0 | Bug: not tracked for atomic |
+| `wmon_delta` | >0 | -0.347 | ✗ LOSS |
+| `net_profit_bps` | ~20 | -13 | ✗ 33 bps worse |
+| `total_execution_ms` | <500 | 940 | ⚠ Slow, allows price drift |
 
 ---
 
-## Key Points
+## Summary Checklist
 
-1. **Swap 1 calldata** is still built in Rust (no change needed)
-2. **Swap 2 calldata** is now built ON-CHAIN in Solidity after swap 1 completes
-3. The contract uses `IERC20(USDC).balanceOf(address(this))` to get the ACTUAL USDC available
-4. `minWmonOut` provides slippage protection for swap 2
-5. The fix uses 100% of available USDC balance, not an estimate
+- [ ] Remove `--force` flag immediately
+- [ ] Reduce `--amount` to 1-10 WMON for testing
+- [ ] Tighten `--slippage` to 75-100 bps
+- [ ] Increase `--min-spread-bps` to 50+ for safety margin
+- [ ] Apply Fix 2 (actual balance verification)
+- [ ] Apply Fix 6 (price recheck before execution)
+- [ ] Monitor `wmon_delta` in logs, not `success` flag
+
+---
+
+## Why The Arb "Succeeded" But Lost Money
+
+```
+minWmonOut = 250.754 * (1 - 0.02) = 245.74 WMON
+Actual received ≈ 249.65 WMON (estimated from delta)
+
+245.74 < 249.65  →  Slippage check PASSED
+249.65 < 250.00  →  But LOST 0.35 WMON profit!
+```
+
+The slippage protection (`minWmonOut`) prevented catastrophic loss but allowed small loss. With `--force`, there's no `minProfit` check, so any loss within slippage tolerance executes.
+
+**Solution:** Never use `--force` for production, and implement Fix 2 to catch this in logging.
