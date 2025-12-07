@@ -194,7 +194,7 @@ pub async fn execute_atomic_arb<P: Provider>(
     let min_usdc_out_wei = to_wei(min_usdc_out, USDC_DECIMALS);
 
     // For swap 2, use conservative USDC estimate
-    let usdc_for_swap2 = min_usdc_out * 0.999; // Tiny buffer for dust
+    let usdc_for_swap2 = expected_usdc * 0.999; // Tiny buffer for dust
     let usdc_for_swap2_wei = to_wei(usdc_for_swap2, USDC_DECIMALS);
     let expected_wmon_back = usdc_for_swap2 / buy_price;
     let min_wmon_out = expected_wmon_back * slippage_mult;
