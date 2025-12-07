@@ -44,6 +44,71 @@ contract MonadAtomicArb {
         _;
     }
 
+    /// @notice Build exactInputSingle calldata for V3-style routers
+    /// @dev Works for Uniswap, PancakeSwap (wrapped in multicall), and Monday
+    function _buildBuyCalldata(
+        Router router,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        uint24 fee
+    ) internal view returns (bytes memory) {
+        if (router == Router.Uniswap || router == Router.MondayTrade) {
+            // Uniswap/Monday: exactInputSingle with deadline in struct (Monday) or not (Uniswap)
+            // For simplicity, use Uniswap format (no deadline in struct)
+            return abi.encodeWithSelector(
+                bytes4(0x04e45aaf), // exactInputSingle selector
+                USDC,              // tokenIn
+                WMON,              // tokenOut
+                fee,               // fee tier
+                address(this),     // recipient
+                amountIn,          // amountIn
+                amountOutMin,      // amountOutMinimum
+                uint160(0)         // sqrtPriceLimitX96 (0 = no limit)
+            );
+        } else if (router == Router.PancakeSwap) {
+            // PancakeSwap: wrap in multicall(deadline, data[])
+            bytes memory innerCall = abi.encodeWithSelector(
+                bytes4(0x04e45aaf), // exactInputSingle selector
+                USDC,
+                WMON,
+                fee,
+                address(this),
+                amountIn,
+                amountOutMin,
+                uint160(0)
+            );
+            bytes[] memory calls = new bytes[](1);
+            calls[0] = innerCall;
+            return abi.encodeWithSelector(
+                bytes4(0x5ae401dc), // multicall(uint256,bytes[]) selector
+                block.timestamp + 300, // deadline
+                calls
+            );
+        } else if (router == Router.LFJ) {
+            // LFJ: swapExactTokensForTokens with Path struct
+            // Path: pairBinSteps[], versions[], tokenPath[]
+            uint256[] memory binSteps = new uint256[](1);
+            binSteps[0] = uint256(fee); // fee is binStep for LFJ
+            uint8[] memory versions = new uint8[](1);
+            versions[0] = 3; // V2_2
+            address[] memory path = new address[](2);
+            path[0] = USDC;
+            path[1] = WMON;
+
+            return abi.encodeWithSelector(
+                bytes4(0x4b126ad4), // swapExactTokensForTokens selector
+                amountIn,
+                amountOutMin,
+                binSteps,
+                versions,
+                path,
+                address(this),
+                block.timestamp + 300
+            );
+        }
+        revert InvalidRouter();
+    }
+
     /// @notice Setup max approvals for all routers (call once after deployment)
     function setupApprovals() external onlyOwner {
         // Approve WMON to all routers
@@ -63,34 +128,42 @@ contract MonadAtomicArb {
     /// @param sellRouter Router to sell WMON for USDC (higher price)
     /// @param sellRouterData Pre-encoded calldata for sell swap
     /// @param buyRouter Router to buy WMON with USDC (lower price)
-    /// @param buyRouterData Pre-encoded calldata for buy swap
+    /// @param buyPoolFee Pool fee tier for buy swap (used to build calldata on-chain)
+    /// @param minWmonOut Minimum WMON output for slippage protection on buy swap
     /// @param minProfit Minimum WMON profit required (reverts if not met)
     /// @return profit The WMON profit achieved
     function executeArb(
         Router sellRouter,
         bytes calldata sellRouterData,
         Router buyRouter,
-        bytes calldata buyRouterData,
+        uint24 buyPoolFee,
+        uint256 minWmonOut,
         uint256 minProfit
     ) external onlyOwner returns (int256 profit) {
         uint256 wmonBefore = IERC20(WMON).balanceOf(address(this));
 
-        // Swap 1: WMON -> USDC on sellRouter
+        // Swap 1: WMON -> USDC on sellRouter (calldata pre-built by Rust)
         address sellAddr = _getRouterAddress(sellRouter);
         (bool success1,) = sellAddr.call(sellRouterData);
         if (!success1) revert SwapFailed(1);
 
+        // Get ACTUAL USDC balance after swap 1
+        uint256 usdcToSwap = IERC20(USDC).balanceOf(address(this));
+
+        // Build swap 2 calldata ON-CHAIN using actual USDC
+        bytes memory buyCalldata = _buildBuyCalldata(buyRouter, usdcToSwap, minWmonOut, buyPoolFee);
+
         // Swap 2: USDC -> WMON on buyRouter
         address buyAddr = _getRouterAddress(buyRouter);
-        (bool success2,) = buyAddr.call(buyRouterData);
+        (bool success2,) = buyAddr.call(buyCalldata);
         if (!success2) revert SwapFailed(2);
 
         uint256 wmonAfter = IERC20(WMON).balanceOf(address(this));
 
-        // Calculate profit (can be negative)
+        // Calculate profit
         profit = int256(wmonAfter) - int256(wmonBefore);
 
-        // Revert if below minimum profit threshold
+        // Revert if below minimum
         if (wmonAfter < wmonBefore + minProfit) {
             revert Unprofitable(wmonBefore, wmonAfter);
         }
@@ -110,18 +183,25 @@ contract MonadAtomicArb {
         Router sellRouter,
         bytes calldata sellRouterData,
         Router buyRouter,
-        bytes calldata buyRouterData
+        uint24 buyPoolFee,
+        uint256 minWmonOut
     ) external onlyOwner returns (int256 profit) {
         uint256 wmonBefore = IERC20(WMON).balanceOf(address(this));
 
-        // Swap 1: WMON -> USDC on sellRouter
+        // Swap 1: WMON -> USDC on sellRouter (calldata pre-built by Rust)
         address sellAddr = _getRouterAddress(sellRouter);
         (bool success1,) = sellAddr.call(sellRouterData);
         if (!success1) revert SwapFailed(1);
 
+        // Get ACTUAL USDC balance after swap 1
+        uint256 usdcToSwap = IERC20(USDC).balanceOf(address(this));
+
+        // Build swap 2 calldata ON-CHAIN using actual USDC
+        bytes memory buyCalldata = _buildBuyCalldata(buyRouter, usdcToSwap, minWmonOut, buyPoolFee);
+
         // Swap 2: USDC -> WMON on buyRouter
         address buyAddr = _getRouterAddress(buyRouter);
-        (bool success2,) = buyAddr.call(buyRouterData);
+        (bool success2,) = buyAddr.call(buyCalldata);
         if (!success2) revert SwapFailed(2);
 
         uint256 wmonAfter = IERC20(WMON).balanceOf(address(this));

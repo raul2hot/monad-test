@@ -8,7 +8,7 @@
 //! - ~500-800ms total execution vs ~2600ms
 
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, U256, Uint};
 use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -59,7 +59,8 @@ sol! {
         uint8 sellRouter,
         bytes calldata sellRouterData,
         uint8 buyRouter,
-        bytes calldata buyRouterData,
+        uint24 buyPoolFee,
+        uint256 minWmonOut,
         uint256 minProfit
     ) external returns (int256 profit);
 
@@ -68,7 +69,8 @@ sol! {
         uint8 sellRouter,
         bytes calldata sellRouterData,
         uint8 buyRouter,
-        bytes calldata buyRouterData
+        uint24 buyPoolFee,
+        uint256 minWmonOut
     ) external returns (int256 profit);
 
     #[derive(Debug)]
@@ -193,10 +195,9 @@ pub async fn execute_atomic_arb<P: Provider>(
     let min_usdc_out = expected_usdc * slippage_mult;
     let min_usdc_out_wei = to_wei(min_usdc_out, USDC_DECIMALS);
 
-    // For swap 2, use conservative USDC estimate
-    let usdc_for_swap2 = expected_usdc * 0.999; // Tiny buffer for dust
-    let usdc_for_swap2_wei = to_wei(usdc_for_swap2, USDC_DECIMALS);
-    let expected_wmon_back = usdc_for_swap2 / buy_price;
+    // Calculate minimum WMON output for swap 2 (slippage protection)
+    // Note: Actual USDC amount will be determined on-chain after swap 1
+    let expected_wmon_back = expected_usdc / buy_price;
     let min_wmon_out = expected_wmon_back * slippage_mult;
     let min_wmon_out_wei = to_wei(min_wmon_out, WMON_DECIMALS);
 
@@ -208,15 +209,19 @@ pub async fn execute_atomic_arb<P: Provider>(
     };
     let min_profit_wei = to_wei(min_profit_wmon, WMON_DECIMALS);
 
+    // Get pool fee for the buy router (convert to u24)
+    let buy_pool_fee: u32 = buy_router.pool_fee;
+
     println!("  Building atomic arb calldata...");
     println!("    WMON in: {:.6}", amount);
     println!("    Expected USDC: {:.6}", expected_usdc);
     println!("    Min USDC out: {:.6}", min_usdc_out);
-    println!("    USDC for swap2: {:.6}", usdc_for_swap2);
     println!("    Expected WMON back: {:.6}", expected_wmon_back);
+    println!("    Min WMON out: {:.6}", min_wmon_out);
+    println!("    Buy pool fee: {}", buy_pool_fee);
     println!("    Min profit: {:.6} WMON ({} bps)", min_profit_wmon, min_profit_bps);
 
-    // Build calldata for both swaps
+    // Build calldata for sell swap only (swap 2 is built on-chain)
     let sell_calldata = build_router_calldata(
         sell_router,
         SwapDirection::Sell,
@@ -224,21 +229,18 @@ pub async fn execute_atomic_arb<P: Provider>(
         min_usdc_out_wei,
     )?;
 
-    let buy_calldata = build_router_calldata(
-        buy_router,
-        SwapDirection::Buy,
-        usdc_for_swap2_wei,
-        min_wmon_out_wei,
-    )?;
-
     // Build executeArb call (use unchecked version if force=true)
+    // Convert pool fee to Uint<24, 1> (u24 type for alloy)
+    let buy_pool_fee_u24: Uint<24, 1> = Uint::from(buy_pool_fee);
+
     let calldata = if force {
         println!("  Using UNCHECKED mode (force=true) - no profit check");
         let execute_call = executeArbUncheckedCall {
             sellRouter: ContractRouter::from(sell_router.router_type) as u8,
             sellRouterData: sell_calldata,
             buyRouter: ContractRouter::from(buy_router.router_type) as u8,
-            buyRouterData: buy_calldata,
+            buyPoolFee: buy_pool_fee_u24,
+            minWmonOut: min_wmon_out_wei,
         };
         Bytes::from(execute_call.abi_encode())
     } else {
@@ -246,7 +248,8 @@ pub async fn execute_atomic_arb<P: Provider>(
             sellRouter: ContractRouter::from(sell_router.router_type) as u8,
             sellRouterData: sell_calldata,
             buyRouter: ContractRouter::from(buy_router.router_type) as u8,
-            buyRouterData: buy_calldata,
+            buyPoolFee: buy_pool_fee_u24,
+            minWmonOut: min_wmon_out_wei,
             minProfit: min_profit_wei,
         };
         Bytes::from(execute_call.abi_encode())
