@@ -12,7 +12,7 @@ pub const MULTICALL3_ADDRESS: Address = alloy::primitives::address!("cA11bde0597
 
 // TODO: Update this address after deploying MonadAtomicArb contract
 // Atomic Arbitrage Contract (deployed by user - UPDATE THIS AFTER DEPLOYMENT)
-pub const ATOMIC_ARB_CONTRACT: Address = alloy::primitives::address!("2d5d6795F8D8358fA7467DFf90D85299282CeB32");
+pub const ATOMIC_ARB_CONTRACT: Address = alloy::primitives::address!("7299daB2965c0A6ce471a8284a1D05bB483e05b2");
 
 // Token decimals
 pub const WMON_DECIMALS: u8 = 18;
