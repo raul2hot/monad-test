@@ -68,25 +68,39 @@ contract MonadAtomicArb {
     }
 
     /// @notice Build exactInputSingle calldata for V3-style routers
-    /// @dev Works for Uniswap, PancakeSwap (wrapped in multicall), and Monday
+    /// @dev Each router has a different ABI for exactInputSingle
     function _buildBuyCalldata(
         Router router,
         uint256 amountIn,
         uint256 amountOutMin,
         uint24 fee
     ) internal view returns (bytes memory) {
-        if (router == Router.Uniswap || router == Router.MondayTrade) {
-            // Uniswap/Monday: exactInputSingle with deadline in struct (Monday) or not (Uniswap)
-            // For simplicity, use Uniswap format (no deadline in struct)
+        if (router == Router.Uniswap) {
+            // Uniswap SwapRouter02: exactInputSingle WITHOUT deadline in struct (7 fields)
+            // Selector: 0x04e45aaf
             return abi.encodeWithSelector(
-                bytes4(0x04e45aaf), // exactInputSingle selector
+                bytes4(0x04e45aaf),
                 USDC,              // tokenIn
                 WMON,              // tokenOut
                 fee,               // fee tier
                 address(this),     // recipient
                 amountIn,          // amountIn
                 amountOutMin,      // amountOutMinimum
-                uint160(0)         // sqrtPriceLimitX96 (0 = no limit)
+                uint160(0)         // sqrtPriceLimitX96
+            );
+        } else if (router == Router.MondayTrade) {
+            // MondayTrade uses original ISwapRouter: deadline IS in struct (8 fields)
+            // Selector: 0x414bf389
+            return abi.encodeWithSelector(
+                bytes4(0x414bf389),
+                USDC,              // tokenIn
+                WMON,              // tokenOut
+                fee,               // fee tier
+                address(this),     // recipient
+                block.timestamp + 300, // deadline (INSIDE struct for Monday!)
+                amountIn,          // amountIn
+                amountOutMin,      // amountOutMinimum
+                uint160(0)         // sqrtPriceLimitX96
             );
         } else if (router == Router.PancakeSwap) {
             // PancakeSwap: wrap in multicall(deadline, data[])
