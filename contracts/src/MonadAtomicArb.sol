@@ -147,7 +147,7 @@ contract MonadAtomicArb {
             });
 
             return abi.encodeWithSelector(
-                bytes4(0x4b126ad4), // swapExactTokensForTokens selector
+                bytes4(0x2a443fae), // swapExactTokensForTokens selector (verified from Rust)
                 amountIn,
                 amountOutMin,
                 lfjPath,           // Pass as struct, not separate arrays!
