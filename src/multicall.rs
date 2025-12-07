@@ -4,9 +4,11 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::debug;
 
 use crate::config::MULTICALL3_ADDRESS;
+use crate::node_config::NodeConfig;
 use crate::pools::{
     calculate_lfj_price, decode_active_id_response, decode_bin_step_response,
     decode_slot0_to_price, CallType, PoolPrice, PriceCall,
@@ -150,4 +152,43 @@ pub async fn fetch_prices_batched<P: Provider>(
     }
 
     Ok((prices, elapsed_ms))
+}
+
+/// Fetch prices with node-aware batching optimization
+/// For local nodes: larger batches, no delay between batches
+/// For remote nodes: smaller batches with delay to avoid rate limits
+pub async fn fetch_prices_optimized<P: Provider>(
+    provider: &P,
+    price_calls: Vec<PriceCall>,
+    config: &NodeConfig,
+) -> Result<(Vec<PoolPrice>, u128)> {
+    let batch_size = config.multicall_batch_size;
+    let total_calls = price_calls.len();
+
+    // If all calls fit in one batch, use the standard function
+    if total_calls <= batch_size {
+        return fetch_prices_batched(provider, price_calls).await;
+    }
+
+    // For large call sets, batch them
+    let start = std::time::Instant::now();
+    let mut all_prices = Vec::new();
+
+    for (i, chunk) in price_calls.chunks(batch_size).enumerate() {
+        debug!("Fetching batch {}/{}", i + 1, (total_calls + batch_size - 1) / batch_size);
+
+        let (prices, _) = fetch_prices_batched(provider, chunk.to_vec()).await?;
+        all_prices.extend(prices);
+
+        // No delay needed for local node, add small delay for remote to avoid rate limits
+        if !config.is_local && i < (total_calls / batch_size) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    debug!("Optimized multicall completed in {}ms ({} calls in {} batches)",
+        elapsed_ms, total_calls, (total_calls + batch_size - 1) / batch_size);
+
+    Ok((all_prices, elapsed_ms))
 }
