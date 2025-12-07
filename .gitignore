@@ -27,3 +27,4 @@ logs/
 # Cargo.lock
 
 arb_stats_*.jsonl
+contracts/out/
