@@ -8,6 +8,8 @@ use std::fs::{OpenOptions, File};
 use std::io::{Write, BufWriter};
 use std::path::PathBuf;
 
+use crate::spread_tracker::SpreadSnapshot;
+
 /// Detailed snapshot before arb execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreExecutionSnapshot {
@@ -29,6 +31,16 @@ pub struct PreExecutionSnapshot {
     pub expected_usdc: f64,
     pub expected_wmon_back: f64,
     pub slippage_bps: u32,
+
+    // Velocity tracking (optional - only when --track-velocity enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spread_history: Option<Vec<SpreadSnapshot>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub velocity_bps_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceleration: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_spike_pattern: Option<bool>,
 }
 
 /// Detailed snapshot after arb execution
