@@ -1,426 +1,343 @@
-// =============================================================================
-// MONAD LOCAL NODE INTEGRATION PATCHES v2.0
-// =============================================================================
-// Updated: December 6, 2025
-// Monad Version: 0.12.3
-// CRITICAL: RPC ports are 8080 (HTTP) and 8081 (WS) - NOT 8545/8546!
-// =============================================================================
+# Atomic Arbitrage USDC Balance Bug Fix
 
-// =============================================================================
-// PATCH 1: CORRECTED ENVIRONMENT CONFIGURATION
-// =============================================================================
-// File: .env or environment variables
-// 
-// BEFORE (WRONG - these are Ethereum standard ports):
-// MONAD_RPC_URL=http://127.0.0.1:8545
-// MONAD_WS_URL=ws://127.0.0.1:8546
-//
-// AFTER (CORRECT - Monad actual ports):
-// MONAD_RPC_URL=http://127.0.0.1:8080
-// MONAD_WS_URL=ws://127.0.0.1:8081
+## Overview
 
+Fix a critical bug where swap 2 uses a PRE-CALCULATED USDC amount instead of the ACTUAL USDC received from swap 1. This causes USDC balance leakage from the contract.
 
-// =============================================================================
-// PATCH 2: NODE CONFIGURATION MODULE
-// =============================================================================
-// File: src/config/node.rs (new file)
+---
 
-use std::time::Duration;
+## The Bug
 
-/// Configuration for Monad node connection
-#[derive(Debug, Clone)]
-pub struct NodeConfig {
-    /// Whether connected to a local node (enables aggressive optimizations)
-    pub is_local: bool,
-    /// HTTP RPC endpoint
-    pub rpc_url: String,
-    /// WebSocket endpoint
-    pub ws_url: String,
-    /// Polling interval for price updates
-    pub poll_interval: Duration,
-    /// Polling interval for transaction receipts
-    pub receipt_poll_interval: Duration,
-    /// Gas buffer multiplier (1.10 = 10% buffer)
-    pub gas_buffer: f64,
-    /// Whether to skip block confirmations (safe for local node)
-    pub skip_block_wait: bool,
+**Location:** `src/execution/atomic_arb.rs` lines ~180-185
+
+**Current broken code:**
+```rust
+// For swap 2, use conservative USDC estimate
+let usdc_for_swap2 = expected_usdc * 0.999; // Tiny buffer for dust
+let usdc_for_swap2_wei = to_wei(usdc_for_swap2, USDC_DECIMALS);
+```
+
+**Problem:** Rust pre-calculates `usdc_for_swap2` BEFORE swap 1 executes. The Solidity contract receives this pre-built calldata and uses it blindly.
+
+**Result:** 
+- Swap 1 might return 0.041097 USDC (actual)
+- Swap 2 tries to spend 0.038455 USDC (pre-calculated estimate)
+- Contract loses the difference: -0.002642 USDC per trade
+
+---
+
+## The Fix
+
+Build swap 2 calldata ON-CHAIN in Solidity using the ACTUAL USDC balance after swap 1.
+
+---
+
+## Step 1: Modify Solidity Contract
+
+**File:** `contracts/src/MonadAtomicArb.sol`
+
+### 1.1 Change the `executeArb` function signature
+
+**Remove:** `bytes calldata buyRouterData` parameter  
+**Add:** `uint8 buyRouter`, `uint24 buyPoolFee`, `uint256 minWmonOut`
+
+**New signature:**
+```solidity
+function executeArb(
+    Router sellRouter,
+    bytes calldata sellRouterData,
+    Router buyRouter,
+    uint24 buyPoolFee,
+    uint256 minWmonOut,
+    uint256 minProfit
+) external onlyOwner returns (int256 profit)
+```
+
+### 1.2 Add helper function to build swap calldata on-chain
+
+Add this function before `executeArb`:
+
+```solidity
+/// @notice Build exactInputSingle calldata for V3-style routers
+/// @dev Works for Uniswap, PancakeSwap (wrapped in multicall), and Monday
+function _buildBuyCalldata(
+    Router router,
+    uint256 amountIn,
+    uint256 amountOutMin,
+    uint24 fee
+) internal view returns (bytes memory) {
+    if (router == Router.Uniswap || router == Router.MondayTrade) {
+        // Uniswap/Monday: exactInputSingle with deadline in struct (Monday) or not (Uniswap)
+        // For simplicity, use Uniswap format (no deadline in struct)
+        return abi.encodeWithSelector(
+            bytes4(0x04e45aaf), // exactInputSingle selector
+            USDC,              // tokenIn
+            WMON,              // tokenOut
+            fee,               // fee tier
+            address(this),     // recipient
+            amountIn,          // amountIn
+            amountOutMin,      // amountOutMinimum
+            uint160(0)         // sqrtPriceLimitX96 (0 = no limit)
+        );
+    } else if (router == Router.PancakeSwap) {
+        // PancakeSwap: wrap in multicall(deadline, data[])
+        bytes memory innerCall = abi.encodeWithSelector(
+            bytes4(0x04e45aaf), // exactInputSingle selector
+            USDC,
+            WMON,
+            fee,
+            address(this),
+            amountIn,
+            amountOutMin,
+            uint160(0)
+        );
+        bytes[] memory calls = new bytes[](1);
+        calls[0] = innerCall;
+        return abi.encodeWithSelector(
+            bytes4(0x5ae401dc), // multicall(uint256,bytes[]) selector
+            block.timestamp + 300, // deadline
+            calls
+        );
+    } else if (router == Router.LFJ) {
+        // LFJ: swapExactTokensForTokens with Path struct
+        // Path: pairBinSteps[], versions[], tokenPath[]
+        uint256[] memory binSteps = new uint256[](1);
+        binSteps[0] = uint256(fee); // fee is binStep for LFJ
+        uint8[] memory versions = new uint8[](1);
+        versions[0] = 3; // V2_2
+        address[] memory path = new address[](2);
+        path[0] = USDC;
+        path[1] = WMON;
+        
+        return abi.encodeWithSelector(
+            bytes4(0x4b126ad4), // swapExactTokensForTokens selector
+            amountIn,
+            amountOutMin,
+            binSteps,
+            versions,
+            path,
+            address(this),
+            block.timestamp + 300
+        );
+    }
+    revert InvalidRouter();
 }
+```
 
-impl NodeConfig {
-    /// Create configuration from environment variables
-    pub fn from_env() -> Self {
-        let rpc_url = std::env::var("MONAD_RPC_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()); // MONAD PORT!
-        
-        let ws_url = std::env::var("MONAD_WS_URL")
-            .unwrap_or_else(|_| "ws://127.0.0.1:8081".to_string()); // MONAD PORT!
-        
-        // Detect if we're connecting to a local node
-        let is_local = rpc_url.contains("127.0.0.1") 
-            || rpc_url.contains("localhost")
-            || rpc_url.starts_with("http://10.")
-            || rpc_url.starts_with("http://192.168.");
-        
-        if is_local {
-            Self::local_config(rpc_url, ws_url)
-        } else {
-            Self::remote_config(rpc_url, ws_url)
-        }
-    }
+### 1.3 Update executeArb implementation
+
+Replace the current `executeArb` function body:
+
+```solidity
+function executeArb(
+    Router sellRouter,
+    bytes calldata sellRouterData,
+    Router buyRouter,
+    uint24 buyPoolFee,
+    uint256 minWmonOut,
+    uint256 minProfit
+) external onlyOwner returns (int256 profit) {
+    uint256 wmonBefore = IERC20(WMON).balanceOf(address(this));
+
+    // Swap 1: WMON -> USDC on sellRouter (calldata pre-built by Rust)
+    address sellAddr = _getRouterAddress(sellRouter);
+    (bool success1,) = sellAddr.call(sellRouterData);
+    if (!success1) revert SwapFailed(1);
+
+    // Get ACTUAL USDC balance after swap 1
+    uint256 usdcToSwap = IERC20(USDC).balanceOf(address(this));
     
-    /// Aggressive settings for local node
-    fn local_config(rpc_url: String, ws_url: String) -> Self {
-        Self {
-            is_local: true,
-            rpc_url,
-            ws_url,
-            poll_interval: Duration::from_millis(100),      // 10x faster
-            receipt_poll_interval: Duration::from_millis(5), // 4x faster
-            gas_buffer: 1.10,                                // 10% (tighter)
-            skip_block_wait: true,                           // State is consistent
-        }
-    }
+    // Build swap 2 calldata ON-CHAIN using actual USDC
+    bytes memory buyCalldata = _buildBuyCalldata(buyRouter, usdcToSwap, minWmonOut, buyPoolFee);
     
-    /// Conservative settings for remote/public RPC
-    fn remote_config(rpc_url: String, ws_url: String) -> Self {
-        Self {
-            is_local: false,
-            rpc_url,
-            ws_url,
-            poll_interval: Duration::from_millis(1000),      // Standard
-            receipt_poll_interval: Duration::from_millis(20), // Standard
-            gas_buffer: 1.15,                                 // 15% buffer
-            skip_block_wait: false,                           // Wait for propagation
-        }
+    // Swap 2: USDC -> WMON on buyRouter
+    address buyAddr = _getRouterAddress(buyRouter);
+    (bool success2,) = buyAddr.call(buyCalldata);
+    if (!success2) revert SwapFailed(2);
+
+    uint256 wmonAfter = IERC20(WMON).balanceOf(address(this));
+
+    // Calculate profit
+    profit = int256(wmonAfter) - int256(wmonBefore);
+
+    // Revert if below minimum
+    if (wmonAfter < wmonBefore + minProfit) {
+        revert Unprofitable(wmonBefore, wmonAfter);
     }
-    
-    /// Log configuration on startup
-    pub fn log_config(&self) {
-        println!("=== Node Configuration ===");
-        println!("RPC URL: {}", self.rpc_url);
-        println!("WS URL: {}", self.ws_url);
-        println!("Local Node: {}", self.is_local);
-        println!("Poll Interval: {:?}", self.poll_interval);
-        println!("Receipt Poll: {:?}", self.receipt_poll_interval);
-        println!("Gas Buffer: {:.0}%", (self.gas_buffer - 1.0) * 100.0);
-        println!("Skip Block Wait: {}", self.skip_block_wait);
-        println!("==========================");
-    }
-}
 
-
-// =============================================================================
-// PATCH 3: HEALTH CHECK MODULE
-// =============================================================================
-// File: src/health/node_health.rs (new file)
-
-use ethers::prelude::*;
-use std::time::{Duration, Instant};
-
-/// Node health status
-#[derive(Debug, Clone)]
-pub struct NodeHealth {
-    pub is_healthy: bool,
-    pub block_number: u64,
-    pub peer_count: u64,
-    pub is_syncing: bool,
-    pub rpc_latency_ms: u64,
-    pub last_check: Instant,
-}
-
-impl NodeHealth {
-    /// Check node health (call periodically)
-    pub async fn check(provider: &Provider<Http>) -> Result<Self, Box<dyn std::error::Error>> {
-        let start = Instant::now();
-        
-        // Get block number (also measures latency)
-        let block_number = provider.get_block_number().await?.as_u64();
-        let rpc_latency_ms = start.elapsed().as_millis() as u64;
-        
-        // Get peer count
-        let peer_count = provider
-            .request::<_, U64>("net_peerCount", ())
-            .await
-            .unwrap_or(U64::zero())
-            .as_u64();
-        
-        // Check sync status
-        let sync_status = provider.syncing().await?;
-        let is_syncing = match sync_status {
-            SyncingStatus::IsSyncing(_) => true,
-            SyncingStatus::NotSyncing => false,
-        };
-        
-        // Determine health
-        let is_healthy = !is_syncing && peer_count > 5 && rpc_latency_ms < 100;
-        
-        Ok(Self {
-            is_healthy,
-            block_number,
-            peer_count,
-            is_syncing,
-            rpc_latency_ms,
-            last_check: Instant::now(),
-        })
-    }
-    
-    /// Quick latency check
-    pub async fn ping(provider: &Provider<Http>) -> Result<Duration, Box<dyn std::error::Error>> {
-        let start = Instant::now();
-        let _ = provider.get_block_number().await?;
-        Ok(start.elapsed())
-    }
-}
-
-
-// =============================================================================
-// PATCH 4: UPDATED MULTICALL WITH LOCAL NODE OPTIMIZATION
-// =============================================================================
-// File: src/multicall.rs - Updates to existing file
-
-// CHANGE 1: Update default RPC URL
-// BEFORE:
-// const DEFAULT_RPC: &str = "https://some-public-rpc.monad.xyz";
-// AFTER:
-const DEFAULT_RPC: &str = "http://127.0.0.1:8080"; // Local Monad node
-
-// CHANGE 2: Add batch size optimization for local node
-impl PriceOracle {
-    /// Optimized batch size based on node type
-    fn get_batch_size(&self, config: &NodeConfig) -> usize {
-        if config.is_local {
-            // Local node can handle larger batches with lower latency
-            100
-        } else {
-            // Public RPCs may have stricter limits
-            50
-        }
-    }
-    
-    /// Fetch prices with node-aware optimization
-    pub async fn fetch_prices_optimized(
-        &self,
-        pairs: &[Address],
-        config: &NodeConfig,
-    ) -> Result<Vec<PriceData>, Box<dyn std::error::Error>> {
-        let batch_size = self.get_batch_size(config);
-        
-        let mut all_prices = Vec::new();
-        for chunk in pairs.chunks(batch_size) {
-            let prices = self.multicall_prices(chunk).await?;
-            all_prices.extend(prices);
-            
-            // No delay needed for local node
-            if !config.is_local {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-        
-        Ok(all_prices)
-    }
-}
-
-
-// =============================================================================
-// PATCH 5: UPDATED SWAP EXECUTION WITH LOCAL NODE OPTIMIZATION
-// =============================================================================
-// File: src/execution/swap.rs - Updates to existing file
-
-impl SwapExecutor {
-    /// Execute swap with node-aware timing
-    pub async fn execute_with_config(
-        &self,
-        swap: &SwapParams,
-        config: &NodeConfig,
-    ) -> Result<TransactionReceipt, ExecutionError> {
-        // Estimate gas with tighter buffer for local node
-        let gas_estimate = self.provider.estimate_gas(&swap.to_tx(), None).await?;
-        let gas_limit = (gas_estimate.as_u64() as f64 * config.gas_buffer) as u64;
-        
-        // Build and sign transaction
-        let tx = swap.to_tx().gas(gas_limit);
-        let pending_tx = self.wallet.send_transaction(tx, None).await?;
-        
-        // Wait for receipt with appropriate polling interval
-        let receipt = self.wait_for_receipt_optimized(
-            pending_tx.tx_hash(),
-            config,
-        ).await?;
-        
-        Ok(receipt)
-    }
-    
-    /// Optimized receipt polling for local node
-    async fn wait_for_receipt_optimized(
-        &self,
-        tx_hash: H256,
-        config: &NodeConfig,
-    ) -> Result<TransactionReceipt, ExecutionError> {
-        let max_attempts = if config.is_local { 200 } else { 50 };
-        let poll_interval = config.receipt_poll_interval;
-        
-        for _ in 0..max_attempts {
-            if let Some(receipt) = self.provider.get_transaction_receipt(tx_hash).await? {
-                return Ok(receipt);
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
-        
-        Err(ExecutionError::ReceiptTimeout)
-    }
-}
-
-
-// =============================================================================
-// PATCH 6: MAIN.RS STARTUP WITH HEALTH CHECK
-// =============================================================================
-// File: src/main.rs - Add to startup sequence
-
-async fn startup() -> Result<(), Box<dyn std::error::Error>> {
-    // Load node configuration
-    let config = NodeConfig::from_env();
-    config.log_config();
-    
-    // Create provider with correct Monad port
-    let provider = Provider::<Http>::try_from(&config.rpc_url)?;
-    
-    // Verify node health before starting bot
-    println!("Checking node health...");
-    let health = NodeHealth::check(&provider).await?;
-    
-    if !health.is_healthy {
-        if health.is_syncing {
-            println!("WARNING: Node is still syncing. Block: {}", health.block_number);
-            println!("Wait for sync to complete before running arbitrage.");
-            return Err("Node not synced".into());
-        }
-        if health.peer_count < 5 {
-            println!("WARNING: Low peer count ({}). Node may be isolated.", health.peer_count);
-        }
-    }
-    
-    println!("Node healthy! Block: {}, Peers: {}, Latency: {}ms",
-        health.block_number,
-        health.peer_count,
-        health.rpc_latency_ms
+    emit ArbExecuted(
+        uint8(sellRouter),
+        uint8(buyRouter),
+        wmonBefore,
+        wmonAfter,
+        profit
     );
-    
-    // Verify it's actually a Monad node
-    let chain_id = provider.get_chainid().await?;
-    if chain_id != U256::from(10143) { // Monad mainnet chain ID - VERIFY THIS
-        println!("WARNING: Unexpected chain ID: {}. Expected Monad mainnet.", chain_id);
-    }
-    
-    // Continue with bot initialization...
-    Ok(())
 }
+```
 
+### 1.4 Update executeArbUnchecked similarly
 
-// =============================================================================
-// PATCH 7: WEBSOCKET SUBSCRIPTION FOR MEMPOOL (ADVANCED)
-// =============================================================================
-// File: src/mempool/subscriber.rs (new file - optional advanced feature)
+Apply the same pattern to `executeArbUnchecked` - remove `buyRouterData`, add `buyRouter`, `buyPoolFee`, `minWmonOut`.
 
-use ethers::prelude::*;
-use futures::StreamExt;
+---
 
-/// Subscribe to pending transactions for MEV opportunities
-pub struct MempoolSubscriber {
-    ws_url: String,
+## Step 2: Modify Rust Code
+
+**File:** `src/execution/atomic_arb.rs`
+
+### 2.1 Remove usdc_for_swap2 calculation
+
+**Delete these lines (~180-190):**
+```rust
+// For swap 2, use conservative USDC estimate
+let usdc_for_swap2 = expected_usdc * 0.999; // Tiny buffer for dust
+let usdc_for_swap2_wei = to_wei(usdc_for_swap2, USDC_DECIMALS);
+let expected_wmon_back = usdc_for_swap2 / buy_price;
+let min_wmon_out = expected_wmon_back * slippage_mult;
+let min_wmon_out_wei = to_wei(min_wmon_out, WMON_DECIMALS);
+```
+
+### 2.2 Remove buy_calldata building
+
+**Delete the buy_calldata construction (~200-210):**
+```rust
+let buy_calldata = build_router_calldata(
+    buy_router,
+    SwapDirection::Buy,
+    usdc_for_swap2_wei,
+    min_wmon_out_wei,
+)?;
+```
+
+### 2.3 Update the Solidity call encoding
+
+**Change the sol! macro definitions:**
+
+```rust
+sol! {
+    #[derive(Debug)]
+    function executeArb(
+        uint8 sellRouter,
+        bytes calldata sellRouterData,
+        uint8 buyRouter,
+        uint24 buyPoolFee,
+        uint256 minWmonOut,
+        uint256 minProfit
+    ) external returns (int256 profit);
+
+    #[derive(Debug)]
+    function executeArbUnchecked(
+        uint8 sellRouter,
+        bytes calldata sellRouterData,
+        uint8 buyRouter,
+        uint24 buyPoolFee,
+        uint256 minWmonOut
+    ) external returns (int256 profit);
 }
+```
 
-impl MempoolSubscriber {
-    pub fn new(config: &NodeConfig) -> Self {
-        Self {
-            ws_url: config.ws_url.clone(),
-        }
-    }
-    
-    /// Subscribe to pending transactions
-    /// NOTE: Requires Monad node with --trace_calls flag enabled
-    pub async fn subscribe_pending_txs(
-        &self,
-    ) -> Result<impl futures::Stream<Item = Transaction>, Box<dyn std::error::Error>> {
-        // Connect to WebSocket on port 8081 (MONAD PORT!)
-        let ws = Ws::connect(&self.ws_url).await?;
-        let provider = Provider::new(ws);
-        
-        // Subscribe to pending transactions
-        let stream = provider.subscribe_pending_txs().await?;
-        
-        // Transform to full transactions
-        let tx_stream = stream.then(move |tx_hash| {
-            let provider = provider.clone();
-            async move {
-                provider.get_transaction(tx_hash).await.ok().flatten()
-            }
-        })
-        .filter_map(|tx| async { tx });
-        
-        Ok(tx_stream)
-    }
-    
-    /// Subscribe to new blocks (for timing arbitrage execution)
-    pub async fn subscribe_blocks(
-        &self,
-    ) -> Result<impl futures::Stream<Item = Block<H256>>, Box<dyn std::error::Error>> {
-        let ws = Ws::connect(&self.ws_url).await?;
-        let provider = Provider::new(ws);
-        
-        let stream = provider.subscribe_blocks().await?;
-        Ok(stream)
-    }
-}
+### 2.4 Update calldata encoding
 
+**Calculate minWmonOut in Rust:**
+```rust
+// Calculate minimum WMON output (for slippage protection)
+let expected_wmon_back = expected_usdc / buy_price;
+let min_wmon_out = expected_wmon_back * slippage_mult;
+let min_wmon_out_wei = to_wei(min_wmon_out, WMON_DECIMALS);
 
-// =============================================================================
-// PATCH 8: CONSTANTS UPDATE
-// =============================================================================
-// File: src/constants.rs - Update port constants
+// Get pool fee for the buy router
+let buy_pool_fee = buy_router.pool_fee; // This is u32, need to convert to u24
+```
 
-// MONAD MAINNET CONFIGURATION
-// CRITICAL: These are NOT Ethereum standard ports!
-pub const MONAD_RPC_PORT: u16 = 8080;           // HTTP JSON-RPC
-pub const MONAD_WS_PORT: u16 = 8081;            // WebSocket
-pub const MONAD_P2P_PORT: u16 = 8000;           // Consensus (for reference)
-pub const MONAD_METRICS_PORT: u16 = 9090;       // Prometheus (for reference)
+**Update the executeArb call:**
+```rust
+let calldata = if force {
+    let execute_call = executeArbUncheckedCall {
+        sellRouter: ContractRouter::from(sell_router.router_type) as u8,
+        sellRouterData: sell_calldata,
+        buyRouter: ContractRouter::from(buy_router.router_type) as u8,
+        buyPoolFee: buy_router.pool_fee.try_into().unwrap_or(3000), // u24
+        minWmonOut: min_wmon_out_wei,
+    };
+    Bytes::from(execute_call.abi_encode())
+} else {
+    let execute_call = executeArbCall {
+        sellRouter: ContractRouter::from(sell_router.router_type) as u8,
+        sellRouterData: sell_calldata,
+        buyRouter: ContractRouter::from(buy_router.router_type) as u8,
+        buyPoolFee: buy_router.pool_fee.try_into().unwrap_or(3000), // u24
+        minWmonOut: min_wmon_out_wei,
+        minProfit: min_profit_wei,
+    };
+    Bytes::from(execute_call.abi_encode())
+};
+```
 
-// Default URLs for local node
-pub const DEFAULT_MONAD_RPC: &str = "http://127.0.0.1:8080";
-pub const DEFAULT_MONAD_WS: &str = "ws://127.0.0.1:8081";
+---
 
-// Monad Mainnet Chain ID (VERIFY with official docs)
-pub const MONAD_MAINNET_CHAIN_ID: u64 = 10143; // TODO: Verify actual chain ID
+## Step 3: Rebuild and Redeploy
 
-// Timing constants
-pub const MONAD_BLOCK_TIME_MS: u64 = 1000;      // ~1 second blocks
-pub const MONAD_FINALITY_MS: u64 = 1000;        // Near-instant finality
+### 3.1 Compile Solidity
 
+```bash
+cd contracts
+forge build
+```
 
-// =============================================================================
-// PATCH 9: CARGO.TOML DEPENDENCIES (for reference)
-// =============================================================================
-/*
-[dependencies]
-ethers = { version = "2.0", features = ["ws", "rustls"] }
-tokio = { version = "1.0", features = ["full"] }
-futures = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-dotenv = "0.15"
-*/
+### 3.2 Deploy new contract
 
+```bash
+forge create --rpc-url $MONAD_RPC_URL --private-key $PRIVATE_KEY src/MonadAtomicArb.sol:MonadAtomicArb
+```
 
-// =============================================================================
-// QUICK REFERENCE: MONAD vs ETHEREUM PORTS
-// =============================================================================
-/*
-SERVICE          | ETHEREUM (GETH) | MONAD
------------------+-----------------+-------
-HTTP RPC         | 8545            | 8080
-WebSocket        | 8546            | 8081
-P2P              | 30303           | 8000
-Metrics          | 6060            | 9090
+### 3.3 Update config.rs
 
-CRITICAL: If your code uses 8545/8546, it will NOT connect to Monad!
-*/
+**File:** `src/config.rs`
+
+Update `ATOMIC_ARB_CONTRACT` with the new contract address:
+```rust
+pub const ATOMIC_ARB_CONTRACT: Address = alloy::primitives::address!("NEW_ADDRESS_HERE");
+```
+
+### 3.4 Setup approvals
+
+```bash
+cargo run -- contract-balance  # Verify new contract
+cargo run -- fund-contract --amount 0.5  # Fund with test amount
+```
+
+---
+
+## Step 4: Test
+
+```bash
+# Dry run first
+cargo run -- atomic-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 0.1 --slippage 200 --force
+
+# Check contract balances before and after
+cargo run -- contract-balance
+```
+
+**Expected Result:**
+- USDC balance should be ~0 after arb (all USDC used)
+- No USDC leakage between trades
+
+---
+
+## Summary of Changes
+
+| File | Change |
+|------|--------|
+| `contracts/src/MonadAtomicArb.sol` | New function signature, add `_buildBuyCalldata()`, query actual USDC balance |
+| `src/execution/atomic_arb.rs` | Remove `usdc_for_swap2` calculation, remove `buy_calldata` building, update call encoding |
+| `src/config.rs` | Update `ATOMIC_ARB_CONTRACT` after deployment |
+
+---
+
+## Key Points
+
+1. **Swap 1 calldata** is still built in Rust (no change needed)
+2. **Swap 2 calldata** is now built ON-CHAIN in Solidity after swap 1 completes
+3. The contract uses `IERC20(USDC).balanceOf(address(this))` to get the ACTUAL USDC available
+4. `minWmonOut` provides slippage protection for swap 2
+5. The fix uses 100% of available USDC balance, not an estimate
