@@ -35,6 +35,7 @@ mod node_config;
 mod nonce;
 mod pools;
 mod price;
+mod spread_filter;
 mod spread_tracker;
 mod stats;
 mod wallet;
@@ -54,6 +55,7 @@ use stats::{
 };
 use execution::{SwapParams, SwapDirection, execute_swap, print_swap_report, build_swap_calldata, wait_for_next_block, execute_fast_arb, print_fast_arb_result, execute_atomic_arb, print_atomic_arb_result, query_contract_balances};
 use execution::report::print_comparison_report;
+use spread_filter::{SpreadFilterConfig, FilterResult};
 use spread_tracker::SpreadTracker;
 use multicall::fetch_prices_batched;
 use nonce::init_nonce;
@@ -256,6 +258,18 @@ enum Commands {
         /// Minimum spread velocity (bps/sec) to trigger - 0 disables velocity filter
         #[arg(long, default_value = "0")]
         min_velocity: i32,
+
+        /// Maximum spread velocity (bps/sec) - skip if exceeded (bot signature)
+        #[arg(long, default_value = "100")]
+        max_velocity: i32,
+
+        /// Minimum final spread (bps) required for margin
+        #[arg(long, default_value = "9")]
+        min_final_spread: i32,
+
+        /// Maximum baseline spread (bps) - skip if already elevated
+        #[arg(long, default_value = "2")]
+        max_baseline: i32,
     },
 
     /// Production arbitrage bot with safety checks
@@ -1354,6 +1368,9 @@ async fn run_auto_arb(
     track_velocity: bool,
     history_size: usize,
     min_velocity: i32,
+    max_velocity: i32,
+    min_final_spread: i32,
+    max_baseline: i32,
 ) -> Result<()> {
     use chrono::Local;
 
@@ -1409,7 +1426,12 @@ async fn run_auto_arb(
     println!("  Dry run:         {}", dry_run);
     println!("  Stats file:      {}", stats_file);
     if track_velocity {
-        println!("  Velocity track:  enabled (history: {}, min_velocity: {} bps/sec)", history_size, min_velocity);
+        println!("  Velocity track:  enabled (history: {})", history_size);
+        println!("  Filter config:");
+        println!("    min_velocity:     {} bps/sec", min_velocity);
+        println!("    max_velocity:     {} bps/sec", max_velocity);
+        println!("    min_final_spread: {} bps", min_final_spread);
+        println!("    max_baseline:     {} bps", max_baseline);
     }
     println!("═══════════════════════════════════════════════════════════════");
     println!();
@@ -1496,13 +1518,24 @@ async fn run_auto_arb(
                     println!("    Range: {} to {} bps", analysis.min_spread_in_window, analysis.max_spread_in_window);
                 }
 
-                // Optional: Skip if velocity filter enabled and not a spike
-                if min_velocity > 0 {
+                // Apply smart spread filter if velocity tracking enabled
+                if track_velocity {
                     if let Some(ref analysis) = velocity_analysis {
-                        if analysis.velocity_bps_per_sec < min_velocity as f64 {
-                            println!("    SKIPPING: velocity {:.2} < threshold {} bps/sec",
-                                analysis.velocity_bps_per_sec, min_velocity);
-                            continue;
+                        let filter = SpreadFilterConfig {
+                            min_velocity: min_velocity as f64,
+                            max_velocity: max_velocity as f64,
+                            min_final_spread,
+                            max_baseline,
+                        };
+
+                        match filter.evaluate(analysis) {
+                            FilterResult::Execute => {
+                                println!("    FILTER: PASS - executing arb");
+                            }
+                            FilterResult::Skip { reason } => {
+                                println!("    FILTER: SKIP - {}", reason);
+                                continue;
+                            }
                         }
                     }
                 }
@@ -2340,8 +2373,11 @@ async fn main() -> Result<()> {
             track_velocity,
             history_size,
             min_velocity,
+            max_velocity,
+            min_final_spread,
+            max_baseline,
         }) => {
-            run_auto_arb(min_spread_bps, amount, slippage, max_executions, cooldown_secs, dry_run, force, track_velocity, history_size, min_velocity).await
+            run_auto_arb(min_spread_bps, amount, slippage, max_executions, cooldown_secs, dry_run, force, track_velocity, history_size, min_velocity, max_velocity, min_final_spread, max_baseline).await
         }
         Some(Commands::ProdArb {
             min_spread_bps,
