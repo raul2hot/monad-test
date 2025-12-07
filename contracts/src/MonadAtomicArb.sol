@@ -22,6 +22,13 @@ contract MonadAtomicArb {
     // Router enum matching Rust RouterType
     enum Router { Uniswap, PancakeSwap, MondayTrade, LFJ }
 
+    // LFJ Path struct for Liquidity Book routing
+    struct LFJPath {
+        uint256[] pairBinSteps;
+        uint8[] versions;
+        address[] tokenPath;
+    }
+
     error OnlyOwner();
     error SwapFailed(uint8 swapIndex);
     error Unprofitable(uint256 wmonBefore, uint256 wmonAfter);
@@ -68,25 +75,39 @@ contract MonadAtomicArb {
     }
 
     /// @notice Build exactInputSingle calldata for V3-style routers
-    /// @dev Works for Uniswap, PancakeSwap (wrapped in multicall), and Monday
+    /// @dev Each router has a different ABI for exactInputSingle
     function _buildBuyCalldata(
         Router router,
         uint256 amountIn,
         uint256 amountOutMin,
         uint24 fee
     ) internal view returns (bytes memory) {
-        if (router == Router.Uniswap || router == Router.MondayTrade) {
-            // Uniswap/Monday: exactInputSingle with deadline in struct (Monday) or not (Uniswap)
-            // For simplicity, use Uniswap format (no deadline in struct)
+        if (router == Router.Uniswap) {
+            // Uniswap SwapRouter02: exactInputSingle WITHOUT deadline in struct (7 fields)
+            // Selector: 0x04e45aaf
             return abi.encodeWithSelector(
-                bytes4(0x04e45aaf), // exactInputSingle selector
+                bytes4(0x04e45aaf),
                 USDC,              // tokenIn
                 WMON,              // tokenOut
                 fee,               // fee tier
                 address(this),     // recipient
                 amountIn,          // amountIn
                 amountOutMin,      // amountOutMinimum
-                uint160(0)         // sqrtPriceLimitX96 (0 = no limit)
+                uint160(0)         // sqrtPriceLimitX96
+            );
+        } else if (router == Router.MondayTrade) {
+            // MondayTrade uses original ISwapRouter: deadline IS in struct (8 fields)
+            // Selector: 0x414bf389
+            return abi.encodeWithSelector(
+                bytes4(0x414bf389),
+                USDC,              // tokenIn
+                WMON,              // tokenOut
+                fee,               // fee tier
+                address(this),     // recipient
+                block.timestamp + 300, // deadline (INSIDE struct for Monday!)
+                amountIn,          // amountIn
+                amountOutMin,      // amountOutMinimum
+                uint160(0)         // sqrtPriceLimitX96
             );
         } else if (router == Router.PancakeSwap) {
             // PancakeSwap: wrap in multicall(deadline, data[])
@@ -108,23 +129,28 @@ contract MonadAtomicArb {
                 calls
             );
         } else if (router == Router.LFJ) {
-            // LFJ: swapExactTokensForTokens with Path struct
-            // Path: pairBinSteps[], versions[], tokenPath[]
+            // LFJ: swapExactTokensForTokens(uint256, uint256, Path memory, address, uint256)
+            // Path struct must be encoded as a single struct, NOT separate arrays
             uint256[] memory binSteps = new uint256[](1);
             binSteps[0] = uint256(fee); // fee is binStep for LFJ
             uint8[] memory versions = new uint8[](1);
             versions[0] = 3; // V2_2
-            address[] memory path = new address[](2);
-            path[0] = USDC;
-            path[1] = WMON;
+            address[] memory tokenPath = new address[](2);
+            tokenPath[0] = USDC;
+            tokenPath[1] = WMON;
+
+            // Create the Path struct
+            LFJPath memory lfjPath = LFJPath({
+                pairBinSteps: binSteps,
+                versions: versions,
+                tokenPath: tokenPath
+            });
 
             return abi.encodeWithSelector(
                 bytes4(0x4b126ad4), // swapExactTokensForTokens selector
                 amountIn,
                 amountOutMin,
-                binSteps,
-                versions,
-                path,
+                lfjPath,           // Pass as struct, not separate arrays!
                 address(this),
                 block.timestamp + 300
             );
