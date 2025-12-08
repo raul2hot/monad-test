@@ -57,7 +57,7 @@ pub fn init_arb_log() -> PathBuf {
 }
 
 /// Represents an arbitrage opportunity between two pools
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SpreadOpportunity {
     pub buy_pool: String,
     pub buy_price: f64,
