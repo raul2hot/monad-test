@@ -30,6 +30,7 @@ mod config;
 mod display;
 mod execution;
 mod health;
+mod mev_validation;
 mod multicall;
 mod node_config;
 mod nonce;
@@ -323,6 +324,13 @@ enum Commands {
         /// Revert method: "zero" (0 amount), "huge" (impossibly large amount), "minout" (impossible min output)
         #[arg(long, default_value = "minout")]
         method: String,
+    },
+
+    /// MEV validation - observe block timing and spread persistence (Phase 1)
+    MevValidate {
+        /// Duration to run validation in seconds
+        #[arg(long, default_value = "300")]
+        duration: u64,
     },
 }
 
@@ -2537,6 +2545,13 @@ async fn run_contract_balance() -> Result<()> {
     Ok(())
 }
 
+async fn run_mev_validate(duration: u64) -> Result<()> {
+    let node_config = NodeConfig::from_env();
+    node_config.log_config();
+
+    mev_validation::run_mev_validation(&node_config.rpc_url, &node_config.ws_url, duration).await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -2624,6 +2639,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::TestRevert { dex, gas_limit, method }) => {
             run_test_revert(&dex, gas_limit, &method).await
+        }
+        Some(Commands::MevValidate { duration }) => {
+            run_mev_validate(duration).await
         }
     }
 }
