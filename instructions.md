@@ -1,854 +1,757 @@
-# Console Display Enhancement Instructions
+# MEV Validation Console Logging Improvements
 
-## Objective
-Improve the console display system for the Monad MEV arbitrage bot to provide real-time, actionable visibility into spread opportunities when spreads exceed 5bps threshold.
+## Executive Summary
 
-## Current State Analysis
+The current `mev-validate` output is noisy and fails to provide actionable insights. This document provides detailed instructions for Claude Code Opus to refactor the logging system into a clean, insightful dashboard.
 
-### Existing Display Components
-
-1. **`src/display.rs`** - Main price monitor display
-   - `display_prices()` - Clears screen and shows current prices + spreads
-   - `calculate_spreads()` - Computes all pairwise spread opportunities
-   - `log_arb_opportunities()` - Logs spreads > 10bps to file
-   - Problem: Screen clears every cycle, losing history
-
-2. **`src/mev_validation.rs`** - Block lifecycle tracking
-   - Shows spreads at Proposed/Finalized states
-   - Uses `\r` carriage return for in-place updates
-   - Problem: Only shows during mev-validate command
-
-3. **`src/main.rs`** - CLI and monitoring loops
-   - `run_monitor()` - Price polling loop
-   - `run_auto_arb()` - Automated arb with spread display
-   - Problem: Inconsistent display formats across commands
-
-4. **`src/spread_tracker.rs`** - Velocity tracking
-   - Ring buffer for spread history
-   - `VelocityAnalysis` - Calculates spread velocity/acceleration
-   - Problem: Only used in auto-arb, not visible in monitor
-
-### Current Pain Points
-- Screen clearing loses spread history
-- No visual distinction between actionable vs noise spreads
-- No trend/velocity visualization in monitor mode
-- Hard to correlate spread spikes with block events
-- No persistent "spread dashboard" view
-
----
-
-## Implementation Requirements
-
-### Phase 1: Enhanced Spread Display Module
-
-Create new file: `src/spread_display.rs`
-
-```rust
-//! Enhanced spread display with real-time tracking and visualization
-//! 
-//! Features:
-//! - Non-clearing display (uses cursor positioning)
-//! - Color-coded spread levels (green/yellow/red)
-//! - Trend arrows showing direction
-//! - Mini sparkline for recent history
-//! - Actionable alerts when threshold exceeded
-
-use std::collections::VecDeque;
-use std::io::{Write, stdout};
-use chrono::Local;
-
-/// Spread alert levels for color coding
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpreadLevel {
-    Dead,       // < 0 bps (negative)
-    Noise,      // 0-5 bps
-    Watching,   // 5-10 bps
-    Ready,      // 10-15 bps
-    Hot,        // 15-25 bps
-    Critical,   // > 25 bps
-}
-
-impl SpreadLevel {
-    pub fn from_bps(spread_bps: i32) -> Self {
-        match spread_bps {
-            x if x < 0 => Self::Dead,
-            0..=4 => Self::Noise,
-            5..=9 => Self::Watching,
-            10..=14 => Self::Ready,
-            15..=24 => Self::Hot,
-            _ => Self::Critical,
-        }
-    }
-    
-    pub fn color_code(&self) -> &'static str {
-        match self {
-            Self::Dead => "\x1b[90m",      // Gray
-            Self::Noise => "\x1b[37m",     // White
-            Self::Watching => "\x1b[33m",  // Yellow
-            Self::Ready => "\x1b[32m",     // Green
-            Self::Hot => "\x1b[1;32m",     // Bold Green
-            Self::Critical => "\x1b[1;5;32m", // Bold Blinking Green
-        }
-    }
-    
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Dead => "DEAD",
-            Self::Noise => "NOISE",
-            Self::Watching => "WATCH",
-            Self::Ready => "READY",
-            Self::Hot => "HOT!",
-            Self::Critical => "GO GO GO",
-        }
-    }
-}
-
-/// Trend direction based on recent spread changes
-#[derive(Debug, Clone, Copy)]
-pub enum Trend {
-    Rising,     // Spread increasing
-    Stable,     // Within ±1 bps
-    Falling,    // Spread decreasing
-}
-
-impl Trend {
-    pub fn arrow(&self) -> &'static str {
-        match self {
-            Self::Rising => "↑",
-            Self::Stable => "→",
-            Self::Falling => "↓",
-        }
-    }
-    
-    pub fn color(&self) -> &'static str {
-        match self {
-            Self::Rising => "\x1b[32m",   // Green (good - opportunity growing)
-            Self::Stable => "\x1b[33m",   // Yellow
-            Self::Falling => "\x1b[31m",  // Red (bad - opportunity shrinking)
-        }
-    }
-}
-
-/// Single spread observation
-#[derive(Debug, Clone)]
-pub struct SpreadObs {
-    pub timestamp_ms: u128,
-    pub buy_pool: String,
-    pub sell_pool: String,
-    pub net_spread_bps: i32,
-}
-
-/// History buffer for a specific pool pair
-pub struct PairHistory {
-    pub pair_key: String,  // "BuyPool→SellPool"
-    pub history: VecDeque<i32>,  // Last N spread values in bps
-    pub capacity: usize,
-}
-
-impl PairHistory {
-    pub fn new(key: String, capacity: usize) -> Self {
-        Self {
-            pair_key: key,
-            history: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-    
-    pub fn push(&mut self, spread_bps: i32) {
-        if self.history.len() >= self.capacity {
-            self.history.pop_front();
-        }
-        self.history.push_back(spread_bps);
-    }
-    
-    pub fn trend(&self) -> Trend {
-        if self.history.len() < 2 {
-            return Trend::Stable;
-        }
-        let recent: Vec<_> = self.history.iter().rev().take(3).collect();
-        let avg_recent = recent.iter().map(|&&x| x).sum::<i32>() / recent.len() as i32;
-        let oldest = *self.history.front().unwrap_or(&0);
-        
-        match avg_recent - oldest {
-            d if d > 1 => Trend::Rising,
-            d if d < -1 => Trend::Falling,
-            _ => Trend::Stable,
-        }
-    }
-    
-    /// Generate mini sparkline (last 10 values)
-    pub fn sparkline(&self) -> String {
-        const CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-        
-        let values: Vec<i32> = self.history.iter().rev().take(10).rev().copied().collect();
-        if values.is_empty() {
-            return String::from("...........");
-        }
-        
-        let min = *values.iter().min().unwrap_or(&0);
-        let max = *values.iter().max().unwrap_or(&1);
-        let range = (max - min).max(1);
-        
-        values.iter().map(|&v| {
-            let idx = ((v - min) * 7 / range).clamp(0, 7) as usize;
-            CHARS[idx]
-        }).collect()
-    }
-}
-
-/// Main display state manager
-pub struct SpreadDisplay {
-    /// History per pool pair
-    pub pair_histories: std::collections::HashMap<String, PairHistory>,
-    /// Display threshold in bps
-    pub min_display_bps: i32,
-    /// History capacity per pair
-    pub history_size: usize,
-    /// Last display update time
-    pub last_update: std::time::Instant,
-    /// Block number at last update
-    pub last_block: u64,
-    /// Alert sound enabled
-    pub alert_sound: bool,
-}
-
-impl SpreadDisplay {
-    pub fn new(min_display_bps: i32, history_size: usize) -> Self {
-        Self {
-            pair_histories: std::collections::HashMap::new(),
-            min_display_bps,
-            history_size,
-            last_update: std::time::Instant::now(),
-            last_block: 0,
-            alert_sound: true,
-        }
-    }
-    
-    /// Update with new spread data
-    pub fn update(&mut self, spreads: &[crate::display::SpreadOpportunity]) {
-        for spread in spreads {
-            let key = format!("{}→{}", spread.buy_pool, spread.sell_pool);
-            let net_bps = (spread.net_spread_pct * 100.0) as i32;
-            
-            let history = self.pair_histories
-                .entry(key.clone())
-                .or_insert_with(|| PairHistory::new(key, self.history_size));
-            
-            history.push(net_bps);
-        }
-        self.last_update = std::time::Instant::now();
-    }
-    
-    /// Render the display (non-clearing)
-    pub fn render(&self, block_number: Option<u64>) -> String {
-        let mut output = String::new();
-        let now = Local::now().format("%H:%M:%S%.3f");
-        
-        // Header line with block info
-        output.push_str(&format!(
-            "\x1b[2K\r\x1b[1;36m[{}] Block: {} | Pairs: {} | Filter: >{}bps\x1b[0m\n",
-            now,
-            block_number.map(|b| b.to_string()).unwrap_or_else(|| "?".to_string()),
-            self.pair_histories.len(),
-            self.min_display_bps
-        ));
-        
-        // Collect and sort by spread
-        let mut active_pairs: Vec<_> = self.pair_histories.iter()
-            .filter_map(|(key, hist)| {
-                let last = *hist.history.back()?;
-                if last >= self.min_display_bps {
-                    Some((key, hist, last))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        
-        active_pairs.sort_by(|a, b| b.2.cmp(&a.2));  // Sort descending by spread
-        
-        if active_pairs.is_empty() {
-            output.push_str(&format!(
-                "\x1b[2K  \x1b[90mNo spreads above {}bps threshold\x1b[0m\n",
-                self.min_display_bps
-            ));
-        } else {
-            // Column headers
-            output.push_str("\x1b[2K  \x1b[1m");
-            output.push_str(&format!("{:<25} {:>8} {:>6} {:>3} {:>12} {:>8}\x1b[0m\n",
-                "PAIR", "NET BPS", "LEVEL", "→", "SPARKLINE", "AGE"
-            ));
-            output.push_str(&format!("\x1b[2K  {}\n", "─".repeat(70)));
-            
-            for (key, hist, last_bps) in active_pairs.iter().take(10) {
-                let level = SpreadLevel::from_bps(*last_bps);
-                let trend = hist.trend();
-                let sparkline = hist.sparkline();
-                let color = level.color_code();
-                let trend_color = trend.color();
-                
-                output.push_str(&format!(
-                    "\x1b[2K  {}{:<25}\x1b[0m {:>+8} {}{:>6}\x1b[0m {}{:>3}\x1b[0m {:>12} {:>8}\n",
-                    color, key,
-                    last_bps,
-                    color, level.label(),
-                    trend_color, trend.arrow(),
-                    sparkline,
-                    format!("{}ms", self.last_update.elapsed().as_millis())
-                ));
-            }
-        }
-        
-        // Footer with legend
-        output.push_str(&format!("\x1b[2K  {}\n", "─".repeat(70)));
-        output.push_str("\x1b[2K  \x1b[90mLevels: ");
-        output.push_str("\x1b[37mNOISE(<5)\x1b[90m | ");
-        output.push_str("\x1b[33mWATCH(5-9)\x1b[90m | ");
-        output.push_str("\x1b[32mREADY(10-14)\x1b[90m | ");
-        output.push_str("\x1b[1;32mHOT(15-24)\x1b[90m | ");
-        output.push_str("\x1b[1;5;32mGO(25+)\x1b[0m\n");
-        
-        output
-    }
-    
-    /// Render single-line status (for non-interactive mode)
-    pub fn render_oneline(&self) -> String {
-        let best = self.pair_histories.iter()
-            .filter_map(|(key, hist)| {
-                let last = *hist.history.back()?;
-                Some((key, last))
-            })
-            .max_by_key(|(_, spread)| *spread);
-        
-        match best {
-            Some((key, spread)) => {
-                let level = SpreadLevel::from_bps(spread);
-                format!(
-                    "{}[{:>+4}bps] {:<25} {}\x1b[0m",
-                    level.color_code(),
-                    spread,
-                    key,
-                    level.label()
-                )
-            }
-            None => String::from("\x1b[90mNo active spreads\x1b[0m"),
-        }
-    }
-}
+**Current Output (Problematic):**
+```
+[BLOCK 40711430] Δt=616ms
+  Spread: 1bps → -7bps (-8Δ)
+  Pair: MondayTrade → PancakeSwap1
+  Status: GONE - CAPTURED
+[DEBUG] Block 40711431 Finalized: proposed=true, finalized=true
 ```
 
-### Phase 2: Update Monitor Command
-
-Modify `src/main.rs` `run_monitor()` function:
-
-```rust
-async fn run_monitor() -> Result<()> {
-    // ... existing setup ...
-    
-    // NEW: Initialize spread display
-    let mut spread_display = spread_display::SpreadDisplay::new(5, 20);  // 5bps threshold, 20 history
-    
-    // NEW: Terminal mode selection
-    let interactive = std::env::var("TERM").is_ok() && atty::is(atty::Stream::Stdout);
-    
-    if interactive {
-        // Enter alternate screen buffer for clean display
-        print!("\x1b[?1049h");  // Enter alternate screen
-        print!("\x1b[?25l");    // Hide cursor
-    }
-    
-    loop {
-        poll_interval.tick().await;
-        
-        match fetch_prices_batched(&provider, price_calls.clone()).await {
-            Ok((prices, elapsed_ms)) => {
-                let spreads = calculate_spreads(&prices);
-                spread_display.update(&spreads);
-                
-                if interactive {
-                    // Move cursor to top and render
-                    print!("\x1b[H");  // Move to home
-                    print!("{}", spread_display.render(None));
-                    stdout().flush().ok();
-                } else {
-                    // Non-interactive: single line update
-                    print!("\r{}", spread_display.render_oneline());
-                    stdout().flush().ok();
-                }
-            }
-            Err(e) => {
-                eprintln!("\x1b[31mError: {}\x1b[0m", e);
-            }
-        }
-    }
-    
-    // Cleanup on exit (Ctrl+C handler needed)
-    if interactive {
-        print!("\x1b[?1049l");  // Exit alternate screen
-        print!("\x1b[?25h");    // Show cursor
-    }
-    
-    Ok(())
-}
-```
-
-### Phase 3: Create Live Dashboard View
-
-Add new CLI command `dashboard`:
-
-```rust
-/// Live spread dashboard with detailed visualization
-Dashboard {
-    /// Minimum spread to display (bps)
-    #[arg(long, default_value = "5")]
-    min_spread: i32,
-    
-    /// History depth per pair
-    #[arg(long, default_value = "30")]
-    history: usize,
-    
-    /// Refresh rate in milliseconds
-    #[arg(long, default_value = "100")]
-    refresh_ms: u64,
-    
-    /// Enable sound alerts for HOT+ spreads
-    #[arg(long, default_value = "false")]
-    sound: bool,
-    
-    /// WebSocket mode (uses monadNewHeads for block-aligned updates)
-    #[arg(long, default_value = "false")]
-    ws: bool,
-}
-```
-
-Implement `run_dashboard()`:
-
-```rust
-async fn run_dashboard(min_spread: i32, history: usize, refresh_ms: u64, sound: bool, ws: bool) -> Result<()> {
-    let node_config = NodeConfig::from_env();
-    
-    // Setup display
-    let mut display = spread_display::SpreadDisplay::new(min_spread, history);
-    display.alert_sound = sound;
-    
-    // Enter alternate screen
-    print!("\x1b[?1049h\x1b[?25l\x1b[H");
-    
-    // Install Ctrl+C handler to restore terminal
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })?;
-    
-    if ws {
-        // WebSocket mode: update on each block
-        run_dashboard_ws(&mut display, &node_config, running).await?;
-    } else {
-        // Polling mode
-        run_dashboard_polling(&mut display, &node_config, refresh_ms, running).await?;
-    }
-    
-    // Restore terminal
-    print!("\x1b[?1049l\x1b[?25h");
-    
-    Ok(())
-}
-
-async fn run_dashboard_polling(
-    display: &mut SpreadDisplay,
-    config: &NodeConfig,
-    refresh_ms: u64,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let url: reqwest::Url = config.rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url);
-    
-    let price_calls = build_price_calls();  // Extract from main.rs
-    let mut interval = tokio::time::interval(Duration::from_millis(refresh_ms));
-    
-    while running.load(Ordering::SeqCst) {
-        interval.tick().await;
-        
-        let block_num = provider.get_block_number().await.ok();
-        
-        match fetch_prices_batched(&provider, price_calls.clone()).await {
-            Ok((prices, _)) => {
-                let spreads = calculate_spreads(&prices);
-                display.update(&spreads);
-                
-                // Render dashboard
-                print!("\x1b[H");  // Home
-                print!("{}", render_full_dashboard(display, &prices, block_num));
-                stdout().flush().ok();
-                
-                // Sound alert for HOT+ spreads
-                if display.alert_sound {
-                    if let Some(best) = spreads.first() {
-                        let bps = (best.net_spread_pct * 100.0) as i32;
-                        if bps >= 15 {
-                            print!("\x07");  // Terminal bell
-                        }
-                    }
-                }
-            }
-            Err(_) => {}
-        }
-    }
-    
-    Ok(())
-}
-
-fn render_full_dashboard(display: &SpreadDisplay, prices: &[PoolPrice], block: Option<u64>) -> String {
-    let mut out = String::new();
-    let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-    
-    // ═══════════════ HEADER ═══════════════
-    out.push_str("\x1b[2K\x1b[1;36m");
-    out.push_str("╔══════════════════════════════════════════════════════════════════════════╗\n");
-    out.push_str("\x1b[2K║                    MONAD MEV SPREAD DASHBOARD                           ║\n");
-    out.push_str("\x1b[2K╠══════════════════════════════════════════════════════════════════════════╣\n");
-    out.push_str(&format!("\x1b[2K║  {} │ Block: {:>12} │ Latency: {:>4}ms                ║\n",
-        now,
-        block.map(|b| b.to_string()).unwrap_or("?".into()),
-        display.last_update.elapsed().as_millis()
-    ));
-    out.push_str("\x1b[2K╠══════════════════════════════════════════════════════════════════════════╣\x1b[0m\n");
-    
-    // ═══════════════ PRICES SECTION ═══════════════
-    out.push_str("\x1b[2K\x1b[1m  CURRENT PRICES (USDC/WMON)\x1b[0m\n");
-    out.push_str("\x1b[2K  ─────────────────────────────────────────────────────────────────────\n");
-    
-    let mut sorted_prices = prices.to_vec();
-    sorted_prices.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-    
-    let best_price = sorted_prices.first().map(|p| p.price).unwrap_or(0.0);
-    
-    for (i, price) in sorted_prices.iter().enumerate() {
-        let diff_pct = if best_price > 0.0 {
-            ((price.price - best_price) / best_price) * 100.0
-        } else { 0.0 };
-        
-        let marker = if i == 0 { "\x1b[1;32m★\x1b[0m" } else { " " };
-        let diff_str = if i == 0 {
-            "\x1b[1;32mBEST\x1b[0m".to_string()
-        } else {
-            format!("\x1b[33m{:+.2}%\x1b[0m", diff_pct)
-        };
-        
-        out.push_str(&format!(
-            "\x1b[2K  {} {:<14} │ {:>12.6} │ {:>10} │ Fee: {:.2}%\n",
-            marker,
-            price.pool_name,
-            price.price,
-            diff_str,
-            price.fee_bps as f64 / 100.0
-        ));
-    }
-    
-    // ═══════════════ SPREADS SECTION ═══════════════
-    out.push_str("\x1b[2K\n");
-    out.push_str("\x1b[2K\x1b[1m  SPREAD OPPORTUNITIES\x1b[0m\n");
-    out.push_str("\x1b[2K  ─────────────────────────────────────────────────────────────────────\n");
-    out.push_str(&format!("\x1b[2K  {:<26} {:>8} {:>7} {:>3} {:>12} {:>10}\n",
-        "PAIR", "NET", "LEVEL", "", "TREND", "ACTION"
-    ));
-    out.push_str("\x1b[2K  ─────────────────────────────────────────────────────────────────────\n");
-    
-    // Get active pairs sorted by spread
-    let mut pairs: Vec<_> = display.pair_histories.iter()
-        .filter_map(|(k, h)| {
-            let last = *h.history.back()?;
-            Some((k.clone(), h.clone(), last))
-        })
-        .collect();
-    pairs.sort_by(|a, b| b.2.cmp(&a.2));
-    
-    for (key, hist, spread_bps) in pairs.iter().take(8) {
-        let level = SpreadLevel::from_bps(*spread_bps);
-        let trend = hist.trend();
-        let sparkline = hist.sparkline();
-        
-        let action = match level {
-            SpreadLevel::Critical | SpreadLevel::Hot => "\x1b[1;32mEXECUTE\x1b[0m",
-            SpreadLevel::Ready => "\x1b[32mREADY\x1b[0m",
-            SpreadLevel::Watching => "\x1b[33mMONITOR\x1b[0m",
-            _ => "\x1b[90m-\x1b[0m",
-        };
-        
-        out.push_str(&format!(
-            "\x1b[2K  {}{:<26}\x1b[0m {:>+8} {}{:>7}\x1b[0m {}{:>3}\x1b[0m {:>12} {:>10}\n",
-            level.color_code(),
-            key,
-            spread_bps,
-            level.color_code(),
-            level.label(),
-            trend.color(),
-            trend.arrow(),
-            sparkline,
-            action
-        ));
-    }
-    
-    // Fill remaining rows with empty lines for consistent height
-    for _ in pairs.len()..8 {
-        out.push_str("\x1b[2K\n");
-    }
-    
-    // ═══════════════ FOOTER ═══════════════
-    out.push_str("\x1b[2K\x1b[1;36m╠══════════════════════════════════════════════════════════════════════════╣\x1b[0m\n");
-    out.push_str("\x1b[2K  \x1b[90mKeys: q=quit │ s=sound toggle │ +=increase threshold │ -=decrease\x1b[0m\n");
-    out.push_str("\x1b[2K\x1b[1;36m╚══════════════════════════════════════════════════════════════════════════╝\x1b[0m\n");
-    
-    out
-}
-```
-
-### Phase 4: Update Existing Commands
-
-#### 4.1 Update `run_auto_arb()` display
-
-Replace the current `print!("\r...")` pattern with:
-
-```rust
-// In the main loop of run_auto_arb:
-if let Some(spread) = best_spread {
-    spread_display.update(&spreads);
-    
-    // Enhanced single-line display with more context
-    let level = SpreadLevel::from_bps((spread.net_spread_pct * 100.0) as i32);
-    let trend = spread_display.pair_histories
-        .get(&format!("{}→{}", spread.buy_pool, spread.sell_pool))
-        .map(|h| h.trend())
-        .unwrap_or(Trend::Stable);
-    
-    print!("\r\x1b[2K");
-    print!("[{}] ", Local::now().format("%H:%M:%S"));
-    print!("{}{:<20}\x1b[0m ", level.color_code(), 
-        format!("{}→{}", spread.buy_pool, spread.sell_pool));
-    print!("{:>+6}bps ", (spread.net_spread_pct * 100.0) as i32);
-    print!("{}{}\x1b[0m ", trend.color(), trend.arrow());
-    print!("{}{:>6}\x1b[0m ", level.color_code(), level.label());
-    
-    // Show sparkline if we have history
-    if let Some(hist) = spread_display.pair_histories
-        .get(&format!("{}→{}", spread.buy_pool, spread.sell_pool)) {
-        print!("[{}] ", hist.sparkline());
-    }
-    
-    // Show P&L if tracking
-    print!("P&L: {:>+.4} WMON ", cumulative_pnl);
-    
-    stdout().flush().ok();
-}
-```
-
-#### 4.2 Update `mev_validation` display
-
-Enhance the MEV validation output to show spread evolution:
-
-```rust
-// In handle_block() for Finalized state:
-if lifecycle.is_complete() {
-    lifecycle.compute_analysis();
-    
-    let spread_proposed = lifecycle.spread_at_proposed_bps.unwrap_or(0);
-    let spread_final = lifecycle.spread_at_finalized_bps.unwrap_or(0);
-    let delta = lifecycle.spread_delta_bps.unwrap_or(0);
-    
-    // Color-coded output
-    let proposed_color = SpreadLevel::from_bps(spread_proposed).color_code();
-    let final_color = SpreadLevel::from_bps(spread_final).color_code();
-    let delta_color = if delta > 0 { "\x1b[32m" } else if delta < 0 { "\x1b[31m" } else { "\x1b[33m" };
-    
-    println!();
-    println!("\x1b[1m[BLOCK {}]\x1b[0m Δt={}ms", 
-        lifecycle.block_number,
-        lifecycle.proposed_to_finalized_ms.unwrap_or(0));
-    println!("  Spread: {}{}bps\x1b[0m → {}{}bps\x1b[0m ({}{}Δ\x1b[0m)",
-        proposed_color, spread_proposed,
-        final_color, spread_final,
-        delta_color, format!("{:+}", delta));
-    
-    if let Some(ref pair) = lifecycle.proposed.as_ref().and_then(|p| p.best_pair.clone()) {
-        println!("  Pair: {} → {}", pair.0, pair.1);
-    }
-    
-    let status = if lifecycle.spread_persisted.unwrap_or(false) {
-        "\x1b[1;32mPERSISTED - ACTIONABLE\x1b[0m"
-    } else if spread_final > 0 {
-        "\x1b[33mDECAYED - PARTIAL\x1b[0m"
-    } else {
-        "\x1b[31mGONE - CAPTURED\x1b[0m"
-    };
-    println!("  Status: {}", status);
-}
-```
-
-### Phase 5: Add Logging Integration
-
-Create `src/spread_logger.rs` for persistent spread data:
-
-```rust
-//! Spread event logging for analysis
-
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use serde::Serialize;
-use chrono::Local;
-
-#[derive(Debug, Serialize)]
-pub struct SpreadEvent {
-    pub timestamp: String,
-    pub block_number: Option<u64>,
-    pub buy_pool: String,
-    pub sell_pool: String,
-    pub buy_price: f64,
-    pub sell_price: f64,
-    pub gross_spread_bps: i32,
-    pub net_spread_bps: i32,
-    pub level: String,
-    pub trend: String,
-    pub velocity_bps_sec: Option<f64>,
-}
-
-pub struct SpreadLogger {
-    writer: BufWriter<File>,
-}
-
-impl SpreadLogger {
-    pub fn new(filename: &str) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(filename)?;
-        Ok(Self {
-            writer: BufWriter::new(file),
-        })
-    }
-    
-    pub fn log(&mut self, event: &SpreadEvent) {
-        if let Ok(json) = serde_json::to_string(event) {
-            let _ = writeln!(self.writer, "{}", json);
-            let _ = self.writer.flush();
-        }
-    }
-}
-
-// Log spread events when they exceed threshold
-impl SpreadDisplay {
-    pub fn log_significant_spreads(&self, logger: &mut SpreadLogger, block: Option<u64>) {
-        for (key, hist) in &self.pair_histories {
-            if let Some(&spread_bps) = hist.history.back() {
-                if spread_bps >= 10 {  // Log spreads >= 10bps
-                    let parts: Vec<_> = key.split('→').collect();
-                    let event = SpreadEvent {
-                        timestamp: Local::now().to_rfc3339(),
-                        block_number: block,
-                        buy_pool: parts.get(0).unwrap_or(&"").to_string(),
-                        sell_pool: parts.get(1).unwrap_or(&"").to_string(),
-                        buy_price: 0.0,  // Fill from prices
-                        sell_price: 0.0,
-                        gross_spread_bps: spread_bps + 10,  // Approximate
-                        net_spread_bps: spread_bps,
-                        level: SpreadLevel::from_bps(spread_bps).label().to_string(),
-                        trend: format!("{}", hist.trend().arrow()),
-                        velocity_bps_sec: None,  // Fill from analysis
-                    };
-                    logger.log(&event);
-                }
-            }
-        }
-    }
-}
-```
-
----
-
-## File Changes Summary
-
-### New Files to Create
-1. `src/spread_display.rs` - Enhanced display module (Phase 1)
-2. `src/spread_logger.rs` - Persistent spread logging (Phase 5)
-
-### Files to Modify
-1. `src/main.rs`:
-   - Add `mod spread_display; mod spread_logger;`
-   - Add `Dashboard` command enum variant
-   - Update `run_monitor()` to use `SpreadDisplay`
-   - Add `run_dashboard()` function
-   - Update `run_auto_arb()` display logic
-   
-2. `src/mev_validation.rs`:
-   - Update `handle_block()` display formatting
-   - Add color-coded spread evolution output
-   
-3. `src/display.rs`:
-   - Export `SpreadOpportunity` struct (make pub if not already)
-   - Add `impl Clone for SpreadOpportunity` if missing
-
-4. `Cargo.toml`:
-   - Add `ctrlc = "3.4"` for Ctrl+C handling
-   - Add `atty = "0.2"` for terminal detection
-
----
-
-## Testing Checklist
-
-1. [ ] `cargo run -- monitor` shows enhanced spread display
-2. [ ] `cargo run -- dashboard --min-spread 5` renders full dashboard
-3. [ ] Spreads > 5bps show in yellow (WATCH)
-4. [ ] Spreads > 10bps show in green (READY)
-5. [ ] Spreads > 15bps show in bold green (HOT)
-6. [ ] Trend arrows update correctly (↑/→/↓)
-7. [ ] Sparklines show last 10 values
-8. [ ] Terminal restores correctly on Ctrl+C
-9. [ ] Non-interactive mode (piped output) shows single-line
-10. [ ] `mev-validate` shows color-coded spread evolution
-11. [ ] Spread events logged to JSONL when > 10bps
-12. [ ] Auto-arb shows enhanced inline display
-
----
-
-## Example Output
-
-### Dashboard Mode
+**Target Output (Clean Dashboard):**
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
-║                    MONAD MEV SPREAD DASHBOARD                           ║
+║  MEV VALIDATION │ Runtime: 05:23 │ Blocks: 324 │ Filter: >10bps          ║
 ╠══════════════════════════════════════════════════════════════════════════╣
-║  2025-12-08 14:32:15.234 │ Block:      1234567 │ Latency:   23ms        ║
+║  TIMING          │ OPPORTUNITIES          │ COMPETITION                  ║
+║  Avg: 742ms      │ Actionable: 23/324     │ Persisted: 8 (34.8%)        ║
+║  Min: 498ms      │ Max Seen: +18bps       │ Captured: 12 (52.2%)        ║
+║  Window: 398ms   │ Avg Decay: -6.2bps     │ Decayed: 3 (13.0%)          ║
 ╠══════════════════════════════════════════════════════════════════════════╣
-  CURRENT PRICES (USDC/WMON)
-  ─────────────────────────────────────────────────────────────────────
-  ★ Uniswap        │     0.037254 │       BEST │ Fee: 0.30%
-    PancakeSwap1   │     0.037198 │     -0.15% │ Fee: 0.05%
-    MondayTrade    │     0.037156 │     -0.26% │ Fee: 0.05%
-    PancakeSwap2   │     0.037142 │     -0.30% │ Fee: 0.25%
-    LFJ            │     0.037089 │     -0.44% │ Fee: 0.10%
-
-  SPREAD OPPORTUNITIES
-  ─────────────────────────────────────────────────────────────────────
-  PAIR                         NET   LEVEL   →       TREND     ACTION
-  ─────────────────────────────────────────────────────────────────────
-  PancakeSwap1→Uniswap         +12   READY   ↑    ▂▃▄▅▆▇█▇▆▇     READY
-  LFJ→Uniswap                   +9   WATCH   →    ▄▄▄▅▅▅▅▅▅▅   MONITOR
-  MondayTrade→Uniswap           +7   WATCH   ↓    ▆▆▅▅▄▄▃▃▂▂   MONITOR
-  PancakeSwap1→PancakeSwap2     +4   NOISE   →    ▃▃▃▃▃▃▃▃▃▃         -
+║  RECENT ACTIONABLE (showing only >10bps at Proposed)                     ║
+║  #40711428 │ 733ms │ Uniswap→LFJ │ +15→+3bps │ ▼ DECAYED                 ║
+║  #40711427 │ 790ms │ Uniswap→LFJ │ +18→ 0bps │ ▼ CAPTURED                ║
 ╠══════════════════════════════════════════════════════════════════════════╣
-  Keys: q=quit │ s=sound toggle │ +=increase threshold │ -=decrease
+║  INSIGHT: 52% captured by competitors. Need <398ms execution or mempool  ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 ```
 
-### Single-Line Mode (non-interactive)
-```
-[+12bps] PancakeSwap1→Uniswap    READY ↑
+---
+
+## Part 1: Code Changes to `src/mev_validation.rs`
+
+### 1.1 Remove Debug Output
+
+**Location**: Around line 234 in `handle_block()` method
+
+```rust
+// DELETE THIS BLOCK:
+eprintln!("[DEBUG] Block {} Finalized: proposed={}, finalized={}",
+    block_num,
+    lifecycle.proposed.is_some(),
+    lifecycle.finalized.is_some());
 ```
 
-### MEV Validation Mode
+### 1.2 Add New Types for Classification
+
+Add these types after the existing `CommitState` enum:
+
+```rust
+/// Classification of spread at Proposed state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpreadTier {
+    Noise,       // < 5 bps - ignore
+    SubThreshold, // 5-9 bps - watch only
+    Marginal,    // 10-14 bps - maybe actionable
+    Actionable,  // 15-24 bps - execute
+    Critical,    // 25+ bps - priority execute
+}
+
+impl SpreadTier {
+    pub fn from_bps(bps: i32) -> Self {
+        match bps {
+            x if x < 5 => Self::Noise,
+            5..=9 => Self::SubThreshold,
+            10..=14 => Self::Marginal,
+            15..=24 => Self::Actionable,
+            _ => Self::Critical,
+        }
+    }
+
+    pub fn is_actionable(&self) -> bool {
+        matches!(self, Self::Marginal | Self::Actionable | Self::Critical)
+    }
+
+    pub fn color(&self) -> &'static str {
+        match self {
+            Self::Noise => "\x1b[90m",        // Gray
+            Self::SubThreshold => "\x1b[37m", // White
+            Self::Marginal => "\x1b[33m",     // Yellow
+            Self::Actionable => "\x1b[32m",   // Green
+            Self::Critical => "\x1b[1;32m",   // Bold Green
+        }
+    }
+}
+
+/// What happened to an actionable spread
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpreadOutcome {
+    /// Was never actionable (< 10bps at Proposed)
+    NotActionable,
+    /// Still actionable at Finalized (>= 10bps)
+    Persisted,
+    /// Dropped below actionable but still positive (5-9bps)
+    Decayed,
+    /// Vanished completely (< 5bps) - captured by competitor
+    Captured,
+    /// Increased (rare but possible)
+    Grew,
+}
+
+impl SpreadOutcome {
+    pub fn classify(proposed_bps: i32, finalized_bps: i32) -> Self {
+        if proposed_bps < 10 {
+            return Self::NotActionable;
+        }
+        match finalized_bps {
+            x if x >= proposed_bps => Self::Grew,
+            x if x >= 10 => Self::Persisted,
+            x if x >= 5 => Self::Decayed,
+            _ => Self::Captured,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotActionable => "---",
+            Self::Persisted => "PERSISTED",
+            Self::Decayed => "DECAYED",
+            Self::Captured => "CAPTURED",
+            Self::Grew => "GREW!",
+        }
+    }
+
+    pub fn color(&self) -> &'static str {
+        match self {
+            Self::NotActionable => "\x1b[90m",
+            Self::Persisted => "\x1b[1;32m",  // Bold Green - success
+            Self::Decayed => "\x1b[33m",      // Yellow - partial
+            Self::Captured => "\x1b[31m",     // Red - missed
+            Self::Grew => "\x1b[1;36m",       // Cyan - unexpected good
+        }
+    }
+}
 ```
-[BLOCK 1234567] Δt=687ms
-  Spread: +15bps → +12bps (-3Δ)
-  Pair: PancakeSwap1 → Uniswap
-  Status: PERSISTED - ACTIONABLE
+
+### 1.3 Add Running Statistics Struct
+
+Add this struct to track real-time aggregates:
+
+```rust
+use std::collections::VecDeque;
+
+/// Real-time running statistics for dashboard display
+#[derive(Debug, Default)]
+pub struct RunningStats {
+    // Block counts
+    pub total_blocks: u64,
+    pub complete_lifecycles: u64,
+
+    // Timing stats (in milliseconds)
+    pub timing_sum: u128,
+    pub timing_min: u128,
+    pub timing_max: u128,
+    pub timing_recent: VecDeque<u128>,  // Last 20 for moving average
+
+    // Spread categorization at Proposed
+    pub actionable_count: u64,  // >= 10bps at Proposed
+    pub max_spread_seen: i32,
+    pub max_spread_block: u64,
+
+    // Outcomes (only for actionable spreads)
+    pub persisted_count: u64,   // Still >= 10bps at Finalized
+    pub decayed_count: u64,     // 5-9bps at Finalized
+    pub captured_count: u64,    // < 5bps at Finalized
+    pub grew_count: u64,        // Increased (rare)
+
+    // Spread value tracking
+    pub spread_sum_proposed: i64,
+    pub spread_sum_finalized: i64,
+
+    // Recent actionable blocks (for display)
+    pub recent_actionable: VecDeque<ActionableBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionableBlock {
+    pub block_number: u64,
+    pub timing_ms: u128,
+    pub pair: String,
+    pub spread_proposed: i32,
+    pub spread_finalized: i32,
+    pub outcome: SpreadOutcome,
+}
+
+impl RunningStats {
+    pub fn new() -> Self {
+        Self {
+            timing_min: u128::MAX,
+            timing_recent: VecDeque::with_capacity(20),
+            recent_actionable: VecDeque::with_capacity(10),
+            ..Default::default()
+        }
+    }
+
+    /// Record a completed block lifecycle
+    pub fn record(&mut self, lifecycle: &BlockLifecycle) {
+        self.complete_lifecycles += 1;
+
+        // Timing
+        if let Some(timing) = lifecycle.proposed_to_finalized_ms {
+            self.timing_sum += timing;
+            self.timing_min = self.timing_min.min(timing);
+            self.timing_max = self.timing_max.max(timing);
+
+            if self.timing_recent.len() >= 20 {
+                self.timing_recent.pop_front();
+            }
+            self.timing_recent.push_back(timing);
+        }
+
+        // Spreads
+        let proposed = lifecycle.spread_at_proposed_bps.unwrap_or(0);
+        let finalized = lifecycle.spread_at_finalized_bps.unwrap_or(0);
+
+        self.spread_sum_proposed += proposed as i64;
+        self.spread_sum_finalized += finalized as i64;
+
+        // Track max
+        if proposed > self.max_spread_seen {
+            self.max_spread_seen = proposed;
+            self.max_spread_block = lifecycle.block_number;
+        }
+
+        // Classify actionable spreads
+        if proposed >= 10 {
+            self.actionable_count += 1;
+
+            let outcome = SpreadOutcome::classify(proposed, finalized);
+            match outcome {
+                SpreadOutcome::Persisted => self.persisted_count += 1,
+                SpreadOutcome::Decayed => self.decayed_count += 1,
+                SpreadOutcome::Captured => self.captured_count += 1,
+                SpreadOutcome::Grew => self.grew_count += 1,
+                SpreadOutcome::NotActionable => {} // Should never happen
+            }
+
+            // Store in recent actionable
+            let pair = lifecycle.proposed.as_ref()
+                .and_then(|p| p.best_pair.as_ref())
+                .map(|(buy, sell)| format!("{}→{}", 
+                    truncate_name(buy, 8),
+                    truncate_name(sell, 8)))
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let block = ActionableBlock {
+                block_number: lifecycle.block_number,
+                timing_ms: lifecycle.proposed_to_finalized_ms.unwrap_or(0),
+                pair,
+                spread_proposed: proposed,
+                spread_finalized: finalized,
+                outcome,
+            };
+
+            if self.recent_actionable.len() >= 10 {
+                self.recent_actionable.pop_front();
+            }
+            self.recent_actionable.push_back(block);
+        }
+    }
+
+    // Computed statistics
+    pub fn avg_timing_ms(&self) -> f64 {
+        if self.complete_lifecycles == 0 { return 0.0; }
+        self.timing_sum as f64 / self.complete_lifecycles as f64
+    }
+
+    pub fn min_timing_ms(&self) -> u128 {
+        if self.timing_min == u128::MAX { 0 } else { self.timing_min }
+    }
+
+    pub fn execution_window_ms(&self) -> u128 {
+        // Recommended execution time = min_timing - 100ms safety buffer
+        self.min_timing_ms().saturating_sub(100)
+    }
+
+    pub fn avg_decay_bps(&self) -> f64 {
+        if self.complete_lifecycles == 0 { return 0.0; }
+        (self.spread_sum_finalized - self.spread_sum_proposed) as f64 
+            / self.complete_lifecycles as f64
+    }
+
+    pub fn persistence_rate(&self) -> f64 {
+        if self.actionable_count == 0 { return 0.0; }
+        (self.persisted_count + self.grew_count) as f64 / self.actionable_count as f64 * 100.0
+    }
+
+    pub fn capture_rate(&self) -> f64 {
+        if self.actionable_count == 0 { return 0.0; }
+        self.captured_count as f64 / self.actionable_count as f64 * 100.0
+    }
+
+    pub fn decay_rate(&self) -> f64 {
+        if self.actionable_count == 0 { return 0.0; }
+        self.decayed_count as f64 / self.actionable_count as f64 * 100.0
+    }
+}
+
+fn truncate_name(name: &str, max_len: usize) -> &str {
+    if name.len() <= max_len { name } else { &name[..max_len] }
+}
 ```
+
+### 1.4 Add Dashboard Renderer
+
+Add this function to render the dashboard:
+
+```rust
+use std::io::{stdout, Write};
+
+/// Render real-time dashboard (replaces per-block logging)
+pub fn render_dashboard(
+    stats: &RunningStats,
+    start_time: std::time::Instant,
+    min_spread_filter: i32,
+) -> String {
+    let mut out = String::new();
+    
+    let runtime = start_time.elapsed();
+    let runtime_str = format!("{:02}:{:02}", 
+        runtime.as_secs() / 60, 
+        runtime.as_secs() % 60);
+
+    // Clear screen and position cursor at top
+    out.push_str("\x1b[H\x1b[2J");
+
+    // Header
+    out.push_str("╔══════════════════════════════════════════════════════════════════════════╗\n");
+    out.push_str(&format!(
+        "║  MEV VALIDATION │ Runtime: {} │ Blocks: {:>5} │ Filter: >{}bps          ║\n",
+        runtime_str,
+        stats.complete_lifecycles,
+        min_spread_filter
+    ));
+    out.push_str("╠══════════════════════════════════════════════════════════════════════════╣\n");
+
+    // Three-column metrics
+    out.push_str("║  TIMING          │ OPPORTUNITIES          │ COMPETITION                  ║\n");
+    out.push_str(&format!(
+        "║  Avg: {:>5.0}ms    │ Actionable: {:>3}/{:<5}   │ Persisted: {:>3} ({:>4.1}%)        ║\n",
+        stats.avg_timing_ms(),
+        stats.actionable_count,
+        stats.complete_lifecycles,
+        stats.persisted_count + stats.grew_count,
+        stats.persistence_rate()
+    ));
+    out.push_str(&format!(
+        "║  Min: {:>5}ms    │ Max Seen: {:>+4}bps      │ Captured:  {:>3} ({:>4.1}%)        ║\n",
+        stats.min_timing_ms(),
+        stats.max_spread_seen,
+        stats.captured_count,
+        stats.capture_rate()
+    ));
+    out.push_str(&format!(
+        "║  Target: <{:>3}ms  │ Avg Decay: {:>+5.1}bps    │ Decayed:   {:>3} ({:>4.1}%)        ║\n",
+        stats.execution_window_ms(),
+        stats.avg_decay_bps(),
+        stats.decayed_count,
+        stats.decay_rate()
+    ));
+    out.push_str("╠══════════════════════════════════════════════════════════════════════════╣\n");
+
+    // Recent actionable blocks
+    out.push_str("║  RECENT ACTIONABLE (>10bps at Proposed)                                  ║\n");
+    out.push_str("╠──────────────────────────────────────────────────────────────────────────╣\n");
+    out.push_str("║  BLOCK     │  Δt   │ PAIR              │ SPREAD      │ OUTCOME          ║\n");
+    out.push_str("╠──────────────────────────────────────────────────────────────────────────╣\n");
+
+    // Show recent actionable blocks (or placeholder)
+    if stats.recent_actionable.is_empty() {
+        out.push_str("║  \x1b[90mNo actionable spreads (>10bps) detected yet...\x1b[0m                        ║\n");
+        for _ in 0..4 {
+            out.push_str("║                                                                          ║\n");
+        }
+    } else {
+        for block in stats.recent_actionable.iter().rev().take(5) {
+            let trend = if block.spread_finalized > block.spread_proposed { "▲" }
+                       else if block.spread_finalized < block.spread_proposed { "▼" }
+                       else { "─" };
+
+            out.push_str(&format!(
+                "║  {:>8} │ {:>4}ms │ {:<17} │ {:>+3}→{:>+3}bps {} │ {}{:<16}\x1b[0m ║\n",
+                block.block_number,
+                block.timing_ms,
+                block.pair,
+                block.spread_proposed,
+                block.spread_finalized,
+                trend,
+                block.outcome.color(),
+                block.outcome.label()
+            ));
+        }
+        // Pad remaining rows
+        for _ in stats.recent_actionable.len()..5 {
+            out.push_str("║                                                                          ║\n");
+        }
+    }
+
+    out.push_str("╠══════════════════════════════════════════════════════════════════════════╣\n");
+
+    // Dynamic insight based on data
+    let insight = generate_insight(stats);
+    out.push_str(&format!("║  💡 {:<71}║\n", insight));
+
+    out.push_str("╚══════════════════════════════════════════════════════════════════════════╝\n");
+    out.push_str("\x1b[90m  Press Ctrl+C to stop and view final report\x1b[0m\n");
+
+    out
+}
+
+/// Generate actionable insight based on current statistics
+fn generate_insight(stats: &RunningStats) -> String {
+    if stats.complete_lifecycles < 20 {
+        return format!("Collecting data... ({}/20 blocks for initial analysis)", 
+            stats.complete_lifecycles);
+    }
+
+    let capture = stats.capture_rate();
+    let persistence = stats.persistence_rate();
+    let window = stats.execution_window_ms();
+
+    if stats.actionable_count == 0 {
+        return "No spreads >10bps observed. Market may be efficient or illiquid.".to_string();
+    }
+
+    if capture > 70.0 {
+        format!(
+            "HIGH COMPETITION: {:.0}% captured. Need <{}ms exec or mempool monitoring.",
+            capture, window / 2
+        )
+    } else if capture > 40.0 {
+        format!(
+            "MODERATE COMPETITION: {:.0}% captured. Execute within {}ms to compete.",
+            capture, window
+        )
+    } else if persistence > 60.0 {
+        format!(
+            "LOW COMPETITION: {:.0}% persist! Good opportunity if exec <{}ms.",
+            persistence, window
+        )
+    } else {
+        format!(
+            "MIXED: {:.0}% captured, {:.0}% decayed. Target {}ms execution.",
+            capture, stats.decay_rate(), window
+        )
+    }
+}
+```
+
+### 1.5 Update the Validator Struct
+
+Add `running_stats` field to `MevValidator`:
+
+```rust
+pub struct MevValidator {
+    ws_url: String,
+    rpc_url: String,
+    price_calls: Vec<PriceCall>,
+    start_time: Instant,
+    block_lifecycles: HashMap<u64, BlockLifecycle>,
+    completed_blocks: Vec<BlockLifecycle>,
+    log_file: String,
+    min_spread_bps: i32,
+    running_stats: RunningStats,  // ADD THIS
+}
+
+impl MevValidator {
+    pub fn new(rpc_url: &str, ws_url: &str, min_spread_bps: i32) -> Self {
+        // ... existing code ...
+        
+        Self {
+            // ... existing fields ...
+            running_stats: RunningStats::new(),  // ADD THIS
+        }
+    }
+}
+```
+
+### 1.6 Update `handle_block()` Method
+
+Replace the current per-block logging with dashboard updates:
+
+```rust
+async fn handle_block(&mut self, header: MonadBlockHeader) -> Result<()> {
+    let block_num = header.block_number();
+    let state = header.commit_state.clone();
+
+    // ... existing snapshot code ...
+
+    // When lifecycle completes, update stats and render dashboard
+    if let Some(completed) = completed_lifecycle {
+        // Update running statistics
+        self.running_stats.record(&completed);
+        
+        // Log to file (silent)
+        self.log_lifecycle(&completed);
+        
+        // Render dashboard (replaces all println! calls)
+        print!("{}", render_dashboard(
+            &self.running_stats,
+            self.start_time,
+            self.min_spread_bps
+        ));
+        stdout().flush().ok();
+    }
+
+    // ... cleanup code ...
+
+    Ok(())
+}
+```
+
+### 1.7 Update Main Loop in `run_mev_validation()`
+
+```rust
+pub async fn run_mev_validation(
+    rpc_url: &str,
+    ws_url: &str,
+    duration_secs: u64,
+    min_spread_bps: i32
+) -> Result<()> {
+    // ... existing setup code ...
+
+    // Enter alternate screen for clean dashboard
+    print!("\x1b[?1049h"); // Alternate screen buffer
+    print!("\x1b[?25l");   // Hide cursor
+    stdout().flush().ok();
+
+    // ... existing WebSocket loop ...
+
+    // On exit: restore terminal and print final stats
+    print!("\x1b[?1049l"); // Exit alternate screen
+    print!("\x1b[?25h");   // Show cursor
+    stdout().flush().ok();
+
+    // Print final comprehensive report
+    validator.print_final_report();
+
+    Ok(())
+}
+```
+
+### 1.8 Add Final Report Method
+
+```rust
+impl MevValidator {
+    pub fn print_final_report(&self) {
+        let stats = &self.running_stats;
+        
+        println!();
+        println!("╔══════════════════════════════════════════════════════════════════════════════╗");
+        println!("║                      FINAL MEV VALIDATION REPORT                             ║");
+        println!("╠══════════════════════════════════════════════════════════════════════════════╣");
+        
+        // Session summary
+        println!("║  SESSION SUMMARY                                                             ║");
+        println!("║    Total Blocks Analyzed:  {:>8}                                           ║", stats.complete_lifecycles);
+        println!("║    Duration:               {:>8} seconds                                   ║", self.start_time.elapsed().as_secs());
+        println!("║    Data File:              {}                                    ║", &self.log_file[..self.log_file.len().min(40)]);
+        
+        println!("╠══════════════════════════════════════════════════════════════════════════════╣");
+        println!("║  TIMING ANALYSIS                                                             ║");
+        println!("║  ──────────────────────────────────────────────────────────────────────────  ║");
+        println!("║    Proposed → Finalized Window:                                              ║");
+        println!("║      Average:     {:>6.0}ms                                                   ║", stats.avg_timing_ms());
+        println!("║      Minimum:     {:>6}ms  ← FASTEST POSSIBLE                               ║", stats.min_timing_ms());
+        println!("║      Maximum:     {:>6}ms                                                   ║", stats.timing_max);
+        println!("║                                                                              ║");
+        println!("║    ⚡ EXECUTION TARGET: Complete arb within {:>4}ms                          ║", stats.execution_window_ms());
+        
+        println!("╠══════════════════════════════════════════════════════════════════════════════╣");
+        println!("║  OPPORTUNITY ANALYSIS                                                        ║");
+        println!("║  ──────────────────────────────────────────────────────────────────────────  ║");
+        
+        let actionable_pct = if stats.complete_lifecycles > 0 {
+            stats.actionable_count as f64 / stats.complete_lifecycles as f64 * 100.0
+        } else { 0.0 };
+        
+        println!("║    Actionable Spreads (>=10bps):  {:>5} / {:>5}  ({:>5.1}% of blocks)         ║",
+            stats.actionable_count, stats.complete_lifecycles, actionable_pct);
+        println!("║    Maximum Spread Observed:       {:>+5}bps at block {:>8}                 ║",
+            stats.max_spread_seen, stats.max_spread_block);
+        println!("║    Average Spread Decay:          {:>+5.1}bps per block                        ║",
+            stats.avg_decay_bps());
+        
+        if stats.actionable_count > 0 {
+            println!("║                                                                              ║");
+            println!("║    OF ACTIONABLE OPPORTUNITIES:                                              ║");
+            println!("║      ✅ PERSISTED (still >=10bps): {:>4} ({:>5.1}%)  ← CAPTURABLE             ║",
+                stats.persisted_count + stats.grew_count, stats.persistence_rate());
+            println!("║      ⚠️  DECAYED (5-9bps):          {:>4} ({:>5.1}%)  ← MARGINAL               ║",
+                stats.decayed_count, stats.decay_rate());
+            println!("║      ❌ CAPTURED (<5bps):          {:>4} ({:>5.1}%)  ← MISSED                  ║",
+                stats.captured_count, stats.capture_rate());
+        }
+        
+        println!("╠══════════════════════════════════════════════════════════════════════════════╣");
+        println!("║  COMPETITIVE ASSESSMENT                                                      ║");
+        println!("║  ──────────────────────────────────────────────────────────────────────────  ║");
+        
+        let capture = stats.capture_rate();
+        if capture > 70.0 {
+            println!("║    ⚠️  HIGH COMPETITION DETECTED                                             ║");
+            println!("║                                                                              ║");
+            println!("║    {:.0}% of actionable spreads were captured by faster competitors.         ║", capture);
+            println!("║                                                                              ║");
+            println!("║    RECOMMENDATIONS:                                                          ║");
+            println!("║      1. Reduce execution latency below {}ms                                ║", stats.execution_window_ms() / 2);
+            println!("║      2. Implement mempool monitoring for earlier spread detection            ║");
+            println!("║      3. Consider validator priority inclusion (contact ken_category_labs)    ║");
+            println!("║      4. Focus on less competitive pairs or larger spreads (>15bps)           ║");
+        } else if capture > 40.0 {
+            println!("║    ⚡ MODERATE COMPETITION                                                   ║");
+            println!("║                                                                              ║");
+            println!("║    {:.0}% captured by others. You can compete with optimizations.            ║", capture);
+            println!("║                                                                              ║");
+            println!("║    RECOMMENDATIONS:                                                          ║");
+            println!("║      1. Target execution under {}ms                                        ║", stats.execution_window_ms());
+            println!("║      2. Use atomic arb contract (single TX) for speed                        ║");
+            println!("║      3. Pre-build transactions during price monitoring                       ║");
+        } else if stats.actionable_count > 0 {
+            println!("║    ✅ LOW COMPETITION - GOOD OPPORTUNITY                                     ║");
+            println!("║                                                                              ║");
+            println!("║    {:.0}% of spreads persist long enough for capture!                        ║", stats.persistence_rate());
+            println!("║                                                                              ║");
+            println!("║    RECOMMENDATIONS:                                                          ║");
+            println!("║      1. Execute within {}ms window                                         ║", stats.execution_window_ms());
+            println!("║      2. Set trigger threshold at 10-12bps for safety margin                  ║");
+            println!("║      3. Monitor for competition increase over time                           ║");
+        } else {
+            println!("║    ℹ️  INSUFFICIENT DATA                                                     ║");
+            println!("║                                                                              ║");
+            println!("║    No actionable spreads (>=10bps) were observed during this session.        ║");
+            println!("║    This could mean:                                                          ║");
+            println!("║      - Market is currently efficient (arbitraged quickly)                    ║");
+            println!("║      - Low liquidity / trading volume                                        ║");
+            println!("║      - Try running during higher activity periods                            ║");
+        }
+        
+        println!("╠══════════════════════════════════════════════════════════════════════════════╣");
+        println!("║  NEXT STEPS                                                                  ║");
+        println!("║  ──────────────────────────────────────────────────────────────────────────  ║");
+        println!("║    1. Review detailed data: cat {}                          ║", &self.log_file);
+        println!("║    2. Test execution timing: cargo run -- fast-arb --sell-dex X --buy-dex Y  ║");
+        println!("║    3. Deploy atomic contract for single-TX execution                         ║");
+        println!("║    4. Run auto-arb with validated parameters                                 ║");
+        println!("╚══════════════════════════════════════════════════════════════════════════════╝");
+        println!();
+    }
+}
+```
+
+---
+
+## Part 2: CLI Enhancements
+
+### 2.1 Update `MevValidate` Command in `main.rs`
+
+```rust
+/// MEV validation - observe block timing and spread persistence (Phase 1)
+MevValidate {
+    /// Duration to run validation in seconds
+    #[arg(long, default_value = "300")]
+    duration: u64,
+
+    /// Minimum spread in bps to consider "actionable" (default: 10)
+    #[arg(long, default_value = "10")]
+    min_spread: i32,
+
+    /// Output mode: "dashboard" (default), "log", "quiet"
+    #[arg(long, default_value = "dashboard")]
+    output: String,
+}
+```
+
+### 2.2 Update `run_mev_validate()` in `main.rs`
+
+```rust
+async fn run_mev_validate(duration: u64, min_spread_bps: i32, output_mode: &str) -> Result<()> {
+    let node_config = NodeConfig::from_env();
+    
+    match output_mode {
+        "dashboard" => {
+            mev_validation::run_mev_validation_dashboard(
+                &node_config.rpc_url, 
+                &node_config.ws_url, 
+                duration, 
+                min_spread_bps
+            ).await
+        }
+        "log" => {
+            mev_validation::run_mev_validation_log(
+                &node_config.rpc_url, 
+                &node_config.ws_url, 
+                duration, 
+                min_spread_bps
+            ).await
+        }
+        "quiet" => {
+            mev_validation::run_mev_validation_quiet(
+                &node_config.rpc_url, 
+                &node_config.ws_url, 
+                duration, 
+                min_spread_bps
+            ).await
+        }
+        _ => {
+            eprintln!("Unknown output mode: {}. Using 'dashboard'", output_mode);
+            mev_validation::run_mev_validation_dashboard(
+                &node_config.rpc_url, 
+                &node_config.ws_url, 
+                duration, 
+                min_spread_bps
+            ).await
+        }
+    }
+}
+```
+
+---
+
+## Part 3: Testing
+
+After implementing these changes, test with:
+
+```bash
+# Interactive dashboard (default)
+cargo run -- mev-validate --duration 120 --min-spread 10
+
+# Log mode (for piping to file or non-interactive environments)
+cargo run -- mev-validate --duration 120 --output log 2>&1 | tee validation.log
+
+# Quiet mode (only final report)
+cargo run -- mev-validate --duration 120 --output quiet
+```
+
+---
+
+## Summary of Changes
+
+| File | Change |
+|------|--------|
+| `src/mev_validation.rs` | Remove debug prints, add `SpreadTier`, `SpreadOutcome`, `RunningStats` |
+| `src/mev_validation.rs` | Add `render_dashboard()` function |
+| `src/mev_validation.rs` | Add `print_final_report()` method |
+| `src/mev_validation.rs` | Update `handle_block()` to use dashboard |
+| `src/main.rs` | Add `--output` flag to `MevValidate` command |
+
+The goal is to transform noisy block-by-block output into a clean, real-time dashboard that answers:
+1. **Can we execute fast enough?** (timing metrics)
+2. **Are there opportunities?** (actionable count, max spread)
+3. **Is competition fierce?** (capture rate)
+4. **What should we do?** (insight + final recommendations)
