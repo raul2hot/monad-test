@@ -349,9 +349,10 @@ impl MevValidator {
         }
 
         // Cleanup old incomplete lifecycles (older than 20 blocks)
+        // Use saturating_sub to avoid underflow when num > current_block
         let current_block = block_num;
         self.block_lifecycles
-            .retain(|&num, _| current_block - num < 20);
+            .retain(|&num, _| current_block.saturating_sub(num) < 20);
 
         Ok(())
     }
