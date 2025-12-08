@@ -331,6 +331,10 @@ enum Commands {
         /// Duration to run validation in seconds
         #[arg(long, default_value = "300")]
         duration: u64,
+
+        /// Minimum spread in bps to display/track (e.g., 10 = only show spreads > 10bps)
+        #[arg(long, default_value = "0")]
+        min_spread: i32,
     },
 }
 
@@ -2545,11 +2549,11 @@ async fn run_contract_balance() -> Result<()> {
     Ok(())
 }
 
-async fn run_mev_validate(duration: u64) -> Result<()> {
+async fn run_mev_validate(duration: u64, min_spread_bps: i32) -> Result<()> {
     let node_config = NodeConfig::from_env();
     node_config.log_config();
 
-    mev_validation::run_mev_validation(&node_config.rpc_url, &node_config.ws_url, duration).await
+    mev_validation::run_mev_validation(&node_config.rpc_url, &node_config.ws_url, duration, min_spread_bps).await
 }
 
 #[tokio::main]
@@ -2640,8 +2644,8 @@ async fn main() -> Result<()> {
         Some(Commands::TestRevert { dex, gas_limit, method }) => {
             run_test_revert(&dex, gas_limit, &method).await
         }
-        Some(Commands::MevValidate { duration }) => {
-            run_mev_validate(duration).await
+        Some(Commands::MevValidate { duration, min_spread }) => {
+            run_mev_validate(duration, min_spread).await
         }
     }
 }
