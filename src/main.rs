@@ -351,7 +351,7 @@ enum Commands {
         output: String,
     },
 
-    /// MEV ULTRA - Real execution with ~50ms latency (mev-validate + turbo execution)
+    /// MEV ULTRA - Real execution with ~10ms latency (mev-validate + turbo execution)
     MevUltra {
         /// Amount of WMON per arb execution
         #[arg(long, default_value = "0.1")]
@@ -372,6 +372,10 @@ enum Commands {
         /// Cooldown between executions in seconds
         #[arg(long, default_value = "1")]
         cooldown_secs: u64,
+
+        /// Price polling interval in ms (default: 5ms for local node)
+        #[arg(long, default_value = "5")]
+        poll_ms: u64,
     },
 
     /// Live spread dashboard with detailed visualization
@@ -2797,7 +2801,7 @@ async fn run_contract_balance() -> Result<()> {
     Ok(())
 }
 
-/// MEV ULTRA - Monitor and execute with ~50ms latency
+/// MEV ULTRA - Monitor and execute with ~10ms latency
 /// Combines mev-validate monitoring with turbo execution
 async fn run_mev_ultra(
     amount: f64,
@@ -2805,14 +2809,15 @@ async fn run_mev_ultra(
     min_spread_bps: i32,
     max_executions: u32,
     cooldown_secs: u64,
+    poll_ms: u64,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     println!("\n\x1b[1;36m=== MEV ULTRA MODE ===\x1b[0m");
-    println!("Amount: {} WMON | Slippage: {} bps | Min Spread: {} bps", amount, slippage, min_spread_bps);
+    println!("Amount: {} WMON | Slippage: {} bps | Min Spread: {} bps | Poll: {}ms", amount, slippage, min_spread_bps, poll_ms);
     println!("Max Executions: {} | Cooldown: {}s", if max_executions == 0 { "∞".to_string() } else { max_executions.to_string() }, cooldown_secs);
-    println!("\x1b[33mTarget execution: <50ms (fire-and-forget)\x1b[0m\n");
+    println!("\x1b[33mTarget execution: ~10ms (fire-and-forget)\x1b[0m\n");
 
     // Setup
     let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
@@ -2851,9 +2856,9 @@ async fn run_mev_ultra(
 
     let mut executions = 0u32;
     let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
-    let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(50));
+    let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
 
-    println!("\x1b[1;32mMonitoring... Press Ctrl+C to stop\x1b[0m\n");
+    println!("\x1b[1;32mMonitoring ({}ms poll)... Press Ctrl+C to stop\x1b[0m\n", poll_ms);
 
     while running.load(Ordering::SeqCst) {
         poll_interval.tick().await;
@@ -3174,8 +3179,8 @@ async fn main() -> Result<()> {
         Some(Commands::MevValidate { duration, min_spread, output }) => {
             run_mev_validate(duration, min_spread, &output).await
         }
-        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs }) => {
-            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs).await
+        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs, poll_ms }) => {
+            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs, poll_ms).await
         }
         Some(Commands::Dashboard { min_spread, history, refresh_ms, sound }) => {
             run_dashboard(min_spread, history, refresh_ms, sound).await
