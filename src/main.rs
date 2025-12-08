@@ -36,7 +36,9 @@ mod node_config;
 mod nonce;
 mod pools;
 mod price;
+mod spread_display;
 mod spread_filter;
+mod spread_logger;
 mod spread_tracker;
 mod stats;
 mod wallet;
@@ -336,6 +338,25 @@ enum Commands {
         #[arg(long, default_value = "0")]
         min_spread: i32,
     },
+
+    /// Live spread dashboard with detailed visualization
+    Dashboard {
+        /// Minimum spread to display (bps)
+        #[arg(long, default_value = "5")]
+        min_spread: i32,
+
+        /// History depth per pair
+        #[arg(long, default_value = "30")]
+        history: usize,
+
+        /// Refresh rate in milliseconds
+        #[arg(long, default_value = "100")]
+        refresh_ms: u64,
+
+        /// Enable sound alerts for HOT+ spreads
+        #[arg(long, default_value = "false")]
+        sound: bool,
+    },
 }
 
 async fn get_current_prices<P: alloy::providers::Provider>(provider: &P) -> Result<Vec<PoolPrice>> {
@@ -357,6 +378,8 @@ async fn get_current_prices<P: alloy::providers::Provider>(provider: &P) -> Resu
 }
 
 async fn run_monitor() -> Result<()> {
+    use std::io::{stdout, Write};
+
     // Load node configuration (auto-detects local vs remote)
     let node_config = NodeConfig::from_env();
     node_config.log_config();
@@ -389,6 +412,17 @@ async fn run_monitor() -> Result<()> {
     let monday_pool = get_monday_trade_pool();
     price_calls.push(create_slot0_call(&monday_pool));
 
+    // Initialize spread display with 5bps threshold, 20 history
+    let mut spread_display = spread_display::SpreadDisplay::new(5, 20);
+
+    // Check if running in interactive mode
+    let interactive = spread_display::is_interactive();
+
+    if interactive {
+        // Enter alternate screen buffer for clean display
+        spread_display::enter_alternate_screen();
+    }
+
     // Use node-aware polling interval (100ms for local, 1000ms for remote)
     let poll_interval_ms = node_config.poll_interval.as_millis() as u64;
     let mut poll_interval = interval(Duration::from_millis(poll_interval_ms));
@@ -400,16 +434,40 @@ async fn run_monitor() -> Result<()> {
         poll_interval.tick().await;
 
         match fetch_prices_batched(&provider, price_calls.clone()).await {
-            Ok((prices, elapsed_ms)) => {
-                display_prices(&prices, elapsed_ms);
+            Ok((prices, _elapsed_ms)) => {
+                let spreads = calculate_spreads(&prices);
+                spread_display.update(&spreads);
+
+                if interactive {
+                    // Move cursor to top and render enhanced display
+                    spread_display::cursor_home();
+                    print!("{}", spread_display::render_full_dashboard(&spread_display, &prices, None));
+                    stdout().flush().ok();
+                } else {
+                    // Non-interactive: single line update
+                    print!("\r{}", spread_display.render_oneline());
+                    stdout().flush().ok();
+                }
             }
             Err(e) => {
                 error!("Failed to fetch prices: {}", e);
-                display::clear_screen();
+                if interactive {
+                    spread_display::cursor_home();
+                }
                 println!("\x1b[1;31mError fetching prices: {}\x1b[0m", e);
                 println!("\nRetrying in {} ms...", poll_interval_ms);
             }
         }
+    }
+
+    // Note: This code is unreachable in the current infinite loop
+    // In production, add Ctrl+C handler to properly exit
+    #[allow(unreachable_code)]
+    {
+        if interactive {
+            spread_display::exit_alternate_screen();
+        }
+        Ok(())
     }
 }
 
@@ -1684,6 +1742,10 @@ async fn run_auto_arb(
     let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
     let mut poll_interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
+    // Initialize enhanced spread display for better visualization
+    let mut arb_spread_display = spread_display::SpreadDisplay::new(min_spread_bps, history_size);
+    let mut cumulative_pnl: f64 = 0.0;
+
     loop {
         poll_interval.tick().await;
 
@@ -1721,15 +1783,35 @@ async fn run_auto_arb(
                 );
             }
 
-            // Display current best opportunity
+            // Update enhanced spread display
+            arb_spread_display.update(&spreads);
+
+            // Display current best opportunity with enhanced visualization
+            let net_bps = (spread.net_spread_pct * 100.0) as i32;
+            let level = spread_display::SpreadLevel::from_bps(net_bps);
+            let pair_key = format!("{}→{}", spread.buy_pool, spread.sell_pool);
+            let trend = arb_spread_display.pair_histories
+                .get(&pair_key)
+                .map(|h| h.trend())
+                .unwrap_or(spread_display::Trend::Stable);
+
             let now = Local::now().format("%H:%M:%S");
-            print!("\r[{}] Best: {} -> {} | Net: {:+.2}% ({:+} bps)    ",
-                now,
-                spread.buy_pool,
-                spread.sell_pool,
-                spread.net_spread_pct,
-                (spread.net_spread_pct * 100.0) as i32
-            );
+            print!("\r\x1b[2K");
+            print!("[{}] ", now);
+            print!("{}{:<20}\x1b[0m ", level.color_code(),
+                format!("{}→{}", spread.buy_pool, spread.sell_pool));
+            print!("{:>+6}bps ", net_bps);
+            print!("{}{}\x1b[0m ", trend.color(), trend.arrow());
+            print!("{}{:>6}\x1b[0m ", level.color_code(), level.label());
+
+            // Show sparkline if we have history
+            if let Some(hist) = arb_spread_display.pair_histories.get(&pair_key) {
+                print!("[{}] ", hist.sparkline());
+            }
+
+            // Show P&L if tracking
+            print!("P&L: {:>+.4} WMON ", cumulative_pnl);
+
             std::io::Write::flush(&mut std::io::stdout()).ok();
 
             let net_spread_bps = (spread.net_spread_pct * 100.0) as i32;
@@ -2556,6 +2638,91 @@ async fn run_mev_validate(duration: u64, min_spread_bps: i32) -> Result<()> {
     mev_validation::run_mev_validation(&node_config.rpc_url, &node_config.ws_url, duration, min_spread_bps).await
 }
 
+/// Live spread dashboard with detailed visualization
+async fn run_dashboard(min_spread: i32, history: usize, refresh_ms: u64, sound: bool) -> Result<()> {
+    use std::io::{stdout, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let node_config = NodeConfig::from_env();
+    node_config.log_config();
+
+    let url: reqwest::Url = node_config.rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+
+    // Verify node health before starting
+    verify_node_ready(&provider).await?;
+
+    // Build price calls
+    let mut price_calls: Vec<PriceCall> = Vec::new();
+
+    for pool in get_v3_pools() {
+        price_calls.push(create_slot0_call(&pool));
+    }
+
+    let lfj_pool = get_lfj_pool();
+    price_calls.push(create_lfj_active_id_call(&lfj_pool));
+    price_calls.push(create_lfj_bin_step_call(&lfj_pool));
+
+    let monday_pool = get_monday_trade_pool();
+    price_calls.push(create_slot0_call(&monday_pool));
+
+    // Setup display
+    let mut display = spread_display::SpreadDisplay::new(min_spread, history);
+    display.alert_sound = sound;
+
+    // Enter alternate screen
+    spread_display::enter_alternate_screen();
+
+    // Install Ctrl+C handler to restore terminal
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+
+    let mut poll_interval = interval(Duration::from_millis(refresh_ms));
+
+    while running.load(Ordering::SeqCst) {
+        poll_interval.tick().await;
+
+        let block_num = provider.get_block_number().await.ok();
+
+        match fetch_prices_batched(&provider, price_calls.clone()).await {
+            Ok((prices, _)) => {
+                let spreads = calculate_spreads(&prices);
+                display.update(&spreads);
+
+                // Render dashboard
+                spread_display::cursor_home();
+                print!("{}", spread_display::render_full_dashboard(&display, &prices, block_num));
+                stdout().flush().ok();
+
+                // Sound alert for HOT+ spreads
+                if display.alert_sound {
+                    if let Some(best) = spreads.first() {
+                        let bps = (best.net_spread_pct * 100.0) as i32;
+                        if bps >= 15 {
+                            print!("\x07"); // Terminal bell
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                spread_display::cursor_home();
+                println!("\x1b[1;31mError fetching prices: {}\x1b[0m", e);
+            }
+        }
+    }
+
+    // Restore terminal
+    spread_display::exit_alternate_screen();
+
+    println!("\nDashboard stopped.");
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -2646,6 +2813,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::MevValidate { duration, min_spread }) => {
             run_mev_validate(duration, min_spread).await
+        }
+        Some(Commands::Dashboard { min_spread, history, refresh_ms, sound }) => {
+            run_dashboard(min_spread, history, refresh_ms, sound).await
         }
     }
 }

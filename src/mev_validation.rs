@@ -22,6 +22,18 @@ use crate::pools::{
 };
 use crate::config::{get_lfj_pool, get_monday_trade_pool, get_v3_pools};
 
+/// Helper function to get ANSI color code based on spread level
+fn spread_level_color(spread_bps: i32) -> &'static str {
+    match spread_bps {
+        x if x < 0 => "\x1b[90m",      // Gray - negative
+        0..=4 => "\x1b[37m",           // White - noise
+        5..=9 => "\x1b[33m",           // Yellow - watching
+        10..=14 => "\x1b[32m",         // Green - ready
+        15..=24 => "\x1b[1;32m",       // Bold Green - hot
+        _ => "\x1b[1;5;32m",           // Bold Blinking Green - critical
+    }
+}
+
 /// Block commit states in Monad lifecycle
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitState {
@@ -302,21 +314,37 @@ impl MevValidator {
                 if lifecycle.is_complete() {
                     lifecycle.compute_analysis();
 
-                    // Print comparison
+                    let spread_proposed = lifecycle.spread_at_proposed_bps.unwrap_or(0);
+                    let spread_final = lifecycle.spread_at_finalized_bps.unwrap_or(0);
+                    let delta = lifecycle.spread_delta_bps.unwrap_or(0);
+
+                    // Color-coded output based on spread levels
+                    let proposed_color = spread_level_color(spread_proposed);
+                    let final_color = spread_level_color(spread_final);
+                    let delta_color = if delta > 0 { "\x1b[32m" } else if delta < 0 { "\x1b[31m" } else { "\x1b[33m" };
+
+                    // Print enhanced color-coded comparison
                     println!();
-                    println!(
-                        "[FINALIZED] Block {} | Dt: {:>4}ms | Spread: {:+3} -> {:+3} bps (D{:+3}) | {}",
-                        block_num,
-                        lifecycle.proposed_to_finalized_ms.unwrap_or(0),
-                        lifecycle.spread_at_proposed_bps.unwrap_or(0),
-                        lifecycle.spread_at_finalized_bps.unwrap_or(0),
-                        lifecycle.spread_delta_bps.unwrap_or(0),
-                        if lifecycle.spread_persisted.unwrap_or(false) {
-                            "PERSISTED"
-                        } else {
-                            "DECAYED"
-                        }
-                    );
+                    println!("\x1b[1m[BLOCK {}]\x1b[0m Δt={}ms",
+                        lifecycle.block_number,
+                        lifecycle.proposed_to_finalized_ms.unwrap_or(0));
+                    println!("  Spread: {}{}bps\x1b[0m → {}{}bps\x1b[0m ({}{}Δ\x1b[0m)",
+                        proposed_color, spread_proposed,
+                        final_color, spread_final,
+                        delta_color, format!("{:+}", delta));
+
+                    if let Some(ref pair) = lifecycle.proposed.as_ref().and_then(|p| p.best_pair.clone()) {
+                        println!("  Pair: {} → {}", pair.0, pair.1);
+                    }
+
+                    let status = if lifecycle.spread_persisted.unwrap_or(false) {
+                        "\x1b[1;32mPERSISTED - ACTIONABLE\x1b[0m"
+                    } else if spread_final > 0 {
+                        "\x1b[33mDECAYED - PARTIAL\x1b[0m"
+                    } else {
+                        "\x1b[31mGONE - CAPTURED\x1b[0m"
+                    };
+                    println!("  Status: {}", status);
 
                     // Clone lifecycle for logging after we release the mutable borrow
                     completed_lifecycle = Some(lifecycle.clone());
