@@ -1724,13 +1724,17 @@ async fn run_atomic_arb_ultra(
 
     let total_time = total_start.elapsed();
 
-    println!("ULTRA | {} -> {} | TX: {} | Init: {:?} | Exec: {:?} | TOTAL: {:?}",
+    let tx_short = if result.tx_hash.len() >= 18 { &result.tx_hash[0..18] } else { &result.tx_hash };
+    println!("ULTRA | {} -> {} | TX: {}... | Init: {:?} | Exec: {:?} | TOTAL: {:?}",
         sell_dex, buy_dex,
-        &result.tx_hash[0..18],
+        tx_short,
         init_time,
         exec_start.elapsed(),
         total_time
     );
+    if let Some(err) = &result.error {
+        println!("ERROR: {}", err);
+    }
 
     Ok(())
 }
@@ -1802,13 +1806,17 @@ async fn run_atomic_arb_turbo(sell_dex: &str, buy_dex: &str, amount: f64, slippa
     let total_time = total_start.elapsed();
 
     // Minimal output for speed
-    println!("TURBO | {} -> {} | TX: {} | Init: {:?} | Exec: {:?} | TOTAL: {:?}",
+    let tx_short = if result.tx_hash.len() >= 18 { &result.tx_hash[0..18] } else { &result.tx_hash };
+    println!("TURBO | {} -> {} | TX: {}... | Init: {:?} | Exec: {:?} | TOTAL: {:?}",
         sell_dex, buy_dex,
-        &result.tx_hash[0..18],
+        tx_short,
         init_time,
         exec_start.elapsed(),
         total_time
     );
+    if let Some(err) = &result.error {
+        println!("ERROR: {}", err);
+    }
 
     Ok(())
 }
