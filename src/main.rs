@@ -218,9 +218,14 @@ enum Commands {
         /// Force execution even if unprofitable (for testing)
         #[arg(long, default_value = "false")]
         force: bool,
-        /// TURBO mode: skip balance queries and gas estimation for <300ms execution
+        /// TURBO mode: skip balance queries and gas estimation for fast execution
         #[arg(long, default_value = "false")]
         turbo: bool,
+
+        /// ULTRA mode: use pre-cached prices (sell_price,buy_price) for sub-20ms execution
+        /// Example: --ultra 0.4521,0.4498
+        #[arg(long)]
+        ultra: Option<String>,
     },
 
     /// Automated arbitrage: monitors prices and executes when opportunity found
@@ -1658,6 +1663,78 @@ async fn run_atomic_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u3
     Ok(())
 }
 
+/// ULTRA MODE: Absolute minimum latency execution
+/// Target: <20ms total execution
+/// - Pre-cached prices (no price RPC calls)
+/// - Hardcoded gas price (no gas RPC)
+/// - Single nonce RPC only
+/// - Fire-and-forget (no receipt waiting)
+async fn run_atomic_arb_ultra(
+    sell_dex: &str,
+    buy_dex: &str,
+    amount: f64,
+    slippage: u32,
+    sell_price: f64,
+    buy_price: f64,
+) -> Result<()> {
+    let total_start = std::time::Instant::now();
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+
+    // ULTRA: Hardcoded gas price
+    let gas_price: u128 = 52_000_000_000;
+
+    // Single RPC: nonce only
+    init_nonce(&provider, signer_address).await?;
+
+    let init_time = total_start.elapsed();
+
+    // Create provider with signer
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Get routers (pure computation, <1us)
+    let sell_router = get_router_by_name(sell_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
+    let buy_router = get_router_by_name(buy_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
+
+    // Execute ULTRA (fire-and-forget with pre-cached prices)
+    let exec_start = std::time::Instant::now();
+    let result = execution::atomic_arb::execute_atomic_arb_turbo(
+        &provider_with_signer,
+        signer_address,
+        &sell_router,
+        &buy_router,
+        amount,
+        sell_price,
+        buy_price,
+        slippage,
+        gas_price,
+    ).await?;
+
+    let total_time = total_start.elapsed();
+
+    println!("ULTRA | {} -> {} | TX: {} | Init: {:?} | Exec: {:?} | TOTAL: {:?}",
+        sell_dex, buy_dex,
+        &result.tx_hash[0..18],
+        init_time,
+        exec_start.elapsed(),
+        total_time
+    );
+
+    Ok(())
+}
+
 /// TURBO MODE: Execute atomic arb with MAXIMUM speed (fire-and-forget)
 /// Target: <50ms total execution
 /// - Uses hardcoded gas price (no RPC)
@@ -2889,8 +2966,17 @@ async fn main() -> Result<()> {
         Some(Commands::FastArb { sell_dex, buy_dex, amount, slippage }) => {
             run_fast_arb(&sell_dex, &buy_dex, amount, slippage).await
         }
-        Some(Commands::AtomicArb { sell_dex, buy_dex, amount, slippage, min_profit_bps, force, turbo }) => {
-            if turbo {
+        Some(Commands::AtomicArb { sell_dex, buy_dex, amount, slippage, min_profit_bps, force, turbo, ultra }) => {
+            if let Some(prices_str) = ultra {
+                // ULTRA mode: parse cached prices and execute with minimal latency
+                let parts: Vec<&str> = prices_str.split(',').collect();
+                if parts.len() != 2 {
+                    return Err(eyre::eyre!("--ultra requires format: sell_price,buy_price (e.g., 0.4521,0.4498)"));
+                }
+                let sell_price: f64 = parts[0].parse().map_err(|_| eyre::eyre!("Invalid sell_price"))?;
+                let buy_price: f64 = parts[1].parse().map_err(|_| eyre::eyre!("Invalid buy_price"))?;
+                run_atomic_arb_ultra(&sell_dex, &buy_dex, amount, slippage, sell_price, buy_price).await
+            } else if turbo {
                 run_atomic_arb_turbo(&sell_dex, &buy_dex, amount, slippage).await
             } else {
                 run_atomic_arb(&sell_dex, &buy_dex, amount, slippage, min_profit_bps, force).await
