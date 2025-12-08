@@ -309,6 +309,21 @@ enum Commands {
 
     /// Check atomic arb contract balances
     ContractBalance,
+
+    /// Test transaction revert to measure gas costs
+    TestRevert {
+        /// DEX to use: uniswap, pancakeswap1, pancakeswap2, lfj, mondaytrade
+        #[arg(long, default_value = "uniswap")]
+        dex: String,
+
+        /// Gas limit to use for the transaction
+        #[arg(long, default_value = "300000")]
+        gas_limit: u64,
+
+        /// Revert method: "zero" (0 amount), "huge" (impossibly large amount), "minout" (impossible min output)
+        #[arg(long, default_value = "minout")]
+        method: String,
+    },
 }
 
 async fn get_current_prices<P: alloy::providers::Provider>(provider: &P) -> Result<Vec<PoolPrice>> {
@@ -453,6 +468,216 @@ async fn run_test_swap(dex: &str, amount: f64, direction: &str, slippage: u32) -
     ).await?;
     println!("  [TIMING] Swap execution: {:?}", t1.elapsed());
     print_swap_report(&result);
+
+    Ok(())
+}
+
+/// Test transaction revert to measure exact gas consumption on Monad
+async fn run_test_revert(dex: &str, gas_limit: u64, method: &str) -> Result<()> {
+    use alloy::network::TransactionBuilder;
+    use alloy::primitives::U256;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::time::{timeout, Duration};
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║          REVERT GAS TEST - MONAD GAS ANALYSIS                ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("⚠️  WARNING: This WILL send a transaction that reverts!");
+    println!("   You will pay: gas_limit × gas_price = {} gas units", gas_limit);
+    println!();
+
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+    init_nonce(&provider, signer_address).await?;
+    println!("Wallet: {:?}", signer_address);
+
+    // Create provider with signer
+    let wallet = EthereumWallet::from(signer);
+    let provider_with_signer = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(url);
+
+    // Get gas price
+    let gas_price = provider.get_gas_price().await.unwrap_or(50_000_000_000); // 50 gwei default
+    println!("Gas price: {} gwei", gas_price / 1_000_000_000);
+
+    // Get router config
+    let router = get_router_by_name(dex)
+        .ok_or_else(|| eyre::eyre!("Unknown DEX: {}. Valid options: uniswap, pancakeswap1, pancakeswap2, lfj, mondaytrade", dex))?;
+
+    println!("DEX: {} ({})", router.name, format!("{:?}", router.router_type));
+    println!("Revert method: {}", method);
+
+    // Build calldata designed to revert based on method
+    let deadline = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() + 300;
+
+    // Use a small real amount (0.001 WMON) to pass initial checks, but set impossible min_out
+    let (amount_in, amount_out_min) = match method {
+        "zero" => {
+            println!("→ Using 0 amount (should fail input validation)");
+            (U256::ZERO, U256::ZERO)
+        }
+        "huge" => {
+            println!("→ Using impossibly large amount (should fail balance check)");
+            (U256::from(1_000_000_000_000_000_000_000_000_000_u128), U256::ZERO) // 1 billion WMON
+        }
+        "minout" | _ => {
+            println!("→ Using tiny amount with impossible min_out (should fail slippage)");
+            // 0.001 WMON = 1e15 wei, but expect 1 trillion USDC out (impossible)
+            (U256::from(1_000_000_000_000_000_u64), U256::MAX / U256::from(2))
+        }
+    };
+
+    println!();
+    println!("Transaction parameters:");
+    println!("  amount_in:     {} wei", amount_in);
+    println!("  amount_out_min: {} (guaranteed to fail)", if amount_out_min > U256::from(1_000_000_000_000_000_000_u128) { "MAX/2".to_string() } else { format!("{}", amount_out_min) });
+    println!("  gas_limit:     {}", gas_limit);
+
+    // Build swap calldata (sell WMON -> USDC)
+    let calldata = build_swap_calldata(
+        router.router_type,
+        WMON_ADDRESS,
+        USDC_ADDRESS,
+        amount_in,
+        amount_out_min,
+        signer_address,
+        router.pool_fee,
+        deadline,
+    )?;
+
+    // Build transaction with explicit gas limit (no estimation)
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(router.address)
+        .from(signer_address)
+        .input(alloy::rpc::types::TransactionInput::new(calldata))
+        .gas_limit(gas_limit)
+        .nonce(nonce::next_nonce())
+        .max_fee_per_gas(gas_price + (gas_price / 10))
+        .max_priority_fee_per_gas(gas_price / 10)
+        .with_chain_id(143); // Monad mainnet
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  SENDING TRANSACTION (expecting revert)...");
+    println!("═══════════════════════════════════════════════════════════════");
+
+    let start = std::time::Instant::now();
+
+    // Send transaction
+    let send_result = timeout(Duration::from_secs(30), provider_with_signer.send_transaction(tx)).await;
+
+    match send_result {
+        Ok(Ok(pending)) => {
+            let tx_hash = *pending.tx_hash();
+            println!("  TX Hash: {:?}", tx_hash);
+            println!("  Waiting for receipt...");
+
+            // Wait for receipt with polling
+            let receipt_result = timeout(Duration::from_secs(60), async {
+                loop {
+                    if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
+                        return Ok::<_, eyre::Report>(receipt);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await;
+
+            match receipt_result {
+                Ok(Ok(receipt)) => {
+                    let elapsed = start.elapsed();
+                    let status = receipt.status();
+                    let gas_used = receipt.gas_used;
+                    let effective_gas_price = receipt.effective_gas_price;
+
+                    // Calculate costs
+                    let gas_cost_actual = U256::from(gas_used) * U256::from(effective_gas_price);
+                    let gas_cost_limit = U256::from(gas_limit) * U256::from(effective_gas_price);
+
+                    println!();
+                    println!("╔══════════════════════════════════════════════════════════════╗");
+                    println!("║                    REVERT GAS ANALYSIS                       ║");
+                    println!("╚══════════════════════════════════════════════════════════════╝");
+                    println!();
+                    println!("  Status:           {} {}",
+                        if status { "✓ SUCCESS" } else { "✗ REVERTED" },
+                        if !status { "(as expected)" } else { "(unexpected!)" }
+                    );
+                    println!("  TX Hash:          {:?}", receipt.transaction_hash);
+                    println!("  Block:            {:?}", receipt.block_number);
+                    println!("  Time:             {:?}", elapsed);
+                    println!();
+                    println!("  ┌─────────────────────────────────────────────────────────┐");
+                    println!("  │                    GAS METRICS                          │");
+                    println!("  ├─────────────────────────────────────────────────────────┤");
+                    println!("  │  Gas Used:        {:>15}                       │", gas_used);
+                    println!("  │  Gas Limit:       {:>15}                       │", gas_limit);
+                    println!("  │  Efficiency:      {:>14.1}%                       │", (gas_used as f64 / gas_limit as f64) * 100.0);
+                    println!("  │  Gas Price:       {:>12} gwei                    │", effective_gas_price / 1_000_000_000);
+                    println!("  └─────────────────────────────────────────────────────────┘");
+                    println!();
+                    println!("  ┌─────────────────────────────────────────────────────────┐");
+                    println!("  │                    COST ANALYSIS                        │");
+                    println!("  ├─────────────────────────────────────────────────────────┤");
+
+                    let actual_cost_mon = gas_cost_actual.to::<u128>() as f64 / 1e18;
+                    let limit_cost_mon = gas_cost_limit.to::<u128>() as f64 / 1e18;
+
+                    println!("  │  Actual (gas_used × price):                            │");
+                    println!("  │    {} wei = {:.8} MON         │", gas_cost_actual, actual_cost_mon);
+                    println!("  │                                                         │");
+                    println!("  │  MONAD CHARGED (gas_limit × price):                     │");
+                    println!("  │    {} wei = {:.8} MON         │", gas_cost_limit, limit_cost_mon);
+                    println!("  │                                                         │");
+                    println!("  │  Overpayment: {:.8} MON ({:.1}%)                   │",
+                        limit_cost_mon - actual_cost_mon,
+                        ((gas_limit as f64 - gas_used as f64) / gas_limit as f64) * 100.0
+                    );
+                    println!("  └─────────────────────────────────────────────────────────┘");
+                    println!();
+
+                    if !status {
+                        println!("  💡 KEY INSIGHT: On Monad, reverted transactions cost:");
+                        println!("     gas_limit × gas_price = {:.8} MON", limit_cost_mon);
+                        println!();
+                        println!("     The 'gas_used' ({}) shows how far execution got", gas_used);
+                        println!("     before the revert, but you paid for the full gas_limit.");
+                    }
+                }
+                Ok(Err(e)) => {
+                    println!("  ✗ Error getting receipt: {:?}", e);
+                }
+                Err(_) => {
+                    println!("  ✗ Timeout waiting for receipt (60s)");
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            // Transaction was rejected (e.g., simulation failed)
+            println!();
+            println!("  ✗ Transaction rejected by node:");
+            println!("    {:?}", e);
+            println!();
+            println!("  💡 This means the transaction was rejected BEFORE being sent.");
+            println!("     No gas was consumed. The node's simulation caught the revert.");
+            println!();
+            println!("     This is actually useful info: eth_estimateGas / eth_call can");
+            println!("     detect reverts before you spend any gas!");
+        }
+        Err(_) => {
+            println!("  ✗ Timeout sending transaction (30s)");
+        }
+    }
 
     Ok(())
 }
@@ -2396,6 +2621,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::ContractBalance) => {
             run_contract_balance().await
+        }
+        Some(Commands::TestRevert { dex, gas_limit, method }) => {
+            run_test_revert(&dex, gas_limit, &method).await
         }
     }
 }
