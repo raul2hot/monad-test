@@ -287,6 +287,12 @@ impl MevValidator {
                     lifecycle.finalized = Some(snap);
                 }
 
+                // Debug: check state of lifecycle
+                eprintln!("[DEBUG] Block {} Finalized: proposed={}, finalized={}",
+                    block_num,
+                    lifecycle.proposed.is_some(),
+                    lifecycle.finalized.is_some());
+
                 // Check if lifecycle is complete
                 if lifecycle.is_complete() {
                     lifecycle.compute_analysis();
