@@ -1689,7 +1689,7 @@ async fn run_atomic_arb_ultra(
     let signer_address = signer.address();
 
     // ULTRA: Hardcoded gas price
-    let gas_price: u128 = 52_000_000_000;
+    let gas_price: u128 = 150_000_000_000;
 
     // Single RPC: nonce only
     init_nonce(&provider, signer_address).await?;
@@ -1757,7 +1757,7 @@ async fn run_atomic_arb_turbo(sell_dex: &str, buy_dex: &str, amount: f64, slippa
     let signer_address = signer.address();
 
     // TURBO: Hardcoded gas price - skip RPC call
-    let gas_price: u128 = 52_000_000_000; // 52 gwei - slightly above base
+    let gas_price: u128 = 150_000_000_000; // 52 gwei - slightly above base
 
     // PARALLEL: Only nonce + prices (gas price is hardcoded)
     let (nonce_result, prices_result) = tokio::join!(
