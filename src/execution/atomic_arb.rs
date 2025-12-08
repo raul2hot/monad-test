@@ -32,8 +32,8 @@ const MONAD_CHAIN_ID: u64 = 143;
 const GAS_BUFFER_PERCENT: u64 = 12;
 
 // TURBO mode constants - hardcoded gas to skip estimation
-const TURBO_GAS_LIMIT: u64 = 500_000;  // Safe for all router combinations
-const TURBO_GAS_BUFFER: u64 = 50_000;  // Extra buffer for safety
+const TURBO_GAS_LIMIT: u64 = 700_000;  // Safe for all router combinations
+const TURBO_GAS_BUFFER: u64 = 100_000;  // Extra buffer for safety
 
 // Router enum matching Solidity contract
 #[derive(Debug, Clone, Copy)]
