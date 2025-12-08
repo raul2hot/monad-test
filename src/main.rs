@@ -351,6 +351,29 @@ enum Commands {
         output: String,
     },
 
+    /// MEV ULTRA - Real execution with ~50ms latency (mev-validate + turbo execution)
+    MevUltra {
+        /// Amount of WMON per arb execution
+        #[arg(long, default_value = "0.1")]
+        amount: f64,
+
+        /// Slippage tolerance in bps
+        #[arg(long, default_value = "150")]
+        slippage: u32,
+
+        /// Minimum spread in bps to trigger execution (default: 10)
+        #[arg(long, default_value = "10")]
+        min_spread: i32,
+
+        /// Maximum executions (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        max_executions: u32,
+
+        /// Cooldown between executions in seconds
+        #[arg(long, default_value = "1")]
+        cooldown_secs: u64,
+    },
+
     /// Live spread dashboard with detailed visualization
     Dashboard {
         /// Minimum spread to display (bps)
@@ -2774,6 +2797,153 @@ async fn run_contract_balance() -> Result<()> {
     Ok(())
 }
 
+/// MEV ULTRA - Monitor and execute with ~50ms latency
+/// Combines mev-validate monitoring with turbo execution
+async fn run_mev_ultra(
+    amount: f64,
+    slippage: u32,
+    min_spread_bps: i32,
+    max_executions: u32,
+    cooldown_secs: u64,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    println!("\n\x1b[1;36m=== MEV ULTRA MODE ===\x1b[0m");
+    println!("Amount: {} WMON | Slippage: {} bps | Min Spread: {} bps", amount, slippage, min_spread_bps);
+    println!("Max Executions: {} | Cooldown: {}s", if max_executions == 0 { "∞".to_string() } else { max_executions.to_string() }, cooldown_secs);
+    println!("\x1b[33mTarget execution: <50ms (fire-and-forget)\x1b[0m\n");
+
+    // Setup
+    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+    let url: reqwest::Url = rpc_url.parse()?;
+
+    let signer = PrivateKeySigner::from_str(&private_key)?;
+    let signer_address = signer.address();
+    let gas_price: u128 = 150_000_000_000; // 150 gwei
+
+    // Pre-build wallet and providers
+    let wallet = EthereumWallet::from(signer);
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+    let provider_with_signer = ProviderBuilder::new().wallet(wallet).connect_http(url);
+
+    // Initialize nonce once
+    init_nonce(&provider, signer_address).await?;
+
+    // Build price calls
+    let mut price_calls: Vec<PriceCall> = Vec::new();
+    for pool in get_v3_pools() {
+        price_calls.push(create_slot0_call(&pool));
+    }
+    let lfj_pool = get_lfj_pool();
+    price_calls.push(create_lfj_active_id_call(&lfj_pool));
+    price_calls.push(create_lfj_bin_step_call(&lfj_pool));
+    let monday_pool = get_monday_trade_pool();
+    price_calls.push(create_slot0_call(&monday_pool));
+
+    // Ctrl+C handler
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+
+    let mut executions = 0u32;
+    let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
+    let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(50));
+
+    println!("\x1b[1;32mMonitoring... Press Ctrl+C to stop\x1b[0m\n");
+
+    while running.load(Ordering::SeqCst) {
+        poll_interval.tick().await;
+
+        // Fetch prices
+        let prices = match fetch_prices_batched(&provider, price_calls.clone()).await {
+            Ok((p, _)) => p,
+            Err(_) => continue,
+        };
+
+        // Calculate spreads
+        let spreads = calculate_spreads(&prices);
+        if spreads.is_empty() {
+            continue;
+        }
+
+        let best = &spreads[0];
+        let spread_bps = (best.net_spread_pct * 100.0) as i32;
+
+        // Check if actionable
+        if spread_bps >= min_spread_bps {
+            // Check cooldown
+            if last_execution.elapsed().as_secs() < cooldown_secs {
+                continue;
+            }
+
+            // Check max executions
+            if max_executions > 0 && executions >= max_executions {
+                println!("\x1b[33mMax executions reached ({})\x1b[0m", max_executions);
+                break;
+            }
+
+            // Get routers and prices for this pair
+            let sell_pool = &best.sell_pool;
+            let buy_pool = &best.buy_pool;
+            let sell_router = match get_router_by_name(sell_pool) {
+                Some(r) => r,
+                None => continue,
+            };
+            let buy_router = match get_router_by_name(buy_pool) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Use prices from spread calculation
+            let sell_price = best.sell_price;
+            let buy_price = best.buy_price;
+
+            // EXECUTE WITH TURBO SPEED
+            let exec_start = std::time::Instant::now();
+            let result = execution::atomic_arb::execute_atomic_arb_turbo(
+                &provider_with_signer,
+                signer_address,
+                &sell_router,
+                &buy_router,
+                amount,
+                sell_price,
+                buy_price,
+                slippage,
+                gas_price,
+            ).await;
+
+            let exec_time = exec_start.elapsed();
+
+            match result {
+                Ok(res) => {
+                    executions += 1;
+                    last_execution = std::time::Instant::now();
+
+                    let tx_short = if res.tx_hash.len() >= 18 { &res.tx_hash[0..18] } else { &res.tx_hash };
+                    println!("\x1b[1;32m[EXEC #{}]\x1b[0m {} -> {} | Spread: {} bps | TX: {}... | \x1b[1;36m{:?}\x1b[0m",
+                        executions, sell_pool, buy_pool, spread_bps, tx_short, exec_time);
+
+                    if let Some(err) = &res.error {
+                        println!("  \x1b[31mError: {}\x1b[0m", err);
+                    }
+                }
+                Err(e) => {
+                    println!("\x1b[31m[ERROR]\x1b[0m {} -> {} | {}", sell_pool, buy_pool, e);
+                }
+            }
+        }
+    }
+
+    println!("\n\x1b[1;36m=== MEV ULTRA STOPPED ===\x1b[0m");
+    println!("Total executions: {}", executions);
+
+    Ok(())
+}
+
 async fn run_mev_validate(duration: u64, min_spread_bps: i32, output_mode: &str) -> Result<()> {
     let node_config = NodeConfig::from_env();
     node_config.log_config();
@@ -3003,6 +3173,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::MevValidate { duration, min_spread, output }) => {
             run_mev_validate(duration, min_spread, &output).await
+        }
+        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs }) => {
+            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs).await
         }
         Some(Commands::Dashboard { min_spread, history, refresh_ms, sound }) => {
             run_dashboard(min_spread, history, refresh_ms, sound).await
