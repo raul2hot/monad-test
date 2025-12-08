@@ -586,17 +586,26 @@ pub async fn run_mev_validation(rpc_url: &str, ws_url: &str, duration_secs: u64)
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                     // Skip subscription confirmation
                     if json.get("result").is_some() && json.get("id").is_some() {
+                        println!("[DEBUG] Subscription confirmed");
                         continue;
                     }
 
                     // Extract block header from subscription notification
                     if let Some(params) = json.get("params") {
                         if let Some(result) = params.get("result") {
-                            if let Ok(header) =
-                                serde_json::from_value::<MonadBlockHeader>(result.clone())
-                            {
-                                if let Err(e) = validator.handle_block(header).await {
-                                    eprintln!("\nError handling block: {}", e);
+                            // Debug: print the raw result to see the format
+                            println!("[DEBUG] Raw block data: {}", result);
+
+                            match serde_json::from_value::<MonadBlockHeader>(result.clone()) {
+                                Ok(header) => {
+                                    println!("[DEBUG] Block {} commitState: '{}'",
+                                        header.block_number(), header.commit_state);
+                                    if let Err(e) = validator.handle_block(header).await {
+                                        eprintln!("\nError handling block: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[DEBUG] Failed to parse header: {}", e);
                                 }
                             }
                         }
