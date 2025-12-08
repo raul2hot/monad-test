@@ -172,10 +172,11 @@ pub struct MevValidator {
     block_lifecycles: HashMap<u64, BlockLifecycle>,
     completed_blocks: Vec<BlockLifecycle>,
     log_file: String,
+    min_spread_bps: i32,
 }
 
 impl MevValidator {
-    pub fn new(rpc_url: &str, ws_url: &str) -> Self {
+    pub fn new(rpc_url: &str, ws_url: &str, min_spread_bps: i32) -> Self {
         // Build price calls (same as monitor)
         let mut price_calls: Vec<PriceCall> = Vec::new();
         for pool in get_v3_pools() {
@@ -198,6 +199,7 @@ impl MevValidator {
             block_lifecycles: HashMap::new(),
             completed_blocks: Vec::new(),
             log_file,
+            min_spread_bps,
         }
     }
 
@@ -271,14 +273,17 @@ impl MevValidator {
         match state.as_str() {
             "Proposed" => {
                 if let Some(snap) = snapshot {
-                    print!(
-                        "\r[PROPOSED]  Block {} | Spread: {:+3}bps | {} -> {}           ",
-                        block_num,
-                        snap.best_spread_bps,
-                        snap.best_pair.as_ref().map(|p| p.0.as_str()).unwrap_or("?"),
-                        snap.best_pair.as_ref().map(|p| p.1.as_str()).unwrap_or("?"),
-                    );
-                    std::io::stdout().flush().ok();
+                    // Only display if spread meets minimum threshold
+                    if snap.best_spread_bps >= self.min_spread_bps {
+                        print!(
+                            "\r[PROPOSED]  Block {} | Spread: {:+3}bps | {} -> {}           ",
+                            block_num,
+                            snap.best_spread_bps,
+                            snap.best_pair.as_ref().map(|p| p.0.as_str()).unwrap_or("?"),
+                            snap.best_pair.as_ref().map(|p| p.1.as_str()).unwrap_or("?"),
+                        );
+                        std::io::stdout().flush().ok();
+                    }
                     lifecycle.proposed = Some(snap);
                 }
             }
@@ -524,7 +529,7 @@ impl MevValidator {
 }
 
 /// Main validation loop using single monadNewHeads subscription
-pub async fn run_mev_validation(rpc_url: &str, ws_url: &str, duration_secs: u64) -> Result<()> {
+pub async fn run_mev_validation(rpc_url: &str, ws_url: &str, duration_secs: u64, min_spread_bps: i32) -> Result<()> {
     use tokio::time::{timeout, Duration};
 
     let rpc_display = if rpc_url.len() > 52 {
@@ -545,8 +550,8 @@ pub async fn run_mev_validation(rpc_url: &str, ws_url: &str, duration_secs: u64)
     println!("║  RPC: {:<52} ║", rpc_display);
     println!("║  WS:  {:<52} ║", ws_display);
     println!(
-        "║  Duration: {} seconds                                        ║",
-        duration_secs
+        "║  Duration: {} seconds | Min Spread: {}bps                    ║",
+        duration_secs, min_spread_bps
     );
     println!("║                                                              ║");
     println!("║  Strategy: Subscribe monadNewHeads, filter by commitState   ║");
@@ -554,7 +559,7 @@ pub async fn run_mev_validation(rpc_url: &str, ws_url: &str, duration_secs: u64)
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
-    let mut validator = MevValidator::new(rpc_url, ws_url);
+    let mut validator = MevValidator::new(rpc_url, ws_url, min_spread_bps);
 
     // Connect to WebSocket
     println!("Connecting to WebSocket...");
