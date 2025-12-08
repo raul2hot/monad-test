@@ -334,9 +334,13 @@ enum Commands {
         #[arg(long, default_value = "300")]
         duration: u64,
 
-        /// Minimum spread in bps to display/track (e.g., 10 = only show spreads > 10bps)
-        #[arg(long, default_value = "0")]
+        /// Minimum spread in bps to consider "actionable" (default: 10)
+        #[arg(long, default_value = "10")]
         min_spread: i32,
+
+        /// Output mode: "dashboard" (default), "log", "quiet"
+        #[arg(long, default_value = "dashboard")]
+        output: String,
     },
 
     /// Live spread dashboard with detailed visualization
@@ -2631,11 +2635,45 @@ async fn run_contract_balance() -> Result<()> {
     Ok(())
 }
 
-async fn run_mev_validate(duration: u64, min_spread_bps: i32) -> Result<()> {
+async fn run_mev_validate(duration: u64, min_spread_bps: i32, output_mode: &str) -> Result<()> {
     let node_config = NodeConfig::from_env();
     node_config.log_config();
 
-    mev_validation::run_mev_validation(&node_config.rpc_url, &node_config.ws_url, duration, min_spread_bps).await
+    match output_mode {
+        "dashboard" => {
+            mev_validation::run_mev_validation_dashboard(
+                &node_config.rpc_url,
+                &node_config.ws_url,
+                duration,
+                min_spread_bps
+            ).await
+        }
+        "log" => {
+            mev_validation::run_mev_validation_log(
+                &node_config.rpc_url,
+                &node_config.ws_url,
+                duration,
+                min_spread_bps
+            ).await
+        }
+        "quiet" => {
+            mev_validation::run_mev_validation_quiet(
+                &node_config.rpc_url,
+                &node_config.ws_url,
+                duration,
+                min_spread_bps
+            ).await
+        }
+        _ => {
+            eprintln!("Unknown output mode: {}. Using 'dashboard'", output_mode);
+            mev_validation::run_mev_validation_dashboard(
+                &node_config.rpc_url,
+                &node_config.ws_url,
+                duration,
+                min_spread_bps
+            ).await
+        }
+    }
 }
 
 /// Live spread dashboard with detailed visualization
@@ -2811,8 +2849,8 @@ async fn main() -> Result<()> {
         Some(Commands::TestRevert { dex, gas_limit, method }) => {
             run_test_revert(&dex, gas_limit, &method).await
         }
-        Some(Commands::MevValidate { duration, min_spread }) => {
-            run_mev_validate(duration, min_spread).await
+        Some(Commands::MevValidate { duration, min_spread, output }) => {
+            run_mev_validate(duration, min_spread, &output).await
         }
         Some(Commands::Dashboard { min_spread, history, refresh_ms, sound }) => {
             run_dashboard(min_spread, history, refresh_ms, sound).await
