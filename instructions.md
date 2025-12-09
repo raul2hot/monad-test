@@ -1,337 +1,229 @@
-# MEV Bot Optimization Instructions for Claude Code Opus
+# Monad Mainnet Arbitrage Bot - Claude Code Instructions
 
 ## Project Overview
-Monad mainnet arbitrage bot in Rust. We execute atomic DEX-to-DEX arbitrage via a smart contract in a single transaction.
 
-## Critical Goal
-**Reduce `atomic-arb` execution time from ~600ms to <300ms**
+You are working on a **Monad mainnet DEX-to-DEX arbitrage bot** written in Rust. The goal is to detect price discrepancies between DEXes (Uniswap, PancakeSwap, LFJ, MondayTrade) and execute profitable atomic arbitrage trades.
 
-Command being optimized:
-```bash
-cargo run -- atomic-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 0.1 --force
-```
+**Mission Statement**: We will succeed in this - no matter what it takes!
 
 ## Current Architecture
 
-### Key Files (all provided in context)
-- `src/execution/atomic_arb.rs` - **PRIMARY TARGET** - Atomic arb execution
-- `src/main.rs` - CLI entry point, `run_atomic_arb()` function
-- `src/config.rs` - Router/pool addresses, contract address
-- `src/nonce.rs` - Nonce management (already optimized)
-- `contracts/src/MonadAtomicArb.sol` - On-chain contract
+### Key Files
+- `src/execution/atomic_arb.rs` - Atomic arbitrage execution via smart contract (single TX)
+- `src/main.rs` - CLI commands and orchestration
+- `src/nonce.rs` - Global nonce management for fast TX submission
+- `src/config.rs` - Router configs, pool addresses, contract addresses
+- `src/multicall.rs` - Batched price fetching
+- `src/execution/routers.rs` - DEX-specific swap calldata builders
 
-### Current Execution Flow (atomic-arb)
+### Execution Flow
+1. Fetch prices from all DEXes via multicall
+2. Calculate spreads and identify opportunities
+3. Build atomic arb calldata (sell on DEX A, buy on DEX B)
+4. Execute via `AtomicArb` smart contract (single TX, MEV-resistant)
+5. Verify profit via balance delta
+
+### Smart Contract Interface
+```solidity
+function executeArbUnchecked(
+    uint8 sellRouter,
+    bytes calldata sellRouterData,
+    uint8 buyRouter,
+    uint24 buyPoolFee,
+    uint256 minWmonOut
+) external returns (int256 profit);
+
+function getBalances() external view returns (uint256 wmon, uint256 usdc);
 ```
-1. Parse CLI args
-2. Connect to RPC
-3. PARALLEL: gas_price + nonce_init + price_fetch  (~100ms) ✓ Already optimized
-4. Create provider_with_signer
-5. Get router configs
-6. Get prices from fetched data
-7. execute_atomic_arb():
-   a. Query contract balances BEFORE        (~50-100ms) ❌ BOTTLENECK
-   b. Calculate amounts
-   c. Build sell calldata
-   d. Build executeArb call
-   e. eth_estimateGas                       (~50-100ms) ❌ BOTTLENECK  
-   f. Build transaction
-   g. Send transaction                      (~20-50ms)
-   h. Wait for receipt (20ms polling)       (~100-200ms) ❌ BOTTLENECK
-   i. Query contract balances AFTER         (~50-100ms) ❌ BOTTLENECK
-   j. Calculate profit
-8. Print result
-```
 
-## Identified Bottlenecks & Solutions
+## Critical Problem: Execution Latency
 
-### 1. Pre-TX Balance Query (~50-100ms)
-**Current:** `query_contract_balances()` before execution
-**Solution:** Skip in TURBO mode - we only need balances for profit calculation, not execution
+Current execution takes **600-800ms**. We need **sub-300ms** to be competitive.
 
-### 2. Gas Estimation (~50-100ms)
-**Current:** `provider.estimate_gas()` call
-**Solution:** Hardcode gas limit for atomic arb (it's predictable ~350-400k gas)
-- Uniswap + PancakeSwap: ~380k
-- With LFJ: ~420k
-- Safe limit: 450k + 50k buffer = 500k
+### Timing Breakdown (Current)
+| Operation | Time | Notes |
+|-----------|------|-------|
+| Pre-balance query | 50-100ms | 1 RPC call |
+| Gas estimation | 200-300ms | Simulation RPC |
+| TX send | 10ms | Fast |
+| Receipt polling | 200-300ms | 20ms intervals |
+| Post-balance query | 50-100ms | 1 RPC call |
+| **Total** | **600-800ms** | Too slow |
 
-### 3. Receipt Polling (20ms interval)
-**Current:** 20ms polling in `wait_for_receipt_fast()`
-**Solution:** 2ms polling for TURBO mode (Monad blocks are fast)
+### CRITICAL: Failed Optimization Attempts
 
-### 4. Post-TX Balance Query (~50-100ms)
-**Current:** `query_contract_balances()` after execution
-**Solution:** Skip in TURBO mode - derive profit from transaction receipt/events or defer
+⚠️ **DO NOT** implement these naive optimizations - they have been tested and fail:
 
-### 5. Provider Creation
-**Current:** Created fresh in `run_atomic_arb()`
-**Solution:** Already at function start, no issue
+1. **Hardcoded gas limit (80% failure rate)**
+   - Why it fails: Gas varies significantly by route. LFJ bin traversal, UniV3 tick crossings, and pool liquidity state all affect gas consumption.
+   - Symptom: Transactions revert with "out of gas"
 
-## Implementation Plan
+2. **Remove balance queries / use estimated profit (100% loss rate)**
+   - Why it fails: Estimated profit uses static prices, but actual execution has slippage and price impact. The price moves during the 500ms+ execution window.
+   - Symptom: Bot reports "profit" but actual balance delta is negative
 
-### Option A: Add `--turbo` flag to atomic-arb command
+### Validated Safe Optimizations
+
+✅ These approaches maintain safety while reducing latency:
+
+1. **Gas Cache per Route**
+   - Cache gas estimates per (sell_router, buy_router) pair
+   - TTL: 30 seconds (routes don't change gas profile often)
+   - Add small buffer (8-12%) on cached values
+   - Still estimate on cache miss
+
+2. **Parallel Operations**
+   - Fetch gas price + init nonce + fetch prices in parallel (already done)
+   - Build calldata (CPU) while RPC calls are in flight
+
+3. **Aggressive Receipt Polling**
+   - Monad has fast blocks (~500ms)
+   - Poll at 5ms intervals instead of 20ms
+   - Can save 50-100ms on average
+
+4. **Deferred Post-Balance Query**
+   - Return immediately after TX confirmation
+   - Query actual profit async for logging (don't block execution)
+   - Use estimated profit for decision-making
+
+5. **Pre-Built Calldata Templates**
+   - For common routes, pre-build calldata templates
+   - Only substitute amounts at execution time
+
+## Code Patterns to Follow
+
+### Nonce Management
 ```rust
-// In Commands::AtomicArb
-#[arg(long, default_value = "false")]
-turbo: bool,  // Skip non-essential operations for speed
+// Always use the global nonce manager
+use crate::nonce::{init_nonce, next_nonce};
+
+// Initialize once at startup
+init_nonce(&provider, signer_address).await?;
+
+// Get next nonce atomically (never fetch from RPC during execution)
+let nonce = next_nonce();
 ```
 
-### Option B: Create new `execute_atomic_arb_turbo()` function
-Separate function that:
-1. Skips pre-balance query
-2. Uses hardcoded gas limit
-3. Uses 2ms receipt polling
-4. Skips post-balance query (returns estimated profit)
-
-### Option C: Conditional logic in existing function
-Add `turbo: bool` parameter to `execute_atomic_arb()` and branch internally.
-
-**Recommended: Option B** - Cleaner separation, no risk of breaking existing flow
-
-## Code Changes Required
-
-### 1. `src/execution/atomic_arb.rs`
-
-Add new function:
+### Transaction Building (Monad-specific)
 ```rust
-/// TURBO MODE: Execute atomic arb with minimal latency
-/// Skips: pre-balance query, gas estimation, post-balance query
-/// Uses: hardcoded gas limit, 2ms receipt polling
-pub async fn execute_atomic_arb_turbo<P: Provider>(
-    provider_with_signer: &P,
-    signer_address: Address,
-    sell_router: &RouterConfig,
-    buy_router: &RouterConfig,
-    amount: f64,
-    sell_price: f64,
-    buy_price: f64,
-    slippage_bps: u32,
-    gas_price: u128,
-) -> Result<AtomicArbResult> {
-    let start = std::time::Instant::now();
-    
-    // NO pre-balance query - save ~80ms
-    
-    // Calculate amounts (pure computation, instant)
-    let wmon_in_wei = to_wei(amount, WMON_DECIMALS);
-    let expected_usdc = amount * sell_price;
-    let slippage_mult = 1.0 - (slippage_bps as f64 / 10000.0);
-    let min_usdc_out = expected_usdc * slippage_mult;
-    let min_usdc_out_wei = to_wei(min_usdc_out, USDC_DECIMALS);
-    
-    let expected_wmon_back = expected_usdc / buy_price;
-    let min_wmon_out = expected_wmon_back * slippage_mult;
-    let min_wmon_out_wei = to_wei(min_wmon_out, WMON_DECIMALS);
-    
-    // Build calldata (pure computation)
-    let sell_calldata = build_router_calldata(
-        sell_router, SwapDirection::Sell, wmon_in_wei, min_usdc_out_wei,
-    )?;
-    
-    let buy_pool_fee_u24: Uint<24, 1> = Uint::from(buy_router.pool_fee);
-    
-    // Use unchecked version (no on-chain profit check = less gas)
-    let calldata = {
-        let execute_call = executeArbUncheckedCall {
-            sellRouter: ContractRouter::from(sell_router.router_type) as u8,
-            sellRouterData: sell_calldata,
-            buyRouter: ContractRouter::from(buy_router.router_type) as u8,
-            buyPoolFee: buy_pool_fee_u24,
-            minWmonOut: min_wmon_out_wei,
-        };
-        Bytes::from(execute_call.abi_encode())
-    };
-    
-    // HARDCODED gas limit - save ~80ms from estimation
-    let gas_limit = TURBO_GAS_LIMIT + TURBO_GAS_BUFFER;
-    
-    // Build and send transaction
-    let tx = alloy::rpc::types::TransactionRequest::default()
-        .to(ATOMIC_ARB_CONTRACT)
-        .from(signer_address)
-        .input(alloy::rpc::types::TransactionInput::new(calldata))
-        .gas_limit(gas_limit)
-        .nonce(next_nonce())
-        .max_fee_per_gas(gas_price + (gas_price / 10))
-        .max_priority_fee_per_gas(gas_price / 10)
-        .with_chain_id(MONAD_CHAIN_ID);
-    
-    let pending = provider_with_signer.send_transaction(tx).await?;
-    let tx_hash = *pending.tx_hash();
-    
-    // TURBO receipt polling - 2ms instead of 20ms
-    let receipt = wait_for_receipt_turbo(provider_with_signer, tx_hash).await?;
-    
-    let exec_time = start.elapsed().as_millis();
-    
-    // NO post-balance query - return estimated profit
-    let estimated_profit = expected_wmon_back - amount;
-    let estimated_profit_bps = (estimated_profit / amount * 10000.0) as i32;
-    
-    let gas_cost_mon = (gas_limit as f64 * gas_price as f64) / 1e18;
-    
-    Ok(AtomicArbResult {
-        tx_hash: format!("{:?}", tx_hash),
-        success: receipt.status(),
-        profit_wmon: estimated_profit,  // Estimated, not actual
-        profit_bps: estimated_profit_bps,
-        gas_used: receipt.gas_used,
-        gas_limit,
-        gas_cost_mon,
-        execution_time_ms: exec_time,
-        sell_dex: sell_router.name.to_string(),
-        buy_dex: buy_router.name.to_string(),
-        wmon_in: amount,
-        error: if receipt.status() { None } else { Some("Reverted".to_string()) },
-    })
-}
+const MONAD_CHAIN_ID: u64 = 143;
 
-/// TURBO: 2ms polling for receipt
-async fn wait_for_receipt_turbo<P: Provider>(
-    provider: &P,
-    tx_hash: alloy::primitives::TxHash,
-) -> Result<alloy::rpc::types::TransactionReceipt> {
-    use tokio::time::interval;
-    let mut poll = interval(Duration::from_millis(2));
-    
-    for _ in 0..2500 { // 5 seconds max at 2ms intervals
-        poll.tick().await;
-        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
-            return Ok(receipt);
-        }
-    }
-    Err(eyre!("Receipt timeout"))
+let tx = alloy::rpc::types::TransactionRequest::default()
+    .to(contract_address)
+    .from(signer_address)
+    .input(alloy::rpc::types::TransactionInput::new(calldata))
+    .gas_limit(gas_estimate)
+    .nonce(next_nonce())  // Use cached nonce
+    .max_fee_per_gas(gas_price + (gas_price / 10))
+    .max_priority_fee_per_gas(gas_price / 10)
+    .with_chain_id(MONAD_CHAIN_ID);
+```
+
+### Router Type Mapping
+```rust
+#[repr(u8)]
+pub enum ContractRouter {
+    Uniswap = 0,
+    PancakeSwap = 1,
+    MondayTrade = 2,
+    LFJ = 3,
 }
 ```
 
-### 2. `src/main.rs`
-
-Update `Commands::AtomicArb`:
+### Wei Conversion
 ```rust
-Some(Commands::AtomicArb { sell_dex, buy_dex, amount, slippage, min_profit_bps, force, turbo }) => {
-    if turbo {
-        run_atomic_arb_turbo(&sell_dex, &buy_dex, amount, slippage).await
-    } else {
-        run_atomic_arb(&sell_dex, &buy_dex, amount, slippage, min_profit_bps, force).await
-    }
+fn to_wei(amount: f64, decimals: u8) -> U256 {
+    let multiplier = U256::from(10u64).pow(U256::from(decimals));
+    let amount_scaled = (amount * 1e18) as u128;
+    U256::from(amount_scaled) * multiplier / U256::from(10u64).pow(U256::from(18u8))
 }
 ```
-
-Add new function:
-```rust
-async fn run_atomic_arb_turbo(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32) -> Result<()> {
-    let total_start = std::time::Instant::now();
-    
-    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
-    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
-    
-    let url: reqwest::Url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url.clone());
-    
-    let signer = PrivateKeySigner::from_str(&private_key)?;
-    let signer_address = signer.address();
-    
-    // PARALLEL init - already optimized
-    let (gas_result, nonce_result, prices_result) = tokio::join!(
-        provider.get_gas_price(),
-        init_nonce(&provider, signer_address),
-        get_current_prices(&provider)
-    );
-    
-    let gas_price = gas_result.unwrap_or(50_000_000_000); // 50 gwei default
-    nonce_result?;
-    let prices = prices_result?;
-    
-    // Create provider with signer
-    let wallet = EthereumWallet::from(signer);
-    let provider_with_signer = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(url);
-    
-    // Get routers
-    let sell_router = get_router_by_name(sell_dex)
-        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
-    let buy_router = get_router_by_name(buy_dex)
-        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
-    
-    // Get prices
-    let sell_price = prices.iter()
-        .find(|p| p.pool_name.to_lowercase() == sell_dex.to_lowercase())
-        .ok_or_else(|| eyre::eyre!("No price for {}", sell_dex))?.price;
-    let buy_price = prices.iter()
-        .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
-        .ok_or_else(|| eyre::eyre!("No price for {}", buy_dex))?.price;
-    
-    println!("TURBO MODE | {} -> {}", sell_dex, buy_dex);
-    
-    let result = execute_atomic_arb_turbo(
-        &provider_with_signer,
-        signer_address,
-        &sell_router,
-        &buy_router,
-        amount,
-        sell_price,
-        buy_price,
-        slippage,
-        gas_price,
-    ).await?;
-    
-    println!("TX: {}", result.tx_hash);
-    println!("Success: {}", result.success);
-    println!("Estimated Profit: {:.6} WMON ({} bps)", result.profit_wmon, result.profit_bps);
-    println!("TOTAL TIME: {:?}", total_start.elapsed());
-    
-    Ok(())
-}
-```
-
-### 3. Update `src/execution/mod.rs`
-```rust
-pub use atomic_arb::{
-    execute_atomic_arb, 
-    execute_atomic_arb_turbo,  // Add this
-    AtomicArbResult, 
-    print_atomic_arb_result, 
-    query_contract_balances
-};
-```
-
-## Expected Timing Breakdown (TURBO)
-
-| Step | Current | TURBO | Saved |
-|------|---------|-------|-------|
-| Parallel init | 100ms | 100ms | 0ms |
-| Pre-balance query | 80ms | 0ms | 80ms |
-| Gas estimation | 80ms | 0ms | 80ms |
-| Build TX | 5ms | 5ms | 0ms |
-| Send TX | 30ms | 30ms | 0ms |
-| Wait receipt | 150ms | 80ms | 70ms (2ms poll) |
-| Post-balance query | 80ms | 0ms | 80ms |
-| **TOTAL** | **~600ms** | **~215ms** | **~310ms** |
 
 ## Testing Commands
 
 ```bash
-# Standard mode (existing)
-cargo run -- atomic-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 0.1 --force
+# Test atomic arb (manual)
+cargo run -- atomic-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 0.1 --slippage 150
 
-# TURBO mode (new)
-cargo run -- atomic-arb --sell-dex uniswap --buy-dex pancakeswap1 --amount 0.1 --turbo
+# Auto arb with monitoring
+cargo run -- auto-arb --min-spread-bps 10 --amount 0.1 --slippage 150 --max-executions 5
+
+# Check contract balances
+cargo run -- contract-balance
+
+# Fund contract with WMON
+cargo run -- fund-contract --amount 10.0
+
+# Price monitor dashboard
+cargo run -- dashboard --min-spread 5 --refresh-ms 100
 ```
 
-## Important Notes
+## Environment Variables Required
 
-1. **TURBO mode trades accuracy for speed** - profit is estimated, not measured
-2. **Gas limit is hardcoded** - if a new router uses more gas, update `TURBO_GAS_LIMIT`
-3. **No profit verification** - use `--force` behavior implicitly
-4. **For production**, may want to verify profit after-the-fact with balance query
+```bash
+MONAD_RPC_URL=https://your-monad-rpc-endpoint
+MONAD_WS_URL=wss://your-monad-ws-endpoint  # Optional, for WebSocket triggers
+PRIVATE_KEY=0x...  # Wallet private key
+```
 
-## Files to Modify
-1. `src/execution/atomic_arb.rs` - Add `execute_atomic_arb_turbo()` and `wait_for_receipt_turbo()`
-2. `src/main.rs` - Add `--turbo` flag and `run_atomic_arb_turbo()`
-3. `src/execution/mod.rs` - Export new function
+## Success Metrics
 
-## Success Criteria
-- `--turbo` mode completes in <300ms consistently
-- Transaction still succeeds on-chain
-- No regression in standard mode
+| Metric | Current | Target |
+|--------|---------|--------|
+| Execution time | 600-800ms | <300ms |
+| Success rate | ~20% | >80% |
+| Profit accuracy | -40 bps error | <5 bps error |
+
+## Key Constraints
+
+1. **Monad is EVM-compatible** but has unique characteristics:
+   - Fast block times (~500ms)
+   - Optimistic execution (use `monadNewHeads` WebSocket for triggers)
+   - Standard gas model
+
+2. **DEX Pool Fees** (in basis points × 100):
+   - Uniswap: 500 (0.05%)
+   - PancakeSwap: 500 (0.05%)
+   - LFJ: Variable (bin-based)
+   - MondayTrade: 3000 (0.3%)
+
+3. **Token Addresses** (Monad Mainnet):
+   - WMON: Check `config.rs` for `WMON_ADDRESS`
+   - USDC: Check `config.rs` for `USDC_ADDRESS`
+   - Atomic Arb Contract: Check `config.rs` for `ATOMIC_ARB_CONTRACT`
+
+## When Making Changes
+
+1. **Always test on small amounts first** (0.01-0.1 WMON)
+2. **Check gas estimates** before removing gas estimation
+3. **Verify actual balance delta** matches expected profit
+4. **Log timing breakdowns** to identify bottlenecks
+5. **Use `--force` flag** for testing execution path without profit requirements
+
+## Common Issues & Solutions
+
+### "Nonce too low"
+- Nonce manager got out of sync
+- Solution: Restart bot, or call `reset_nonce()`
+
+### "Gas estimation failed"
+- Usually means the arb would be unprofitable (contract reverts)
+- This is expected behavior - skip this opportunity
+
+### "Transaction reverted"
+- Price moved during execution (MEV or natural)
+- Slippage protection triggered
+- Consider increasing slippage or reducing execution time
+
+### Actual profit differs from estimated
+- Price impact not accounted for
+- Slippage during execution
+- Solution: Use actual balance queries for profit calculation
+
+## Next Steps for Optimization
+
+1. Implement gas caching per route pair
+2. Add aggressive 5ms receipt polling
+3. Parallelize remaining sequential operations
+4. Consider WebSocket-triggered execution (`mev-ultra` command)
+5. Profile each RPC call to find remaining bottlenecks
