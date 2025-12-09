@@ -218,14 +218,6 @@ enum Commands {
         /// Force execution even if unprofitable (for testing)
         #[arg(long, default_value = "false")]
         force: bool,
-        /// TURBO mode: skip balance queries and gas estimation for fast execution
-        #[arg(long, default_value = "false")]
-        turbo: bool,
-
-        /// ULTRA mode: use pre-cached prices (sell_price,buy_price) for sub-20ms execution
-        /// Example: --ultra 0.4521,0.4498
-        #[arg(long)]
-        ultra: Option<String>,
     },
 
     /// Automated arbitrage: monitors prices and executes when opportunity found
@@ -351,7 +343,7 @@ enum Commands {
         output: String,
     },
 
-    /// MEV ULTRA - Real execution with ~10ms latency (mev-validate + turbo execution)
+    /// MEV Ultra - WebSocket Proposed state trigger with execution
     MevUltra {
         /// Amount of WMON per arb execution
         #[arg(long, default_value = "0.1")]
@@ -372,14 +364,6 @@ enum Commands {
         /// Cooldown between executions in seconds
         #[arg(long, default_value = "1")]
         cooldown_secs: u64,
-
-        /// Price polling interval in ms (default: 5ms for local node)
-        #[arg(long, default_value = "5")]
-        poll_ms: u64,
-
-        /// Gas price in gwei (0 = fetch from network with 20% buffer)
-        #[arg(long, default_value = "0")]
-        gas_gwei: u64,
     },
 
     /// Live spread dashboard with detailed visualization
@@ -1694,102 +1678,46 @@ async fn run_atomic_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u3
     Ok(())
 }
 
-/// ULTRA MODE: Absolute minimum latency execution
-/// Target: <20ms total execution
-/// - Pre-cached prices (no price RPC calls)
-/// - Hardcoded gas price (no gas RPC)
-/// - Single nonce RPC only
-/// - Fire-and-forget (no receipt waiting)
-async fn run_atomic_arb_ultra(
-    sell_dex: &str,
-    buy_dex: &str,
-    amount: f64,
-    slippage: u32,
-    sell_price: f64,
-    buy_price: f64,
-) -> Result<()> {
-    let total_start = std::time::Instant::now();
-
-    // === ALL SETUP BEFORE RPC (<1ms) ===
-    let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
-    let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
-    let url: reqwest::Url = rpc_url.parse()?;
-
-    let signer = PrivateKeySigner::from_str(&private_key)?;
-    let signer_address = signer.address();
-    let gas_price: u128 = 150_000_000_000;
-
-    // Pre-build everything
-    let sell_router = get_router_by_name(sell_dex)
-        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
-    let buy_router = get_router_by_name(buy_dex)
-        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
-    let wallet = EthereumWallet::from(signer);
-    let provider = ProviderBuilder::new().connect_http(url.clone());
-    let provider_with_signer = ProviderBuilder::new().wallet(wallet).connect_http(url);
-
-    // === SINGLE RPC: nonce (~10ms) ===
-    init_nonce(&provider, signer_address).await?;
-    let init_time = total_start.elapsed();
-
-    // === EXECUTE (~10ms) ===
-    let exec_start = std::time::Instant::now();
-    let result = execution::atomic_arb::execute_atomic_arb_turbo(
-        &provider_with_signer, signer_address, &sell_router, &buy_router,
-        amount, sell_price, buy_price, slippage, gas_price,
-    ).await?;
-
-    let total_time = total_start.elapsed();
-    let tx_short = if result.tx_hash.len() >= 18 { &result.tx_hash[0..18] } else { &result.tx_hash };
-    println!("ULTRA | {} -> {} | TX: {}... | Init: {:?} | Exec: {:?} | TOTAL: {:?}",
-        sell_dex, buy_dex, tx_short, init_time, exec_start.elapsed(), total_time);
-    if let Some(err) = &result.error { println!("ERROR: {}", err); }
-
-    Ok(())
-}
-
-/// TURBO MODE: Execute atomic arb with MAXIMUM speed (fire-and-forget)
-/// Target: <40ms total execution
-/// - Uses hardcoded gas price (no RPC)
-/// - Parallel nonce + price fetch
-/// - Pre-build wallet before RPC calls
-/// - No receipt waiting
+/// TURBO MODE: Execute atomic arb with minimal latency (<300ms target)
+/// Skips pre/post balance queries and gas estimation for maximum speed
 async fn run_atomic_arb_turbo(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u32) -> Result<()> {
     let total_start = std::time::Instant::now();
 
-    // === SETUP PHASE (pure computation, <1ms) ===
     let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+
     let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url.clone());
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
     let signer_address = signer.address();
 
-    // Pre-build routers (pure computation)
-    let sell_router = get_router_by_name(sell_dex)
-        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
-    let buy_router = get_router_by_name(buy_dex)
-        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
+    // PARALLEL init - already optimized
+    let (gas_result, nonce_result, prices_result) = tokio::join!(
+        provider.get_gas_price(),
+        init_nonce(&provider, signer_address),
+        get_current_prices(&provider)
+    );
 
-    // Pre-build wallet and provider (no network call)
+    let gas_price = gas_result.unwrap_or(50_000_000_000); // 50 gwei default
+    nonce_result?;
+    let prices = prices_result?;
+
+    println!("  [TIMING] Init: {:?}", total_start.elapsed());
+
+    // Create provider with signer
     let wallet = EthereumWallet::from(signer);
-    let provider = ProviderBuilder::new().connect_http(url.clone());
     let provider_with_signer = ProviderBuilder::new()
         .wallet(wallet)
         .connect_http(url);
 
-    // Hardcoded gas price
-    let gas_price: u128 = 150_000_000_000;
+    // Get routers
+    let sell_router = get_router_by_name(sell_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown sell DEX: {}", sell_dex))?;
+    let buy_router = get_router_by_name(buy_dex)
+        .ok_or_else(|| eyre::eyre!("Unknown buy DEX: {}", buy_dex))?;
 
-    // === RPC PHASE (parallel, ~25ms) ===
-    let (nonce_result, prices_result) = tokio::join!(
-        init_nonce(&provider, signer_address),
-        get_current_prices(&provider)
-    );
-    nonce_result?;
-    let prices = prices_result?;
-
-    // Get prices (pure lookup, <1us)
+    // Get prices
     let sell_price = prices.iter()
         .find(|p| p.pool_name.to_lowercase() == sell_dex.to_lowercase())
         .ok_or_else(|| eyre::eyre!("No price for {}", sell_dex))?.price;
@@ -1797,11 +1725,11 @@ async fn run_atomic_arb_turbo(sell_dex: &str, buy_dex: &str, amount: f64, slippa
         .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
         .ok_or_else(|| eyre::eyre!("No price for {}", buy_dex))?.price;
 
-    let init_time = total_start.elapsed();
+    println!("\n==============================================================");
+    println!("  TURBO MODE | {} -> {} (single TX, max speed)", sell_dex, buy_dex);
+    println!("==============================================================");
 
-    // === EXECUTE PHASE (~10ms) ===
-    let exec_start = std::time::Instant::now();
-    let result = execution::atomic_arb::execute_atomic_arb_turbo(
+    let result = execution::execute_atomic_arb(
         &provider_with_signer,
         signer_address,
         &sell_router,
@@ -1810,17 +1738,13 @@ async fn run_atomic_arb_turbo(sell_dex: &str, buy_dex: &str, amount: f64, slippa
         sell_price,
         buy_price,
         slippage,
+        0,  // min_profit_bps ignored
         gas_price,
+        true,  // force flag ignored
     ).await?;
 
-    let total_time = total_start.elapsed();
-
-    let tx_short = if result.tx_hash.len() >= 18 { &result.tx_hash[0..18] } else { &result.tx_hash };
-    println!("TURBO | {} -> {} | TX: {}... | Init: {:?} | Exec: {:?} | TOTAL: {:?}",
-        sell_dex, buy_dex, tx_short, init_time, exec_start.elapsed(), total_time);
-    if let Some(err) = &result.error {
-        println!("ERROR: {}", err);
-    }
+    print_atomic_arb_result(&result);
+    println!("  [TIMING] TOTAL: {:?} (TURBO)", total_start.elapsed());
 
     Ok(())
 }
@@ -2805,16 +2729,13 @@ async fn run_contract_balance() -> Result<()> {
     Ok(())
 }
 
-/// MEV ULTRA - Execute on Proposed block state via WebSocket
-/// This is the optimal MEV strategy - execute at earliest block lifecycle point
+/// MEV Ultra - WebSocket Proposed state trigger with execution
 async fn run_mev_ultra(
     amount: f64,
     slippage: u32,
     min_spread_bps: i32,
     max_executions: u32,
     cooldown_secs: u64,
-    _poll_ms: u64,  // Ignored - we use WebSocket events now
-    gas_gwei: u64,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -2829,8 +2750,7 @@ async fn run_mev_ultra(
     println!("  Amount: {} WMON | Slippage: {} bps | Min Spread: {} bps", amount, slippage, min_spread_bps);
     println!("  Max Executions: {} | Cooldown: {}s",
         if max_executions == 0 { "∞".to_string() } else { max_executions.to_string() }, cooldown_secs);
-    println!("  \x1b[33mTrigger: WebSocket monadNewHeads -> Proposed state\x1b[0m");
-    println!("  \x1b[33mTarget: ~10ms execution (fire-and-forget)\x1b[0m\n");
+    println!("  \x1b[33mTrigger: WebSocket monadNewHeads -> Proposed state\x1b[0m\n");
 
     // Setup wallet and signer
     let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
@@ -2845,19 +2765,6 @@ async fn run_mev_ultra(
     let wallet = EthereumWallet::from(signer);
     let provider = ProviderBuilder::new().connect_http(url.clone());
     let provider_with_signer = ProviderBuilder::new().wallet(wallet).connect_http(url);
-
-    // Get gas price: use provided value or fetch from network with 20% buffer
-    let gas_price: u128 = if gas_gwei > 0 {
-        gas_gwei as u128 * 1_000_000_000
-    } else {
-        let network_gas = provider.get_gas_price().await.unwrap_or(50_000_000_000);
-        let buffered = network_gas + (network_gas / 5); // +20% buffer
-        println!("  Gas: {} gwei (network {} + 20% buffer)", buffered / 1_000_000_000, network_gas / 1_000_000_000);
-        buffered
-    };
-    if gas_gwei > 0 {
-        println!("  Gas: {} gwei (fixed)", gas_gwei);
-    }
 
     // Initialize nonce once
     init_nonce(&provider, signer_address).await?;
@@ -3016,9 +2923,17 @@ async fn run_mev_ultra(
         let sell_price = best.sell_price;
         let buy_price = best.buy_price;
 
-        // EXECUTE WITH TURBO SPEED
+        // Get gas price from network
+        let gas_price = provider.get_gas_price().await.unwrap_or(50_000_000_000);
+
+        println!("\n\x1b[1;32m[EXEC #{} @ Block {}]\x1b[0m", executions + 1, block_num);
+        println!("  \x1b[1;36mTrigger: PROPOSED state\x1b[0m");
+        println!("  Route: {} ({:.4}) -> {} ({:.4})", sell_pool, sell_price, buy_pool, buy_price);
+        println!("  Spread: {} bps | Amount: {} WMON", spread_bps, amount);
+
+        // Execute using standard execute_atomic_arb
         let exec_start = std::time::Instant::now();
-        let result = execution::atomic_arb::execute_atomic_arb_turbo(
+        let result = execution::execute_atomic_arb(
             &provider_with_signer,
             signer_address,
             &sell_router,
@@ -3027,7 +2942,9 @@ async fn run_mev_ultra(
             sell_price,
             buy_price,
             slippage,
+            0,  // min_profit_bps
             gas_price,
+            true,  // force
         ).await;
 
         let exec_time = exec_start.elapsed();
@@ -3038,19 +2955,8 @@ async fn run_mev_ultra(
                 executions += 1;
                 last_execution = std::time::Instant::now();
 
-                println!("\n\x1b[1;32m[EXEC #{} @ Block {}]\x1b[0m", executions, block_num);
-                println!("  \x1b[1;36mTrigger: PROPOSED state\x1b[0m");
-                println!("  Route: {} ({:.4}) -> {} ({:.4})", sell_pool, sell_price, buy_pool, buy_price);
-                println!("  Spread: {} bps | Amount: {} WMON", spread_bps, amount);
-                println!("  TX: {}", res.tx_hash);
-                println!("  Est Profit: {:.6} WMON ({} bps)", res.profit_wmon, res.profit_bps);
-                println!("  Est Gas: {:.6} MON", res.gas_cost_mon);
+                print_atomic_arb_result(&res);
                 println!("  \x1b[1;33mTiming: Fetch {:?} + Exec {:?} = {:?}\x1b[0m", fetch_time, exec_time, total_time);
-
-                if let Some(err) = &res.error {
-                    println!("  \x1b[31mTX Error: {}\x1b[0m", err);
-                }
-                println!();
 
                 if max_executions > 0 && executions >= max_executions {
                     println!("\x1b[33mMax executions reached ({})\x1b[0m", max_executions);
@@ -3058,7 +2964,7 @@ async fn run_mev_ultra(
                 }
             }
             Err(e) => {
-                println!("\n\x1b[31m[SEND ERROR @ Block {}]\x1b[0m {} -> {} | {}\n", block_num, sell_pool, buy_pool, e);
+                println!("\n\x1b[31m[ERROR @ Block {}]\x1b[0m {} -> {} | {}\n", block_num, sell_pool, buy_pool, e);
             }
         }
     }
@@ -3242,21 +3148,8 @@ async fn main() -> Result<()> {
         Some(Commands::FastArb { sell_dex, buy_dex, amount, slippage }) => {
             run_fast_arb(&sell_dex, &buy_dex, amount, slippage).await
         }
-        Some(Commands::AtomicArb { sell_dex, buy_dex, amount, slippage, min_profit_bps, force, turbo, ultra }) => {
-            if let Some(prices_str) = ultra {
-                // ULTRA mode: parse cached prices and execute with minimal latency
-                let parts: Vec<&str> = prices_str.split(',').collect();
-                if parts.len() != 2 {
-                    return Err(eyre::eyre!("--ultra requires format: sell_price,buy_price (e.g., 0.4521,0.4498)"));
-                }
-                let sell_price: f64 = parts[0].parse().map_err(|_| eyre::eyre!("Invalid sell_price"))?;
-                let buy_price: f64 = parts[1].parse().map_err(|_| eyre::eyre!("Invalid buy_price"))?;
-                run_atomic_arb_ultra(&sell_dex, &buy_dex, amount, slippage, sell_price, buy_price).await
-            } else if turbo {
-                run_atomic_arb_turbo(&sell_dex, &buy_dex, amount, slippage).await
-            } else {
-                run_atomic_arb(&sell_dex, &buy_dex, amount, slippage, min_profit_bps, force).await
-            }
+        Some(Commands::AtomicArb { sell_dex, buy_dex, amount, slippage, min_profit_bps, force }) => {
+            run_atomic_arb(&sell_dex, &buy_dex, amount, slippage, min_profit_bps, force).await
         }
         Some(Commands::AutoArb {
             min_spread_bps,
@@ -3299,8 +3192,8 @@ async fn main() -> Result<()> {
         Some(Commands::MevValidate { duration, min_spread, output }) => {
             run_mev_validate(duration, min_spread, &output).await
         }
-        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs, poll_ms, gas_gwei }) => {
-            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs, poll_ms, gas_gwei).await
+        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs }) => {
+            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs).await
         }
         Some(Commands::Dashboard { min_spread, history, refresh_ms, sound }) => {
             run_dashboard(min_spread, history, refresh_ms, sound).await
