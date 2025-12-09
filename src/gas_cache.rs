@@ -14,7 +14,8 @@ const GAS_CACHE_TTL_MS: u128 = 30_000;
 const GAS_CACHE_TTL_MEDIUM_MS: u128 = 10_000;
 
 /// Spread threshold for cache invalidation (if spread increased by this much, invalidate)
-const SPREAD_DELTA_THRESHOLD_BPS: i32 = 20;
+/// Set to 7 bps for more aggressive invalidation during volatile conditions
+const SPREAD_DELTA_THRESHOLD_BPS: i32 = 7;
 
 /// Low spread threshold (bps)
 const LOW_SPREAD_BPS: i32 = 15;
