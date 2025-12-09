@@ -376,6 +376,10 @@ enum Commands {
         /// Price polling interval in ms (default: 5ms for local node)
         #[arg(long, default_value = "5")]
         poll_ms: u64,
+
+        /// Gas price in gwei (0 = fetch from network with 20% buffer)
+        #[arg(long, default_value = "0")]
+        gas_gwei: u64,
     },
 
     /// Live spread dashboard with detailed visualization
@@ -2810,6 +2814,7 @@ async fn run_mev_ultra(
     max_executions: u32,
     cooldown_secs: u64,
     _poll_ms: u64,  // Ignored - we use WebSocket events now
+    gas_gwei: u64,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -2835,12 +2840,24 @@ async fn run_mev_ultra(
 
     let signer = PrivateKeySigner::from_str(&private_key)?;
     let signer_address = signer.address();
-    let gas_price: u128 = 150_000_000_000; // 150 gwei
 
     // Pre-build wallet and providers
     let wallet = EthereumWallet::from(signer);
     let provider = ProviderBuilder::new().connect_http(url.clone());
     let provider_with_signer = ProviderBuilder::new().wallet(wallet).connect_http(url);
+
+    // Get gas price: use provided value or fetch from network with 20% buffer
+    let gas_price: u128 = if gas_gwei > 0 {
+        gas_gwei as u128 * 1_000_000_000
+    } else {
+        let network_gas = provider.get_gas_price().await.unwrap_or(50_000_000_000);
+        let buffered = network_gas + (network_gas / 5); // +20% buffer
+        println!("  Gas: {} gwei (network {} + 20% buffer)", buffered / 1_000_000_000, network_gas / 1_000_000_000);
+        buffered
+    };
+    if gas_gwei > 0 {
+        println!("  Gas: {} gwei (fixed)", gas_gwei);
+    }
 
     // Initialize nonce once
     init_nonce(&provider, signer_address).await?;
@@ -3282,8 +3299,8 @@ async fn main() -> Result<()> {
         Some(Commands::MevValidate { duration, min_spread, output }) => {
             run_mev_validate(duration, min_spread, &output).await
         }
-        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs, poll_ms }) => {
-            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs, poll_ms).await
+        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs, poll_ms, gas_gwei }) => {
+            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs, poll_ms, gas_gwei).await
         }
         Some(Commands::Dashboard { min_spread, history, refresh_ms, sound }) => {
             run_dashboard(min_spread, history, refresh_ms, sound).await
