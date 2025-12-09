@@ -2940,15 +2940,28 @@ async fn run_mev_ultra(
                     last_execution = std::time::Instant::now();
 
                     let tx_short = if res.tx_hash.len() >= 18 { &res.tx_hash[0..18] } else { &res.tx_hash };
-                    println!("\x1b[1;32m[EXEC #{}]\x1b[0m {} -> {} | Spread: {} bps | TX: {}... | \x1b[1;36m{:?}\x1b[0m",
-                        executions, sell_pool, buy_pool, spread_bps, tx_short, exec_time);
+
+                    // Detailed output
+                    println!("\n\x1b[1;32m[EXEC #{}]\x1b[0m {:?}", executions, exec_time);
+                    println!("  Route: {} ({:.4}) -> {} ({:.4})", sell_pool, sell_price, buy_pool, buy_price);
+                    println!("  Spread: {} bps | Amount: {} WMON", spread_bps, amount);
+                    println!("  TX: {}", res.tx_hash);
+                    println!("  Est Profit: {:.6} WMON ({} bps)", res.profit_wmon, res.profit_bps);
+                    println!("  Est Gas: {:.6} MON", res.gas_cost_mon);
 
                     if let Some(err) = &res.error {
-                        println!("  \x1b[31mError: {}\x1b[0m", err);
+                        println!("  \x1b[31mTX Error: {}\x1b[0m", err);
+                    }
+                    println!();
+
+                    // Check max executions AFTER incrementing
+                    if max_executions > 0 && executions >= max_executions {
+                        println!("\x1b[33mMax executions reached ({})\x1b[0m", max_executions);
+                        break;
                     }
                 }
                 Err(e) => {
-                    println!("\x1b[31m[ERROR]\x1b[0m {} -> {} | {}", sell_pool, buy_pool, e);
+                    println!("\n\x1b[31m[SEND ERROR]\x1b[0m {} -> {} | {}\n", sell_pool, buy_pool, e);
                 }
             }
         }
