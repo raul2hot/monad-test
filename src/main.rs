@@ -2801,26 +2801,35 @@ async fn run_contract_balance() -> Result<()> {
     Ok(())
 }
 
-/// MEV ULTRA - Monitor and execute with ~10ms latency
-/// Combines mev-validate monitoring with turbo execution
+/// MEV ULTRA - Execute on Proposed block state via WebSocket
+/// This is the optimal MEV strategy - execute at earliest block lifecycle point
 async fn run_mev_ultra(
     amount: f64,
     slippage: u32,
     min_spread_bps: i32,
     max_executions: u32,
     cooldown_secs: u64,
-    poll_ms: u64,
+    _poll_ms: u64,  // Ignored - we use WebSocket events now
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use futures_util::{SinkExt, StreamExt};
 
-    println!("\n\x1b[1;36m=== MEV ULTRA MODE ===\x1b[0m");
-    println!("Amount: {} WMON | Slippage: {} bps | Min Spread: {} bps | Poll: {}ms", amount, slippage, min_spread_bps, poll_ms);
-    println!("Max Executions: {} | Cooldown: {}s", if max_executions == 0 { "∞".to_string() } else { max_executions.to_string() }, cooldown_secs);
-    println!("\x1b[33mTarget execution: ~10ms (fire-and-forget)\x1b[0m\n");
+    let node_config = NodeConfig::from_env();
 
-    // Setup
+    println!("\n\x1b[1;36m╔═══════════════════════════════════════════════════════════════╗\x1b[0m");
+    println!("\x1b[1;36m║              MEV ULTRA - PROPOSED STATE TRIGGER               ║\x1b[0m");
+    println!("\x1b[1;36m╚═══════════════════════════════════════════════════════════════╝\x1b[0m");
+    println!("  Amount: {} WMON | Slippage: {} bps | Min Spread: {} bps", amount, slippage, min_spread_bps);
+    println!("  Max Executions: {} | Cooldown: {}s",
+        if max_executions == 0 { "∞".to_string() } else { max_executions.to_string() }, cooldown_secs);
+    println!("  \x1b[33mTrigger: WebSocket monadNewHeads -> Proposed state\x1b[0m");
+    println!("  \x1b[33mTarget: ~10ms execution (fire-and-forget)\x1b[0m\n");
+
+    // Setup wallet and signer
     let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
+    let ws_url = std::env::var("MONAD_WS_URL").unwrap_or_else(|_| node_config.ws_url.clone());
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
     let url: reqwest::Url = rpc_url.parse()?;
 
@@ -2854,31 +2863,101 @@ async fn run_mev_ultra(
         r.store(false, Ordering::SeqCst);
     })?;
 
-    let mut executions = 0u32;
-    let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
-    let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
-    let mut last_heartbeat = std::time::Instant::now();
-    let mut poll_count = 0u64;
+    // Connect to WebSocket
+    println!("Connecting to WebSocket: {}...", ws_url);
+    let (ws_stream, _) = connect_async(&ws_url).await?;
+    let (mut write, mut read) = ws_stream.split();
 
-    println!("\x1b[1;32mMonitoring ({}ms poll)... Press Ctrl+C to stop\x1b[0m\n", poll_ms);
+    // Subscribe to monadNewHeads
+    let subscribe_msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_subscribe",
+        "params": ["monadNewHeads"]
+    });
+    write.send(Message::Text(subscribe_msg.to_string())).await?;
+    println!("\x1b[1;32mSubscribed to monadNewHeads. Waiting for Proposed blocks...\x1b[0m\n");
+
+    let mut executions = 0u32;
+    let mut blocks_seen = 0u64;
+    let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
+    let mut last_heartbeat = std::time::Instant::now();
 
     while running.load(Ordering::SeqCst) {
-        poll_interval.tick().await;
-        poll_count += 1;
-
-        // Heartbeat every 10 seconds to keep SSH alive
+        // Heartbeat every 10 seconds
         if last_heartbeat.elapsed().as_secs() >= 10 {
             let now = chrono::Local::now().format("%H:%M:%S");
-            print!("\r\x1b[90m[{}] Polls: {} | Execs: {} | Waiting...\x1b[0m", now, poll_count, executions);
+            print!("\r\x1b[90m[{}] Blocks: {} | Execs: {} | Waiting for Proposed...\x1b[0m    ",
+                now, blocks_seen, executions);
             std::io::Write::flush(&mut std::io::stdout()).ok();
             last_heartbeat = std::time::Instant::now();
         }
 
-        // Fetch prices
+        // Read WebSocket message with timeout
+        let msg_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read.next()
+        ).await;
+
+        let msg = match msg_result {
+            Ok(Some(Ok(Message::Text(text)))) => text,
+            Ok(Some(Ok(Message::Ping(data)))) => {
+                let _ = write.send(Message::Pong(data)).await;
+                continue;
+            }
+            Ok(Some(Err(e))) => {
+                println!("\n\x1b[31mWebSocket error: {}\x1b[0m", e);
+                break;
+            }
+            Ok(None) => {
+                println!("\n\x1b[31mWebSocket closed\x1b[0m");
+                break;
+            }
+            Err(_) => continue, // Timeout - just continue
+            _ => continue,
+        };
+
+        // Parse JSON
+        let json: serde_json::Value = match serde_json::from_str(&msg) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+
+        // Skip subscription confirmation
+        if json.get("result").is_some() && json.get("id").is_some() {
+            continue;
+        }
+
+        // Extract block header
+        let header = match json.get("params")
+            .and_then(|p| p.get("result"))
+        {
+            Some(result) => result,
+            None => continue,
+        };
+
+        let commit_state = header.get("commitState")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+
+        // ONLY trigger on Proposed state
+        if commit_state != "Proposed" {
+            continue;
+        }
+
+        blocks_seen += 1;
+        let block_num = header.get("number")
+            .and_then(|n| n.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+
+        // Fetch prices immediately on Proposed
+        let fetch_start = std::time::Instant::now();
         let prices = match fetch_prices_batched(&provider, price_calls.clone()).await {
             Ok((p, _)) => p,
             Err(_) => continue,
         };
+        let fetch_time = fetch_start.elapsed();
 
         // Calculate spreads
         let spreads = calculate_spreads(&prices);
@@ -2890,85 +2969,85 @@ async fn run_mev_ultra(
         let spread_bps = (best.net_spread_pct * 100.0) as i32;
 
         // Check if actionable
-        if spread_bps >= min_spread_bps {
-            // Check cooldown
-            if last_execution.elapsed().as_secs() < cooldown_secs {
-                continue;
-            }
+        if spread_bps < min_spread_bps {
+            continue;
+        }
 
-            // Check max executions
-            if max_executions > 0 && executions >= max_executions {
-                println!("\x1b[33mMax executions reached ({})\x1b[0m", max_executions);
-                break;
-            }
+        // Check cooldown
+        if last_execution.elapsed().as_secs() < cooldown_secs {
+            continue;
+        }
 
-            // Get routers and prices for this pair
-            let sell_pool = &best.sell_pool;
-            let buy_pool = &best.buy_pool;
-            let sell_router = match get_router_by_name(sell_pool) {
-                Some(r) => r,
-                None => continue,
-            };
-            let buy_router = match get_router_by_name(buy_pool) {
-                Some(r) => r,
-                None => continue,
-            };
+        // Check max executions
+        if max_executions > 0 && executions >= max_executions {
+            println!("\n\x1b[33mMax executions reached ({})\x1b[0m", max_executions);
+            break;
+        }
 
-            // Use prices from spread calculation
-            let sell_price = best.sell_price;
-            let buy_price = best.buy_price;
+        // Get routers
+        let sell_pool = &best.sell_pool;
+        let buy_pool = &best.buy_pool;
+        let sell_router = match get_router_by_name(sell_pool) {
+            Some(r) => r,
+            None => continue,
+        };
+        let buy_router = match get_router_by_name(buy_pool) {
+            Some(r) => r,
+            None => continue,
+        };
 
-            // EXECUTE WITH TURBO SPEED
-            let exec_start = std::time::Instant::now();
-            let result = execution::atomic_arb::execute_atomic_arb_turbo(
-                &provider_with_signer,
-                signer_address,
-                &sell_router,
-                &buy_router,
-                amount,
-                sell_price,
-                buy_price,
-                slippage,
-                gas_price,
-            ).await;
+        let sell_price = best.sell_price;
+        let buy_price = best.buy_price;
 
-            let exec_time = exec_start.elapsed();
+        // EXECUTE WITH TURBO SPEED
+        let exec_start = std::time::Instant::now();
+        let result = execution::atomic_arb::execute_atomic_arb_turbo(
+            &provider_with_signer,
+            signer_address,
+            &sell_router,
+            &buy_router,
+            amount,
+            sell_price,
+            buy_price,
+            slippage,
+            gas_price,
+        ).await;
 
-            match result {
-                Ok(res) => {
-                    executions += 1;
-                    last_execution = std::time::Instant::now();
+        let exec_time = exec_start.elapsed();
+        let total_time = fetch_start.elapsed();
 
-                    let tx_short = if res.tx_hash.len() >= 18 { &res.tx_hash[0..18] } else { &res.tx_hash };
+        match result {
+            Ok(res) => {
+                executions += 1;
+                last_execution = std::time::Instant::now();
 
-                    // Detailed output
-                    println!("\n\x1b[1;32m[EXEC #{}]\x1b[0m {:?}", executions, exec_time);
-                    println!("  Route: {} ({:.4}) -> {} ({:.4})", sell_pool, sell_price, buy_pool, buy_price);
-                    println!("  Spread: {} bps | Amount: {} WMON", spread_bps, amount);
-                    println!("  TX: {}", res.tx_hash);
-                    println!("  Est Profit: {:.6} WMON ({} bps)", res.profit_wmon, res.profit_bps);
-                    println!("  Est Gas: {:.6} MON", res.gas_cost_mon);
+                println!("\n\x1b[1;32m[EXEC #{} @ Block {}]\x1b[0m", executions, block_num);
+                println!("  \x1b[1;36mTrigger: PROPOSED state\x1b[0m");
+                println!("  Route: {} ({:.4}) -> {} ({:.4})", sell_pool, sell_price, buy_pool, buy_price);
+                println!("  Spread: {} bps | Amount: {} WMON", spread_bps, amount);
+                println!("  TX: {}", res.tx_hash);
+                println!("  Est Profit: {:.6} WMON ({} bps)", res.profit_wmon, res.profit_bps);
+                println!("  Est Gas: {:.6} MON", res.gas_cost_mon);
+                println!("  \x1b[1;33mTiming: Fetch {:?} + Exec {:?} = {:?}\x1b[0m", fetch_time, exec_time, total_time);
 
-                    if let Some(err) = &res.error {
-                        println!("  \x1b[31mTX Error: {}\x1b[0m", err);
-                    }
-                    println!();
-
-                    // Check max executions AFTER incrementing
-                    if max_executions > 0 && executions >= max_executions {
-                        println!("\x1b[33mMax executions reached ({})\x1b[0m", max_executions);
-                        break;
-                    }
+                if let Some(err) = &res.error {
+                    println!("  \x1b[31mTX Error: {}\x1b[0m", err);
                 }
-                Err(e) => {
-                    println!("\n\x1b[31m[SEND ERROR]\x1b[0m {} -> {} | {}\n", sell_pool, buy_pool, e);
+                println!();
+
+                if max_executions > 0 && executions >= max_executions {
+                    println!("\x1b[33mMax executions reached ({})\x1b[0m", max_executions);
+                    break;
                 }
+            }
+            Err(e) => {
+                println!("\n\x1b[31m[SEND ERROR @ Block {}]\x1b[0m {} -> {} | {}\n", block_num, sell_pool, buy_pool, e);
             }
         }
     }
 
     println!("\n\x1b[1;36m=== MEV ULTRA STOPPED ===\x1b[0m");
-    println!("Total executions: {}", executions);
+    println!("Proposed blocks seen: {} | Executions: {}", blocks_seen, executions);
 
     Ok(())
 }
