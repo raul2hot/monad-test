@@ -31,10 +31,6 @@ const MONAD_CHAIN_ID: u64 = 143;
 // Gas buffer for atomic arb (tighter than 2-TX version)
 const GAS_BUFFER_PERCENT: u64 = 12;
 
-// TURBO mode constants - hardcoded gas to skip estimation
-const TURBO_GAS_LIMIT: u64 = 500_000;  // Safe for all router combinations
-const TURBO_GAS_BUFFER: u64 = 50_000;  // Extra buffer for safety
-
 // Router enum matching Solidity contract
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -159,7 +155,7 @@ fn build_router_calldata(
     )
 }
 
-/// Execute atomic arbitrage via smart contract (optimized for speed)
+/// Execute atomic arbitrage via smart contract
 ///
 /// # Arguments
 /// * `provider_with_signer` - Provider with wallet for sending transactions
@@ -181,24 +177,54 @@ pub async fn execute_atomic_arb<P: Provider>(
     sell_price: f64,
     buy_price: f64,
     slippage_bps: u32,
-    _min_profit_bps: i32,  // Ignored for speed - contract handles slippage protection
+    min_profit_bps: i32,
     gas_price: u128,
-    _force: bool,  // Always use unchecked for speed
+    force: bool,
 ) -> Result<AtomicArbResult> {
     let start = std::time::Instant::now();
 
-    // Calculate amounts (pure computation, instant)
+    // Validate contract address is set
+    if ATOMIC_ARB_CONTRACT == Address::ZERO {
+        return Err(eyre!("ATOMIC_ARB_CONTRACT not set in config.rs. Deploy contract first!"));
+    }
+
+    // Pre-TX balance snapshot - query balances BEFORE execution
+    let (wmon_before, usdc_before) = query_contract_balances(provider_with_signer).await?;
+    println!("  Contract balances before: {:.6} WMON, {:.6} USDC", wmon_before, usdc_before);
+
+    // Calculate amounts
     let wmon_in_wei = to_wei(amount, WMON_DECIMALS);
     let expected_usdc = amount * sell_price;
     let slippage_mult = 1.0 - (slippage_bps as f64 / 10000.0);
     let min_usdc_out = expected_usdc * slippage_mult;
     let min_usdc_out_wei = to_wei(min_usdc_out, USDC_DECIMALS);
 
+    // Calculate minimum WMON output for swap 2 (slippage protection)
     let expected_wmon_back = expected_usdc / buy_price;
     let min_wmon_out = expected_wmon_back * slippage_mult;
     let min_wmon_out_wei = to_wei(min_wmon_out, WMON_DECIMALS);
 
-    // Build calldata (pure computation)
+    // Calculate minimum profit for contract
+    let min_profit_wmon = if min_profit_bps > 0 {
+        amount * (min_profit_bps as f64 / 10000.0)
+    } else {
+        0.0
+    };
+    let min_profit_wei = to_wei(min_profit_wmon, WMON_DECIMALS);
+
+    // Get pool fee for the buy router (convert to u24)
+    let buy_pool_fee: u32 = buy_router.pool_fee;
+
+    println!("  Building atomic arb calldata...");
+    println!("    WMON in: {:.6}", amount);
+    println!("    Expected USDC: {:.6}", expected_usdc);
+    println!("    Min USDC out: {:.6}", min_usdc_out);
+    println!("    Expected WMON back: {:.6}", expected_wmon_back);
+    println!("    Min WMON out: {:.6}", min_wmon_out);
+    println!("    Buy pool fee: {}", buy_pool_fee);
+    println!("    Min profit: {:.6} WMON ({} bps)", min_profit_wmon, min_profit_bps);
+
+    // Build calldata for sell swap only (swap 2 is built on-chain)
     let sell_calldata = build_router_calldata(
         sell_router,
         SwapDirection::Sell,
@@ -206,10 +232,11 @@ pub async fn execute_atomic_arb<P: Provider>(
         min_usdc_out_wei,
     )?;
 
-    let buy_pool_fee_u24: Uint<24, 1> = Uint::from(buy_router.pool_fee);
+    // Build executeArb call (use unchecked version if force=true)
+    let buy_pool_fee_u24: Uint<24, 1> = Uint::from(buy_pool_fee);
 
-    // Use unchecked version for speed
-    let calldata = {
+    let calldata = if force {
+        println!("  Using UNCHECKED mode (force=true) - no profit check");
         let execute_call = executeArbUncheckedCall {
             sellRouter: ContractRouter::from(sell_router.router_type) as u8,
             sellRouterData: sell_calldata,
@@ -218,52 +245,228 @@ pub async fn execute_atomic_arb<P: Provider>(
             minWmonOut: min_wmon_out_wei,
         };
         Bytes::from(execute_call.abi_encode())
+    } else {
+        let execute_call = executeArbCall {
+            sellRouter: ContractRouter::from(sell_router.router_type) as u8,
+            sellRouterData: sell_calldata,
+            buyRouter: ContractRouter::from(buy_router.router_type) as u8,
+            buyPoolFee: buy_pool_fee_u24,
+            minWmonOut: min_wmon_out_wei,
+            minProfit: min_profit_wei,
+        };
+        Bytes::from(execute_call.abi_encode())
     };
 
-    // HARDCODED gas limit - skip estimation RPC call
-    let gas_limit = TURBO_GAS_LIMIT + TURBO_GAS_BUFFER;
+    // Estimate gas
+    println!("  Estimating gas...");
+    let estimate_tx = alloy::rpc::types::TransactionRequest::default()
+        .to(ATOMIC_ARB_CONTRACT)
+        .from(signer_address)
+        .input(alloy::rpc::types::TransactionInput::new(calldata.clone()));
+
+    let gas_estimate = match provider_with_signer.estimate_gas(estimate_tx).await {
+        Ok(est) => {
+            let with_buffer = est * (100 + GAS_BUFFER_PERCENT) / 100;
+            println!("    Estimated: {} + {}% = {}", est, GAS_BUFFER_PERCENT, with_buffer);
+            with_buffer
+        }
+        Err(e) => {
+            // If estimation fails, the arb would likely fail
+            return Ok(AtomicArbResult {
+                tx_hash: String::new(),
+                success: false,
+                profit_wmon: 0.0,
+                profit_bps: 0,
+                gas_used: 0,
+                gas_limit: 0,
+                gas_cost_mon: 0.0,
+                execution_time_ms: start.elapsed().as_millis(),
+                sell_dex: sell_router.name.to_string(),
+                buy_dex: buy_router.name.to_string(),
+                wmon_in: amount,
+                error: Some(format!("Gas estimation failed (arb likely unprofitable): {}", e)),
+            });
+        }
+    };
 
     // Build and send transaction
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(ATOMIC_ARB_CONTRACT)
         .from(signer_address)
         .input(alloy::rpc::types::TransactionInput::new(calldata))
-        .gas_limit(gas_limit)
+        .gas_limit(gas_estimate)
         .nonce(next_nonce())
         .max_fee_per_gas(gas_price + (gas_price / 10))
         .max_priority_fee_per_gas(gas_price / 10)
         .with_chain_id(MONAD_CHAIN_ID);
 
-    // Send transaction
-    let pending = provider_with_signer.send_transaction(tx).await?;
+    println!("  Sending atomic arb transaction...");
+    let send_start = std::time::Instant::now();
+
+    let pending = match timeout(
+        Duration::from_secs(10),
+        provider_with_signer.send_transaction(tx)
+    ).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            return Ok(AtomicArbResult {
+                tx_hash: String::new(),
+                success: false,
+                profit_wmon: 0.0,
+                profit_bps: 0,
+                gas_used: 0,
+                gas_limit: gas_estimate,
+                gas_cost_mon: 0.0,
+                execution_time_ms: start.elapsed().as_millis(),
+                sell_dex: sell_router.name.to_string(),
+                buy_dex: buy_router.name.to_string(),
+                wmon_in: amount,
+                error: Some(format!("Send failed: {}", e)),
+            });
+        }
+        Err(_) => {
+            return Ok(AtomicArbResult {
+                tx_hash: String::new(),
+                success: false,
+                profit_wmon: 0.0,
+                profit_bps: 0,
+                gas_used: 0,
+                gas_limit: gas_estimate,
+                gas_cost_mon: 0.0,
+                execution_time_ms: start.elapsed().as_millis(),
+                sell_dex: sell_router.name.to_string(),
+                buy_dex: buy_router.name.to_string(),
+                wmon_in: amount,
+                error: Some("Send timeout".to_string()),
+            });
+        }
+    };
+
     let tx_hash = *pending.tx_hash();
+    println!("    TX sent: {:?} (in {:?})", tx_hash, send_start.elapsed());
 
-    // Fast receipt polling (2ms intervals)
-    let receipt = wait_for_receipt_turbo(provider_with_signer, tx_hash).await?;
+    // Wait for receipt (standard polling for Monad)
+    println!("  Waiting for confirmation...");
+    let receipt = match timeout(
+        Duration::from_secs(15),
+        wait_for_receipt(provider_with_signer, tx_hash)
+    ).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return Ok(AtomicArbResult {
+                tx_hash: format!("{:?}", tx_hash),
+                success: false,
+                profit_wmon: 0.0,
+                profit_bps: 0,
+                gas_used: 0,
+                gas_limit: gas_estimate,
+                gas_cost_mon: 0.0,
+                execution_time_ms: start.elapsed().as_millis(),
+                sell_dex: sell_router.name.to_string(),
+                buy_dex: buy_router.name.to_string(),
+                wmon_in: amount,
+                error: Some(format!("Receipt error: {}", e)),
+            });
+        }
+        Err(_) => {
+            return Ok(AtomicArbResult {
+                tx_hash: format!("{:?}", tx_hash),
+                success: false,
+                profit_wmon: 0.0,
+                profit_bps: 0,
+                gas_used: 0,
+                gas_limit: gas_estimate,
+                gas_cost_mon: 0.0,
+                execution_time_ms: start.elapsed().as_millis(),
+                sell_dex: sell_router.name.to_string(),
+                buy_dex: buy_router.name.to_string(),
+                wmon_in: amount,
+                error: Some("Confirmation timeout".to_string()),
+            });
+        }
+    };
 
+    let gas_cost_wei = U256::from(gas_estimate) * U256::from(receipt.effective_gas_price);
+    let gas_cost_mon = gas_cost_wei.to::<u128>() as f64 / 1e18;
     let exec_time = start.elapsed().as_millis();
 
-    // Estimated profit (no balance verification for speed)
-    let estimated_profit = expected_wmon_back - amount;
-    let estimated_profit_bps = (estimated_profit / amount * 10000.0) as i32;
+    if receipt.status() {
+        // Query ACTUAL balances after execution
+        let (wmon_after, usdc_after) = query_contract_balances(provider_with_signer).await?;
+        println!("  Contract balances after: {:.6} WMON, {:.6} USDC", wmon_after, usdc_after);
 
-    let gas_cost_wei = U256::from(gas_limit) * U256::from(receipt.effective_gas_price);
-    let gas_cost_mon = gas_cost_wei.to::<u128>() as f64 / 1e18;
+        // Calculate actual profit from balance change
+        let actual_wmon_delta = wmon_after - wmon_before;
+        let actual_profit = actual_wmon_delta;
+        let actual_profit_bps = if amount > 0.0 {
+            (actual_profit / amount * 10000.0) as i32
+        } else {
+            0
+        };
 
-    Ok(AtomicArbResult {
-        tx_hash: format!("{:?}", tx_hash),
-        success: receipt.status(),
-        profit_wmon: estimated_profit,
-        profit_bps: estimated_profit_bps,
-        gas_used: receipt.gas_used,
-        gas_limit,
-        gas_cost_mon,
-        execution_time_ms: exec_time,
-        sell_dex: sell_router.name.to_string(),
-        buy_dex: buy_router.name.to_string(),
-        wmon_in: amount,
-        error: if receipt.status() { None } else { Some("Reverted".to_string()) },
-    })
+        // Log comparison between estimated and actual
+        let estimated_profit = expected_wmon_back - amount;
+        println!("  Estimated profit: {:.6} WMON, Actual profit: {:.6} WMON",
+            estimated_profit, actual_profit);
+        if (actual_profit - estimated_profit).abs() > 0.0001 {
+            println!("  WARNING: Actual profit differs from estimate by {:.6} WMON ({} bps)",
+                actual_profit - estimated_profit,
+                ((actual_profit - estimated_profit) / amount * 10000.0) as i32);
+        }
+
+        println!("  Atomic arb SUCCESS in {}ms", exec_time);
+
+        Ok(AtomicArbResult {
+            tx_hash: format!("{:?}", tx_hash),
+            success: true,
+            profit_wmon: actual_profit,  // Use ACTUAL, not estimated
+            profit_bps: actual_profit_bps,
+            gas_used: receipt.gas_used,
+            gas_limit: gas_estimate,
+            gas_cost_mon,
+            execution_time_ms: exec_time,
+            sell_dex: sell_router.name.to_string(),
+            buy_dex: buy_router.name.to_string(),
+            wmon_in: amount,
+            error: None,
+        })
+    } else {
+        println!("  Atomic arb REVERTED (likely unprofitable)");
+
+        Ok(AtomicArbResult {
+            tx_hash: format!("{:?}", tx_hash),
+            success: false,
+            profit_wmon: 0.0,
+            profit_bps: 0,
+            gas_used: receipt.gas_used,
+            gas_limit: gas_estimate,
+            gas_cost_mon,
+            execution_time_ms: exec_time,
+            sell_dex: sell_router.name.to_string(),
+            buy_dex: buy_router.name.to_string(),
+            wmon_in: amount,
+            error: Some("Transaction reverted (unprofitable or swap failed)".to_string()),
+        })
+    }
+}
+
+/// Standard receipt polling (20ms intervals)
+async fn wait_for_receipt<P: Provider>(
+    provider: &P,
+    tx_hash: alloy::primitives::TxHash,
+) -> Result<alloy::rpc::types::TransactionReceipt> {
+    use tokio::time::interval;
+
+    let mut poll = interval(Duration::from_millis(20));
+
+    for _ in 0..750 { // 15 seconds max
+        poll.tick().await;
+        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+            return Ok(receipt);
+        }
+    }
+
+    Err(eyre!("Receipt timeout"))
 }
 
 /// Print atomic arb result
@@ -298,21 +501,4 @@ pub fn print_atomic_arb_result(result: &AtomicArbResult) {
 
     println!();
     println!("===============================================================");
-}
-
-/// TURBO: 2ms polling for receipt (fast for Monad blocks)
-async fn wait_for_receipt_turbo<P: Provider>(
-    provider: &P,
-    tx_hash: alloy::primitives::TxHash,
-) -> Result<alloy::rpc::types::TransactionReceipt> {
-    use tokio::time::interval;
-    let mut poll = interval(Duration::from_millis(2));
-
-    for _ in 0..2500 { // 5 seconds max at 2ms intervals
-        poll.tick().await;
-        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
-            return Ok(receipt);
-        }
-    }
-    Err(eyre!("Receipt timeout"))
 }
