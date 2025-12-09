@@ -344,7 +344,7 @@ enum Commands {
         output: String,
     },
 
-    /// MEV Ultra - WebSocket Proposed state trigger with execution
+    /// MEV Ultra - WebSocket block state trigger with execution
     MevUltra {
         /// Amount of WMON per arb execution
         #[arg(long, default_value = "0.1")]
@@ -365,6 +365,13 @@ enum Commands {
         /// Cooldown between executions in seconds
         #[arg(long, default_value = "1")]
         cooldown_secs: u64,
+
+        /// Block state to trigger on: proposed, verified, or finalized
+        /// - proposed: Fastest but prices may be stale (pre-block state)
+        /// - verified: Block validated, prices reflect block's txs
+        /// - finalized: Safest, block is irreversible
+        #[arg(long, default_value = "proposed")]
+        trigger_state: String,
     },
 
     /// Live spread dashboard with detailed visualization
@@ -2750,28 +2757,54 @@ async fn run_contract_balance() -> Result<()> {
     Ok(())
 }
 
-/// MEV Ultra - WebSocket Proposed state trigger with execution
+/// MEV Ultra - WebSocket block state trigger with execution
+///
+/// Trigger states:
+/// - "proposed": Fastest but prices are PRE-BLOCK (stale) - you're racing against txs IN the block
+/// - "verified": Block validated, prices reflect the block's transactions - more accurate
+/// - "finalized": Safest, block is irreversible - most accurate but slowest
 async fn run_mev_ultra(
     amount: f64,
     slippage: u32,
     min_spread_bps: i32,
     max_executions: u32,
     cooldown_secs: u64,
+    trigger_state: &str,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use futures_util::{SinkExt, StreamExt};
 
+    // Normalize trigger state
+    let trigger_state = match trigger_state.to_lowercase().as_str() {
+        "proposed" => "Proposed",
+        "verified" => "Verified",
+        "finalized" => "Finalized",
+        other => {
+            println!("\x1b[31mInvalid trigger state '{}'. Use: proposed, verified, or finalized\x1b[0m", other);
+            return Ok(());
+        }
+    };
+
     let node_config = NodeConfig::from_env();
 
+    // State-specific advice
+    let state_advice = match trigger_state {
+        "Proposed" => "\x1b[33m⚠ WARNING: Prices are PRE-BLOCK (stale). You're racing against txs IN this block.\x1b[0m",
+        "Verified" => "\x1b[32m✓ Prices reflect block's txs. Good balance of speed and accuracy.\x1b[0m",
+        "Finalized" => "\x1b[36m✓ Safest mode. Block is irreversible but ~500ms slower than Proposed.\x1b[0m",
+        _ => "",
+    };
+
     println!("\n\x1b[1;36m╔═══════════════════════════════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[1;36m║              MEV ULTRA - PROPOSED STATE TRIGGER               ║\x1b[0m");
+    println!("\x1b[1;36m║              MEV ULTRA - {} STATE TRIGGER              ║\x1b[0m", trigger_state.to_uppercase());
     println!("\x1b[1;36m╚═══════════════════════════════════════════════════════════════╝\x1b[0m");
     println!("  Amount: {} WMON | Slippage: {} bps | Min Spread: {} bps", amount, slippage, min_spread_bps);
     println!("  Max Executions: {} | Cooldown: {}s",
         if max_executions == 0 { "∞".to_string() } else { max_executions.to_string() }, cooldown_secs);
-    println!("  \x1b[33mTrigger: WebSocket monadNewHeads -> Proposed state\x1b[0m\n");
+    println!("  Trigger: WebSocket monadNewHeads -> {} state", trigger_state);
+    println!("  {}\n", state_advice);
 
     // Setup wallet and signer
     let rpc_url = std::env::var("MONAD_RPC_URL").expect("MONAD_RPC_URL must be set");
@@ -2821,7 +2854,7 @@ async fn run_mev_ultra(
         "params": ["monadNewHeads"]
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
-    println!("\x1b[1;32mSubscribed to monadNewHeads. Waiting for Proposed blocks...\x1b[0m\n");
+    println!("\x1b[1;32mSubscribed to monadNewHeads. Waiting for {} blocks...\x1b[0m\n", trigger_state);
 
     let mut executions = 0u32;
     let mut blocks_seen = 0u64;
@@ -2832,8 +2865,8 @@ async fn run_mev_ultra(
         // Heartbeat every 10 seconds
         if last_heartbeat.elapsed().as_secs() >= 10 {
             let now = chrono::Local::now().format("%H:%M:%S");
-            print!("\r\x1b[90m[{}] Blocks: {} | Execs: {} | Waiting for Proposed...\x1b[0m    ",
-                now, blocks_seen, executions);
+            print!("\r\x1b[90m[{}] Blocks: {} | Execs: {} | Waiting for {}...\x1b[0m    ",
+                now, blocks_seen, executions, trigger_state);
             std::io::Write::flush(&mut std::io::stdout()).ok();
             last_heartbeat = std::time::Instant::now();
         }
@@ -2885,8 +2918,8 @@ async fn run_mev_ultra(
             .and_then(|s| s.as_str())
             .unwrap_or("");
 
-        // ONLY trigger on Proposed state
-        if commit_state != "Proposed" {
+        // Trigger on configured state
+        if commit_state != trigger_state {
             continue;
         }
 
@@ -3214,8 +3247,8 @@ async fn main() -> Result<()> {
         Some(Commands::MevValidate { duration, min_spread, output }) => {
             run_mev_validate(duration, min_spread, &output).await
         }
-        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs }) => {
-            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs).await
+        Some(Commands::MevUltra { amount, slippage, min_spread, max_executions, cooldown_secs, trigger_state }) => {
+            run_mev_ultra(amount, slippage, min_spread, max_executions, cooldown_secs, &trigger_state).await
         }
         Some(Commands::Dashboard { min_spread, history, refresh_ms, sound }) => {
             run_dashboard(min_spread, history, refresh_ms, sound).await
