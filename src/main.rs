@@ -2857,11 +2857,22 @@ async fn run_mev_ultra(
     let mut executions = 0u32;
     let mut last_execution = std::time::Instant::now() - std::time::Duration::from_secs(cooldown_secs);
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
+    let mut last_heartbeat = std::time::Instant::now();
+    let mut poll_count = 0u64;
 
     println!("\x1b[1;32mMonitoring ({}ms poll)... Press Ctrl+C to stop\x1b[0m\n", poll_ms);
 
     while running.load(Ordering::SeqCst) {
         poll_interval.tick().await;
+        poll_count += 1;
+
+        // Heartbeat every 10 seconds to keep SSH alive
+        if last_heartbeat.elapsed().as_secs() >= 10 {
+            let now = chrono::Local::now().format("%H:%M:%S");
+            print!("\r\x1b[90m[{}] Polls: {} | Execs: {} | Waiting...\x1b[0m", now, poll_count, executions);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            last_heartbeat = std::time::Instant::now();
+        }
 
         // Fetch prices
         let prices = match fetch_prices_batched(&provider, price_calls.clone()).await {
