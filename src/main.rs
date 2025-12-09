@@ -29,6 +29,7 @@ fn get_http_client() -> &'static Client {
 mod config;
 mod display;
 mod execution;
+mod gas_cache;
 mod health;
 mod mev_validation;
 mod multicall;
@@ -1654,8 +1655,16 @@ async fn run_atomic_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u3
         .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
         .ok_or_else(|| eyre::eyre!("No price for {}", buy_dex))?.price;
 
+    // Calculate spread in bps for gas strategy
+    let spread_bps = if sell_price > buy_price && buy_price > 0.0 {
+        ((sell_price - buy_price) / buy_price * 10000.0) as i32
+    } else {
+        0
+    };
+
     println!("\n==============================================================");
-    println!("  ATOMIC ARB | {} -> {} (single TX)", sell_dex, buy_dex);
+    println!("  ATOMIC ARB [TURBO] | {} -> {} (single TX)", sell_dex, buy_dex);
+    println!("  Spread: {} bps", spread_bps);
     println!("==============================================================");
 
     let result = execute_atomic_arb(
@@ -1669,6 +1678,7 @@ async fn run_atomic_arb(sell_dex: &str, buy_dex: &str, amount: f64, slippage: u3
         slippage,
         min_profit_bps,
         gas_price,
+        spread_bps,
         force,
     ).await?;
 
@@ -1725,8 +1735,16 @@ async fn run_atomic_arb_turbo(sell_dex: &str, buy_dex: &str, amount: f64, slippa
         .find(|p| p.pool_name.to_lowercase() == buy_dex.to_lowercase())
         .ok_or_else(|| eyre::eyre!("No price for {}", buy_dex))?.price;
 
+    // Calculate spread in bps for gas strategy
+    let spread_bps = if sell_price > buy_price && buy_price > 0.0 {
+        ((sell_price - buy_price) / buy_price * 10000.0) as i32
+    } else {
+        0
+    };
+
     println!("\n==============================================================");
     println!("  TURBO MODE | {} -> {} (single TX, max speed)", sell_dex, buy_dex);
+    println!("  Spread: {} bps", spread_bps);
     println!("==============================================================");
 
     let result = execution::execute_atomic_arb(
@@ -1740,6 +1758,7 @@ async fn run_atomic_arb_turbo(sell_dex: &str, buy_dex: &str, amount: f64, slippa
         slippage,
         0,  // min_profit_bps ignored
         gas_price,
+        spread_bps,
         true,  // force flag ignored
     ).await?;
 
@@ -2069,7 +2088,7 @@ async fn run_auto_arb(
                 let use_atomic = ATOMIC_ARB_CONTRACT != alloy::primitives::Address::ZERO;
 
                 let arb_result: Result<execution::FastArbResult, eyre::Report> = if use_atomic {
-                    println!("  Using ATOMIC execution (single TX)...");
+                    println!("  Using ATOMIC TURBO execution (single TX)...");
                     match execute_atomic_arb(
                         &provider_with_signer,
                         signer_address,
@@ -2081,11 +2100,13 @@ async fn run_auto_arb(
                         slippage,
                         0, // min_profit_bps = 0 (any profit)
                         gas_price,
+                        net_spread_bps, // spread_bps for gas strategy
                         force, // force execution even if unprofitable
                     ).await {
                         Ok(result) => {
                             print_atomic_arb_result(&result);
                             // Convert AtomicArbResult to FastArbResult for stats compatibility
+                            let profit = result.profit_wmon();
                             Ok(execution::FastArbResult {
                                 success: result.success,
                                 swap1_success: result.success,
@@ -2098,18 +2119,18 @@ async fn run_auto_arb(
                                 swap2_gas_estimated: 0,
                                 wmon_in: result.wmon_in,
                                 usdc_intermediate: 0.0,
-                                wmon_out: result.wmon_in + result.profit_wmon,
+                                wmon_out: result.wmon_in + profit,
                                 usdc_before: 0.0,
                                 usdc_after_swap1: 0.0,
                                 wmon_before: result.wmon_in,
-                                wmon_after_swap2: result.wmon_in + result.profit_wmon,
+                                wmon_after_swap2: result.wmon_in + profit,
                                 actual_usdc_received: 0.0,
-                                actual_wmon_received: result.profit_wmon,
+                                actual_wmon_received: profit,
                                 swap1_slippage_bps: 0,
                                 swap2_slippage_bps: 0,
-                                wmon_out_actual: Some(result.wmon_in + result.profit_wmon),
+                                wmon_out_actual: Some(result.wmon_in + profit),
                                 estimation_error_bps: None,
-                                gross_profit_wmon: result.profit_wmon,
+                                gross_profit_wmon: profit,
                                 profit_bps: result.profit_bps,
                                 total_gas_cost_wei: alloy::primitives::U256::ZERO,
                                 total_gas_cost_mon: result.gas_cost_mon,
@@ -2931,7 +2952,7 @@ async fn run_mev_ultra(
         println!("  Route: {} ({:.4}) -> {} ({:.4})", sell_pool, sell_price, buy_pool, buy_price);
         println!("  Spread: {} bps | Amount: {} WMON", spread_bps, amount);
 
-        // Execute using standard execute_atomic_arb
+        // Execute using TURBO execute_atomic_arb
         let exec_start = std::time::Instant::now();
         let result = execution::execute_atomic_arb(
             &provider_with_signer,
@@ -2944,6 +2965,7 @@ async fn run_mev_ultra(
             slippage,
             0,  // min_profit_bps
             gas_price,
+            spread_bps,  // spread for gas strategy
             true,  // force
         ).await;
 
