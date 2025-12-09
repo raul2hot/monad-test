@@ -511,13 +511,11 @@ pub fn print_atomic_arb_result(result: &AtomicArbResult) {
     println!("===============================================================");
 }
 
-/// TURBO MODE: Execute atomic arb with MAXIMUM speed (fire-and-forget)
-/// Target: <50ms execution
+/// TURBO MODE: Execute atomic arb with speed optimizations
 /// - NO pre-balance query
 /// - NO gas estimation (hardcoded)
-/// - NO receipt waiting (fire and forget)
+/// - Fast receipt polling (5ms intervals)
 /// - NO post-balance query
-/// Returns immediately after TX is sent to mempool
 pub async fn execute_atomic_arb_turbo<P: Provider>(
     provider_with_signer: &P,
     signer_address: Address,
@@ -577,7 +575,7 @@ pub async fn execute_atomic_arb_turbo<P: Provider>(
         .max_priority_fee_per_gas(gas_price / 10)
         .with_chain_id(MONAD_CHAIN_ID);
 
-    // FIRE AND FORGET - send and return immediately
+    // Send transaction
     let pending = match provider_with_signer.send_transaction(tx).await {
         Ok(p) => p,
         Err(e) => {
@@ -599,26 +597,84 @@ pub async fn execute_atomic_arb_turbo<P: Provider>(
     };
 
     let tx_hash = *pending.tx_hash();
-    let exec_time = start.elapsed().as_millis();
 
-    // Estimated profit (no actual verification)
+    // Wait for receipt with fast polling (5ms intervals)
+    let receipt = match timeout(
+        Duration::from_secs(10),
+        wait_for_receipt_turbo(provider_with_signer, tx_hash)
+    ).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return Ok(AtomicArbResult {
+                tx_hash: format!("{:?}", tx_hash),
+                success: false,
+                profit_wmon: 0.0,
+                profit_bps: 0,
+                gas_used: 0,
+                gas_limit,
+                gas_cost_mon: 0.0,
+                execution_time_ms: start.elapsed().as_millis(),
+                sell_dex: sell_router.name.to_string(),
+                buy_dex: buy_router.name.to_string(),
+                wmon_in: amount,
+                error: Some(format!("Receipt error: {}", e)),
+            });
+        }
+        Err(_) => {
+            return Ok(AtomicArbResult {
+                tx_hash: format!("{:?}", tx_hash),
+                success: false,
+                profit_wmon: 0.0,
+                profit_bps: 0,
+                gas_used: 0,
+                gas_limit,
+                gas_cost_mon: 0.0,
+                execution_time_ms: start.elapsed().as_millis(),
+                sell_dex: sell_router.name.to_string(),
+                buy_dex: buy_router.name.to_string(),
+                wmon_in: amount,
+                error: Some("Confirmation timeout".to_string()),
+            });
+        }
+    };
+
+    let exec_time = start.elapsed().as_millis();
+    let gas_cost_wei = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
+    let gas_cost_mon = gas_cost_wei.to::<u128>() as f64 / 1e18;
+
+    // Estimated profit (no balance verification for speed)
     let estimated_profit = expected_wmon_back - amount;
     let estimated_profit_bps = (estimated_profit / amount * 10000.0) as i32;
-    let estimated_gas_cost = (gas_limit as f64 * gas_price as f64) / 1e18;
 
-    // Return immediately - TX is in mempool
     Ok(AtomicArbResult {
         tx_hash: format!("{:?}", tx_hash),
-        success: true,  // Assume success - it's in mempool
+        success: receipt.status(),
         profit_wmon: estimated_profit,
         profit_bps: estimated_profit_bps,
-        gas_used: gas_limit,  // Estimated
+        gas_used: receipt.gas_used,
         gas_limit,
-        gas_cost_mon: estimated_gas_cost,
+        gas_cost_mon,
         execution_time_ms: exec_time,
         sell_dex: sell_router.name.to_string(),
         buy_dex: buy_router.name.to_string(),
         wmon_in: amount,
-        error: None,
+        error: if receipt.status() { None } else { Some("Transaction reverted".to_string()) },
     })
+}
+
+/// TURBO: 5ms polling for receipt
+async fn wait_for_receipt_turbo<P: Provider>(
+    provider: &P,
+    tx_hash: alloy::primitives::TxHash,
+) -> Result<alloy::rpc::types::TransactionReceipt> {
+    use tokio::time::interval;
+    let mut poll = interval(Duration::from_millis(5));
+
+    for _ in 0..2000 { // 10 seconds max at 5ms intervals
+        poll.tick().await;
+        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+            return Ok(receipt);
+        }
+    }
+    Err(eyre!("Receipt timeout"))
 }
