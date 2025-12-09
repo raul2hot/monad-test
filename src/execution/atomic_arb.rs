@@ -288,6 +288,30 @@ pub async fn execute_atomic_arb<P: Provider + Clone + Send + Sync + 'static>(
         return Err(eyre!("ATOMIC_ARB_CONTRACT not set in config.rs. Deploy contract first!"));
     }
 
+    // TURBO: Early exit if spread is too low to be profitable
+    // This avoids wasting time on gas estimation that would fail anyway
+    const MIN_PROFITABLE_SPREAD_BPS: i32 = 5;
+    if spread_bps < MIN_PROFITABLE_SPREAD_BPS && !force {
+        return Ok(AtomicArbResult {
+            tx_hash: String::new(),
+            success: false,
+            estimated_profit_wmon: 0.0,
+            actual_profit_wmon: None,
+            profit_bps: 0,
+            gas_used: 0,
+            gas_limit: 0,
+            gas_cost_mon: 0.0,
+            execution_time_ms: start.elapsed().as_millis(),
+            sell_dex: sell_router.name.to_string(),
+            buy_dex: buy_router.name.to_string(),
+            wmon_in: amount,
+            spread_bps,
+            gas_source: "Skipped".to_string(),
+            error: Some(format!("Spread {} bps below minimum {} bps - skipping (use --force to override)",
+                spread_bps, MIN_PROFITABLE_SPREAD_BPS)),
+        });
+    }
+
     // TURBO: Skip pre-balance query - we'll use estimated profit and verify async
     // This saves ~50-100ms
     println!("  [TURBO] Skipping pre-balance query, using estimated profit");
